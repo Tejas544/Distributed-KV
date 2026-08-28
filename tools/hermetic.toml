@@ -1,0 +1,224 @@
+# Hermeticity rules for anvil_core.
+#
+# Consumed by tools/hermetic_check.py, which scans the *strong undefined*
+# symbols of the built archive. Those are precisely the external facilities the
+# core will demand at link time, which makes them a much better source of truth
+# than grepping source files.
+#
+# tiers:
+#   [[deny]]   -> build fails
+#   [[warn]]   -> reported, build continues (symbols libstdc++ sometimes pulls
+#                 in on its own; promote to deny once core is known clean)
+#   [[allow]]  -> named exception with a written reason and optional expiry
+#
+# 'patterns' are regexes matched against the *mangled* name. Itanium mangling
+# is length-prefixed, so an identifier like std::chrono::system_clock appears
+# verbatim as "12system_clock" inside the mangled symbol. That makes substring
+# rules reliable without having to guess whole manglings.
+
+# ---------------------------------------------------------------------------
+# Time
+# ---------------------------------------------------------------------------
+[[deny]]
+category = "wall-clock"
+why = """Time must come from Runtime::now(), which the simulator advances only \
+when every task is blocked. A real clock read makes the run irreproducible and \
+silently breaks every lease and uncertainty-interval invariant."""
+symbols = [
+  "clock_gettime", "__clock_gettime", "clock_gettime64", "__clock_gettime64",
+  "gettimeofday", "__gettimeofday", "time", "time64", "clock", "times", "ftime",
+  "clock_getres", "clock_nanosleep",
+  "mach_absolute_time", "mach_continuous_time", "clock_gettime_nsec_np",
+  "GetSystemTimeAsFileTime", "GetSystemTimePreciseAsFileTime",
+  "GetTickCount", "GetTickCount64", "QueryPerformanceCounter",
+  "QueryPerformanceFrequency", "timeGetTime",
+]
+patterns = ["12system_clock", "12steady_clock", "22high_resolution_clock"]
+
+[[deny]]
+category = "locale-and-calendar"
+why = """Calendar and locale conversions depend on TZ and LC_* environment, so \
+the same seed produces different behaviour on different machines. Format \
+timestamps outside the core."""
+symbols = [
+  "localtime", "localtime_r", "localtime_s", "gmtime", "gmtime_r",
+  "mktime", "timegm", "strftime", "strptime", "asctime", "ctime", "difftime",
+  "setlocale", "localeconv", "nl_langinfo", "tzset",
+]
+
+# ---------------------------------------------------------------------------
+# Entropy
+# ---------------------------------------------------------------------------
+[[deny]]
+category = "unseeded-entropy"
+why = """The seed is the whole reproduction story. All randomness must come \
+from Runtime::random_u64(), which is a pure function of the run seed. One \
+rand() call and a failing run can never be replayed."""
+symbols = [
+  "rand", "srand", "rand_r", "random", "srandom", "initstate", "setstate",
+  "drand48", "lrand48", "mrand48", "srand48", "seed48",
+  "getrandom", "getentropy",
+  "arc4random", "arc4random_buf", "arc4random_uniform",
+  "RtlGenRandom", "SystemFunction036",
+  "BCryptGenRandom", "CryptGenRandom", "rand_s",
+]
+patterns = ["13random_device"]
+
+# ---------------------------------------------------------------------------
+# Concurrency
+# ---------------------------------------------------------------------------
+[[deny]]
+category = "threads"
+why = """The core runs on one thread by construction: no parallelism is half of \
+the deterministic-simulation formula. Concurrency is expressed as coroutine \
+tasks scheduled by the Runtime, never as OS threads."""
+symbols = [
+  "pthread_create", "pthread_join", "pthread_detach", "pthread_cancel",
+  "pthread_barrier_wait", "pthread_setspecific",
+  "thrd_create", "thrd_join",
+  "CreateThread", "_beginthread", "_beginthreadex", "SwitchToThread",
+  "sched_yield", "sched_setaffinity",
+  "nanosleep", "clock_nanosleep", "usleep", "sleep", "Sleep", "SleepEx",
+]
+patterns = [
+  "_ZNSt6thread",              # std::thread
+  "_ZNSt11this_thread",        # std::this_thread::*
+  "_ZNSt18condition_variable", # std::condition_variable
+  "_ZNSt6latch", "_ZNSt7barrier", "_ZNSt9semaphore",
+]
+
+# ---------------------------------------------------------------------------
+# I/O
+# ---------------------------------------------------------------------------
+[[deny]]
+category = "file-io"
+why = """All storage goes through Runtime's file handles so the disk model can \
+tear writes at sector granularity, delay fsync, and resolve unsynced blocks to \
+old/new/torn content on crash. A direct write() is invisible to that model, so \
+its crash behaviour is untested."""
+symbols = [
+  "open", "open64", "openat", "creat", "close",
+  "read", "pread", "pread64", "readv", "preadv",
+  "write", "pwrite", "pwrite64", "writev", "pwritev",
+  "lseek", "lseek64", "ftruncate", "ftruncate64", "fallocate", "posix_fallocate",
+  "fsync", "fdatasync", "sync", "syncfs", "sync_file_range",
+  "unlink", "unlinkat", "rename", "renameat", "renameat2", "link", "symlink",
+  "mkdir", "mkdirat", "rmdir", "opendir", "readdir", "closedir",
+  "stat", "fstat", "lstat", "statx", "statfs", "access", "chmod", "fchmod",
+  "mmap", "mmap64", "munmap", "msync", "mprotect", "madvise",
+  "fopen", "fdopen", "freopen", "fclose", "fread", "fwrite", "fflush", "fseek",
+  "CreateFileA", "CreateFileW", "ReadFile", "WriteFile", "FlushFileBuffers",
+  "SetFilePointerEx", "DeleteFileW", "MoveFileExW", "CreateFileMappingW",
+]
+patterns = [
+  "_ZNSt14basic_ofstream", "_ZNSt14basic_ifstream", "_ZNSt13basic_fstream",
+  "_ZNSt13basic_filebuf",
+]
+
+[[deny]]
+category = "network-io"
+why = """Messages must traverse the simulated network so they can be delayed, \
+reordered, dropped, duplicated, and partitioned. A raw socket bypasses every \
+fault the simulator knows how to inject."""
+symbols = [
+  "socket", "socketpair", "connect", "bind", "listen", "accept", "accept4",
+  "send", "sendto", "sendmsg", "sendmmsg", "recv", "recvfrom", "recvmsg",
+  "recvmmsg", "shutdown", "setsockopt", "getsockopt", "getaddrinfo",
+  "gethostbyname", "getnameinfo", "inet_pton", "inet_ntop",
+  "poll", "ppoll", "select", "pselect",
+  "epoll_create", "epoll_create1", "epoll_ctl", "epoll_wait", "epoll_pwait",
+  "kqueue", "kevent", "eventfd", "timerfd_create", "timerfd_settime",
+  "io_uring_setup", "io_uring_enter", "io_uring_register",
+  "io_uring_queue_init", "io_uring_submit", "io_uring_wait_cqe",
+  "splice", "sendfile", "WSASend", "WSARecv", "WSAStartup",
+]
+
+[[deny]]
+category = "console-io"
+why = """The core does not print. Diagnostics go to the Runtime's logger so the \
+simulator can fold them into the causal trace with a virtual timestamp -- and \
+so that stray output cannot perturb the execution digest."""
+patterns = ["_ZSt4cout", "_ZSt4cerr", "_ZSt4clog", "_ZSt3cin", "_ZSt5wcout"]
+symbols = ["puts", "putchar", "printf", "vprintf", "perror"]
+
+# ---------------------------------------------------------------------------
+# Ambient environment
+# ---------------------------------------------------------------------------
+[[deny]]
+category = "process-and-environment"
+why = """Anything read from the environment, the process table, or the host is \
+ambient input the seed does not control, so it cannot be replayed. Node \
+identity comes from configuration, not from getpid() or gethostname()."""
+symbols = [
+  "getenv", "secure_getenv", "setenv", "unsetenv", "putenv",
+  "getpid", "getppid", "gettid", "getuid", "geteuid",
+  "gethostname", "uname", "getcwd", "getlogin",
+  "system", "popen", "fork", "vfork", "clone", "posix_spawn",
+  "execl", "execle", "execlp", "execv", "execve", "execvp",
+  "dlopen", "dlsym", "dlclose",
+  "signal", "sigaction", "raise", "kill", "alarm", "setitimer",
+  "GetEnvironmentVariableA", "GetEnvironmentVariableW",
+  "GetCurrentProcessId", "GetComputerNameW",
+]
+
+# ---------------------------------------------------------------------------
+# Warnings: usually libstdc++'s doing, occasionally ours
+# ---------------------------------------------------------------------------
+[[warn]]
+category = "libc-introspection"
+why = """Generally pulled in by libstdc++ or the allocator rather than by our \
+code, but worth a look: a page-size or CPU-count query that reaches control \
+flow is a portability-dependent branch, and portability-dependent branches \
+break cross-architecture digest equality."""
+symbols = [
+  "sysconf", "getpagesize", "sched_getcpu", "get_nprocs", "get_nprocs_conf",
+  "getrlimit", "getrusage", "malloc_usable_size", "mallinfo", "mallinfo2",
+]
+
+[[warn]]
+category = "mutex"
+why = """std::mutex in single-threaded core code is dead weight and usually \
+means someone is porting threaded code in. Harmless for determinism if never \
+contended, but it should not be here."""
+symbols = [
+  "pthread_mutex_lock", "pthread_mutex_unlock", "pthread_mutex_init",
+  "pthread_rwlock_rdlock", "pthread_rwlock_wrlock", "pthread_rwlock_unlock",
+  "pthread_cond_wait", "pthread_cond_signal", "pthread_cond_broadcast",
+]
+patterns = ["_ZNSt5mutex", "_ZNSt15recursive_mutex", "_ZNSt10shared_mutex"]
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+# Every entry needs a reason. 'expires' is optional but strongly encouraged --
+# an exception without a deadline is a permanent hole. Expired entries fail the
+# build; unused entries are reported so this list does not accumulate ghosts.
+#
+# [[allow]]
+# symbol  = "example_symbol"
+# reason  = "why this is genuinely safe, not why it is inconvenient to fix"
+# expires = 2026-12-31
+
+# ---------------------------------------------------------------------------
+# Allowlist mode (the stronger gate)
+# ---------------------------------------------------------------------------
+# A denylist only catches what we thought to forbid. Inverting it -- fail on any
+# strong-undefined symbol not explicitly permitted -- is the real end state, and
+# anvil_core's external surface is small enough to make it achievable.
+#
+# Turn this on once the core stops growing new dependencies weekly (target: end
+# of P2). Until then it would be edited more often than it would fire.
+[allowlist_mode]
+enabled = false
+permitted = [
+  "^_Z(n|d)[alw]",             # operator new / delete
+  "^__cxa_",                   # exception + static-destruction ABI
+  "^_Unwind_",
+  "^__gxx_personality",
+  "^_ZSt9terminatev",
+  "^_ZSt(17|18|19|20|21|24|25)__throw_",  # libstdc++ throw helpers
+  "^(mem(cpy|move|set|cmp|chr))$",
+  "^(str(len|cmp|ncmp|chr))$",
+  "^(malloc|calloc|realloc|free|aligned_alloc|posix_memalign)$",
+  "^(abort|__assert_fail|__stack_chk_fail)$",
+]

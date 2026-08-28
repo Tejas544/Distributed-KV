@@ -1,0 +1,154 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------------------
+  # The hermeticity gate. Runs first and alone, because if the core is not
+  # hermetic then nothing downstream of it -- every seed, every replay, every
+  # bug-ledger row -- means what it claims to mean.
+  # -------------------------------------------------------------------------
+  hermetic:
+    name: hermeticity gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: install toolchain
+        run: sudo apt-get update && sudo apt-get install -y ninja-build binutils
+
+      - name: configure
+        run: cmake --preset digest-gcc
+
+      - name: build core and the negative control
+        run: |
+          cmake --build build/digest-gcc --target anvil_core
+          cmake --build build/digest-gcc --target anvil_hermetic_negative
+
+      - name: gate -- anvil_core must be clean
+        run: |
+          python3 tools/hermetic_check.py \
+            --json artifacts/hermetic-core.json \
+            build/digest-gcc/anvil/core/libanvil_core.a
+
+      # Without this, "the gate passed" is unfalsifiable: a checker that always
+      # exits 0 would produce an identical green build.
+      - name: gate -- negative control must be rejected
+        run: |
+          python3 tools/hermetic_check.py --expect-violations \
+            --json artifacts/hermetic-negative.json \
+            build/digest-gcc/test/libanvil_hermetic_negative.a
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hermetic-report
+          path: artifacts/
+
+  # -------------------------------------------------------------------------
+  # Build and test across compilers and architectures. The matrix is not about
+  # portability for its own sake: INV-SIM-01 requires identical execution
+  # digests on gcc/x86-64 and clang/arm64, so both have to be built anyway.
+  # -------------------------------------------------------------------------
+  build:
+    name: ${{ matrix.name }}
+    needs: hermetic
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-gcc-asan
+            os: ubuntu-24.04
+            preset: dev
+          - name: linux-clang-digest
+            os: ubuntu-24.04
+            preset: digest-clang
+          - name: macos-arm64-clang
+            os: macos-14
+            preset: digest-clang
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: install toolchain (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang binutils
+
+      - name: install toolchain (macos)
+        if: runner.os == 'macOS'
+        run: brew install ninja llvm binutils
+
+      - name: configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: build
+        run: cmake --build build/${{ matrix.preset }} --parallel
+
+      - name: test
+        run: ctest --test-dir build/${{ matrix.preset }} --output-on-failure --parallel
+
+      # Each toolchain records a rollup digest over the same 2,000 seeds. The
+      # comparison happens in the job below; sanitizer builds are excluded
+      # because ASan changes allocation addresses, and if that changed the
+      # digest we would want the in-process test to say so, not a cross-job diff
+      # that cannot tell which half moved.
+      - name: sweep -- record the rollup digest
+        if: matrix.preset != 'dev'
+        run: |
+          mkdir -p artifacts
+          ./build/${{ matrix.preset }}/anvil-sim --sweep 2000 | tee artifacts/sweep.txt
+          grep '^rollup' artifacts/sweep.txt | awk '{print $2}' > artifacts/rollup.txt
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.preset != 'dev'
+        with:
+          name: rollup-${{ matrix.name }}
+          path: artifacts/rollup.txt
+
+  # -------------------------------------------------------------------------
+  # INV-SIM-01: same seed, same digest, across compilers and architectures.
+  #
+  # The in-process half (same seed twice, one binary) is the sim.determinism
+  # ctest case. This is the other half, and it is the one that catches the
+  # things a single toolchain cannot see: container implementations that iterate
+  # differently, `long` widths, FP contraction, and anything that depends on the
+  # allocator's address choices.
+  # -------------------------------------------------------------------------
+  determinism:
+    name: cross-toolchain digest
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rollup-*
+          path: rollups
+
+      - name: all toolchains must agree
+        run: |
+          echo "rollup digests over seeds 1..2000:"
+          for f in rollups/*/rollup.txt; do
+            echo "  $(cat "$f")  <- $(basename "$(dirname "$f")")"
+          done
+          count=$(cat rollups/*/rollup.txt | sort -u | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo ""
+            echo "INV-SIM-01 VIOLATED: toolchains disagree on the execution digest."
+            echo "The same seed produced different executions on different builds,"
+            echo "so no archived seed means the same thing everywhere. Look for"
+            echo "unordered-container iteration, pointer-value comparisons, or a"
+            echo "width-dependent integer type reaching a decision."
+            exit 1
+          fi
+          echo "all toolchains agree"

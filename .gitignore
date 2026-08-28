@@ -1,0 +1,30 @@
+build/
+out/
+.scratch/
+cmake-build-*/
+compile_commands.json
+.cache/
+CMakeUserPresets.json
+
+# Simulation artifacts. Traces are large and regenerable from the seed, which is
+# the entire point -- the seed goes in the ledger, the trace does not go in git.
+artifacts/
+*.jsonl
+*.trace
+
+# Explicitly NOT ignored: test/corpus/*.seed. Those are pinned regression seeds,
+# one per fixed bug, and they are the smallest and most valuable files here.
+!test/corpus/*.seed
+
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+
+.vscode/
+.idea/
+*.swp
+.DS_Store

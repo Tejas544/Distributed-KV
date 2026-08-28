@@ -1,0 +1,117 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "ANVIL_BUILD_TESTS": "ON",
+        "ANVIL_HERMETIC_CHECK": "ON",
+        "ANVIL_WERROR": "ON"
+      }
+    },
+    {
+      "name": "gcc",
+      "hidden": true,
+      "cacheVariables": { "CMAKE_CXX_COMPILER": "g++" }
+    },
+    {
+      "name": "clang",
+      "hidden": true,
+      "cacheVariables": { "CMAKE_CXX_COMPILER": "clang++" }
+    },
+
+    {
+      "name": "dev",
+      "displayName": "dev (gcc, asan+ubsan, BUGGIFY on)",
+      "description": "Day-to-day simulation work. ASan is affordable here because a seed reproduces the exact allocation sequence.",
+      "inherits": ["base", "gcc"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ANVIL_SANITIZER": "address",
+        "ANVIL_ENABLE_BUGGIFY": "ON"
+      }
+    },
+    {
+      "name": "fleet",
+      "displayName": "fleet (gcc, optimised, BUGGIFY on)",
+      "description": "What the nightly seed fleet runs. Simulated hours per wall-clock hour is the metric this preset exists to maximise.",
+      "inherits": ["base", "gcc"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "ANVIL_SANITIZER": "none",
+        "ANVIL_ENABLE_BUGGIFY": "ON"
+      }
+    },
+    {
+      "name": "digest-gcc",
+      "displayName": "digest cross-check (gcc)",
+      "description": "Half of the INV-SIM-01 gate. Must produce byte-identical execution digests to digest-clang and to the same preset on another architecture.",
+      "inherits": ["base", "gcc"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "ANVIL_SANITIZER": "none",
+        "ANVIL_ENABLE_BUGGIFY": "OFF"
+      }
+    },
+    {
+      "name": "digest-clang",
+      "displayName": "digest cross-check (clang)",
+      "inherits": ["base", "clang"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "ANVIL_SANITIZER": "none",
+        "ANVIL_ENABLE_BUGGIFY": "OFF"
+      }
+    },
+    {
+      "name": "prod",
+      "displayName": "prod (clang, release, BUGGIFY compiled out)",
+      "description": "The shipped configuration. BUGGIFY must be OFF: the macro becomes a literal false and every injection site disappears from the binary.",
+      "inherits": ["base", "clang"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ANVIL_SANITIZER": "none",
+        "ANVIL_ENABLE_BUGGIFY": "OFF"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "tsan (production runtime only)",
+      "description": "Only meaningful against anvil_prod. The core is single-threaded, so TSan has nothing to observe there.",
+      "inherits": ["base", "clang"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "ANVIL_SANITIZER": "thread",
+        "ANVIL_ENABLE_BUGGIFY": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "fleet", "configurePreset": "fleet" },
+    { "name": "prod", "configurePreset": "prod" },
+    { "name": "digest-gcc", "configurePreset": "digest-gcc" },
+    { "name": "digest-clang", "configurePreset": "digest-clang" }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "gate",
+      "displayName": "hermeticity gate only",
+      "configurePreset": "dev",
+      "filter": { "include": { "label": "gate" } },
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    }
+  ]
+}

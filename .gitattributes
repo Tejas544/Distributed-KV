@@ -1,0 +1,11 @@
+# Development happens on Windows, WSL2 and macOS. Line endings that vary by
+# checkout would change file contents, and file contents feed configuration
+# hashes that end up recorded next to seeds in the bug ledger. Normalise.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary
+
+# Pinned regression seeds: exact bytes, no translation, ever.
+*.seed -text

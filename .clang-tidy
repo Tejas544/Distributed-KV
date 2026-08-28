@@ -1,0 +1,83 @@
+# Static analysis for Anvil.
+#
+# The stock checks below are hygiene. The determinism rules that actually matter
+# -- no wall clock, no unseeded entropy, no raw threads, no unordered-container
+# iteration in decision paths, no float in control flow -- are NOT expressible
+# here. Some are enforced at link time by tools/hermetic_check.py; the rest need
+# custom clang-tidy checks, which are a P0 deliverable still outstanding (see
+# docs/ROADMAP.md, P0).
+#
+# The split is worth understanding, because the two are not interchangeable:
+#
+#   hermetic_check.py sees the *linker's* view. It catches anything, including
+#   calls that arrive transitively through a header five levels deep, which is
+#   how the clock usually gets in. It cannot see anything that does not produce
+#   an undefined symbol.
+#
+#   clang-tidy sees the *AST*. It catches things that leave no symbol trace at
+#   all -- iterating an std::unordered_map and branching on the order, comparing
+#   pointers to sort, a float creeping into a timeout computation. It cannot
+#   catch what it does not have source for.
+#
+# Neither alone is sufficient. Custom checks to write, in priority order:
+#
+#   anvil-no-unordered-iteration     range-for or explicit iteration over
+#                                    std::unordered_{map,set} whose body affects
+#                                    control flow or ordering. The single most
+#                                    common source of "why does this replay
+#                                    differently on the other machine".
+#   anvil-no-pointer-ordering        operator< on unrelated pointers; sorting or
+#                                    keying containers by address.
+#   anvil-no-float-in-control-flow   float or double reaching a branch condition
+#                                    or a duration computation.
+#   anvil-no-wallclock               std::chrono clock now() calls in anvil/core,
+#                                    caught at the AST level so the diagnostic
+#                                    names the line rather than the symbol.
+#   anvil-no-raw-thread              std::thread / std::mutex / std::atomic
+#                                    outside anvil/prod.
+#   anvil-runtime-io-only            direct POSIX I/O in anvil/core.
+
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -modernize-use-trailing-return-type,
+  -readability-magic-numbers,
+  -readability-identifier-length,
+  -misc-non-private-member-variables-in-classes,
+  -bugprone-easily-swappable-parameters
+
+WarningsAsErrors: 'bugprone-*,clang-analyzer-*,concurrency-*,portability-*'
+
+HeaderFilterRegex: '^.*/anvil/.*'
+
+CheckOptions:
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.PrivateMemberSuffix
+    value: '_'
+  - key: readability-identifier-naming.EnumConstantCase
+    value: CamelCase
+  - key: readability-identifier-naming.EnumConstantPrefix
+    value: 'k'
+  - key: readability-identifier-naming.GlobalConstantCase
+    value: CamelCase
+  - key: readability-identifier-naming.GlobalConstantPrefix
+    value: 'k'

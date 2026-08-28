@@ -1,0 +1,11 @@
+# ANV-0001 -- Scheduler::run() discarded one event at the deadline boundary.
+# The wedged node's WAL was intact on disk; its recovery wakeup had been thrown away.
+seed        = 10
+workload    = counter
+nodes       = 7
+faults      = drawn from seed
+invariant   = INV-LIVE-07 (replicas converge after faults heal)
+reproduce   = anvil-sim --seed 10 --workload counter --faults
+expect      = converged=yes, lost writes=0
+found_at    = <initial commit>
+fixed_at    = <initial commit>
