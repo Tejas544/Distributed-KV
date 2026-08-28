@@ -14,9 +14,9 @@
 
 | | |
 |---|---|
-| Phase | `P1 — Simulator core`, stream A complete (see [docs/ROADMAP.md](docs/ROADMAP.md)) |
-| Working | Runtime seam · hermeticity gate + negative control · deterministic scheduler on virtual time · **19 fault kinds** across network, disk, clock and process · swarm-drawn fault profiles · durable replicated-counter workload · execution digest · causal trace |
-| Next | P1 stream D: the reference model, the invariant framework with cost classes, and the Elle-style consistency checker |
+| Phase | `P1 — Simulator core`, **complete** (see [docs/ROADMAP.md](docs/ROADMAP.md)) |
+| Working | Runtime seam · hermeticity gate + negative control · deterministic scheduler on virtual time · **19 fault kinds** across network, disk, clock and process · swarm-drawn fault profiles · **invariant framework with cost classes**, evaluated inside the run loop · **Elle-style consistency checker** (version-order recovery, DSG, Tarjan, Adya classification, minimal witnesses) · serial reference model · durable replicated-counter workload · execution digest · causal trace |
+| Next | P2: the LSM storage engine — WAL, memtable, SSTables, compaction — against a disk model that can already lose data |
 | Language | C++20 (coroutines, concepts, ranges) + Python 3 tooling + TLA+ specs |
 | Platforms | Linux x86-64 (primary), macOS arm64 (determinism cross-check), Windows via WSL2 |
 | Bug ledger | [BUGS.md](BUGS.md) |
@@ -153,13 +153,23 @@ durability, 400 seeds under faults ... 23,783 acked increments, 0 lost
 liveness, 400 seeds after healing .... 0 unconverged
 media corruption ..................... 58 seeds, 100% detected by checksum
 
-seeded durability bug A (ack pre-fsync)  detected in 218/233 crashing seeds
-seeded durability bug B (no dir fsync)   detected in 233/233 crashing seeds
+seeded durability bug A (ack pre-fsync)  167/180 crashing seeds (workload + invariants)
+seeded durability bug B (no dir fsync)   180/180 crashing seeds (workload + invariants)
 
-bugs found (S0/S1/S2/S3/S4) .......... 0/0/1/0/3   (see BUGS.md)
+checker soundness (INV-SIM-03) ....... 90/90 known-bad histories flagged
+  correctly classified ............... 90/90 across 9 anomaly classes
+checker precision (INV-SIM-04) ....... 500/500 serial histories accepted
+checker mutation score ............... 13/13 non-equivalent mutants caught
+  (2 further mutants confirmed equivalent -- masked by BFS pruning
+   and by Tarjan discarding single-node components)
+isolation-level discrimination ....... write skew accepted at SI, rejected at
+                                       serializable; real-time violations
+                                       accepted at SER, rejected at strict
+cycle witnesses ...................... minimal (2 txns) even for 8-txn SCCs
+
+bugs found (S0/S1/S2/S3/S4) .......... 0/0/1/0/4   (see BUGS.md)
 BUGGIFY site activation coverage ..... n/a -- no BUGGIFY sites in the core yet
-invariant framework .................. (pending P1 stream D)
-checker mutation score ............... (pending P7)
+TLA+ trace-validation conformance .... (pending P7)
 TLA+ trace-validation conformance .... (pending P7)
 YCSB-A throughput / p99 .............. (pending P9)
 TPC-C tpmC / p99 ..................... (pending P9)
@@ -167,7 +177,7 @@ TPC-C tpmC / p99 ..................... (pending P9)
 
 Measured on the ping-pong and replicated-counter workloads. These are properties
 of the **harness**, not of a database — there is no storage engine, consensus,
-or transaction code yet. The four bugs in the ledger are three harness defects
+or transaction code yet. The five bugs in the ledger are four harness defects
 and one workload defect, which is the expected shape this early: the adversary
 currently has far more to say about the simulator than about the system under
 test. See [docs/ROADMAP.md](docs/ROADMAP.md).

@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "anvil/checker/invariant.h"
 #include "anvil/core/digest.h"
 #include "anvil/core/random.h"
 #include "anvil/core/runtime/task.h"
@@ -54,6 +55,7 @@ enum class StopReason : std::uint8_t {
   kDeadlineHit,   // max_time reached with work outstanding
   kStopRequested,
   kPanic,
+  kInvariantViolated,  // a protocol invariant failed mid-run
 };
 
 const char* to_string(StopReason reason) noexcept;
@@ -65,6 +67,15 @@ struct RunResult {
   std::uint64_t tasks_outstanding = 0;
   Digest digest;
   std::string panic_message;
+
+  // Every invariant that fired during the run. The first one is the
+  // interesting one -- after an invariant breaks, downstream state is already
+  // corrupt and later violations are usually consequences rather than causes.
+  std::vector<checker::Violation> violations;
+
+  bool ok() const noexcept {
+    return reason != StopReason::kPanic && reason != StopReason::kInvariantViolated;
+  }
 };
 
 class Scheduler {
@@ -96,6 +107,16 @@ class Scheduler {
   void spawn(NodeId node, Task<void> task);
 
   void request_stop() noexcept { stop_requested_ = true; }
+
+  // Armed invariants are evaluated inside the run loop: tick-class after every
+  // event, epoch-class every N. A violation stops the run immediately, because
+  // continuing past a broken invariant means every subsequent observation is
+  // about a system that is already corrupt -- and the resulting cascade buries
+  // the one violation that mattered.
+  void set_invariants(checker::InvariantRegistry* registry) noexcept {
+    invariants_ = registry;
+  }
+  checker::InvariantRegistry* invariants() const noexcept { return invariants_; }
 
   RunResult run(Duration max_time);
 
@@ -177,6 +198,8 @@ class Scheduler {
   Digest digest_;
   DeterministicRandom rng_;
   Trace* trace_;
+  checker::InvariantRegistry* invariants_ = nullptr;
+  std::vector<checker::Violation> violations_;
 };
 
 // Awaitable that parks the current coroutine and hands it back to the scheduler

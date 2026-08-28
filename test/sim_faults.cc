@@ -61,8 +61,13 @@ struct Outcome {
   anvil::sim::FaultSummary faults;
   std::vector<anvil::sim::FaultKind> exercised;
   std::vector<anvil::sim::FaultKind> unexercised;
+  std::vector<anvil::checker::Violation> violations;
   bool converged = false;
   std::uint32_t nodes = 0;
+
+  bool clean() const {
+    return faulted.ok() && settled.ok() && violations.empty();
+  }
 };
 
 Outcome run_seed(std::uint64_t seed, anvil::workloads::CounterConfig workload,
@@ -89,6 +94,10 @@ Outcome run_seed(std::uint64_t seed, anvil::workloads::CounterConfig workload,
   outcome.exercised = sim.faults().exercised_kinds();
   outcome.unexercised = sim.faults().unexercised_kinds();
   outcome.converged = anvil::workloads::converged(sim, outcome.state);
+
+  outcome.violations = outcome.faulted.violations;
+  outcome.violations.insert(outcome.violations.end(), outcome.settled.violations.begin(),
+                            outcome.settled.violations.end());
   return outcome;
 }
 
@@ -116,23 +125,36 @@ void test_correct_under_faults(std::uint64_t seeds) {
     const Outcome o = run_seed(seed, anvil::workloads::CounterConfig{}, true);
     total_acked += o.state.acked_ids.size();
 
-    if (o.faulted.reason == anvil::sim::StopReason::kPanic ||
-        o.settled.reason == anvil::sim::StopReason::kPanic) {
-      ++panics;
-      if (panics <= 3) {
-        std::cerr << "  seed " << seed << " panicked: " << o.faulted.panic_message
-                  << o.settled.panic_message << "\n";
-      }
-      continue;
-    }
-
+    // Media corruption is classified first, before anything else is treated as a
+    // failure. A single-replica write-ahead log with no erasure coding cannot
+    // survive a flipped bit in a record it already wrote -- there is nowhere to
+    // recover it from. What it must do is *notice*, and an INV-CTR-01 violation
+    // on such a seed is the invariant correctly reporting real, detected loss
+    // rather than a bug in the protocol.
     if (o.faults.disk.bit_rots > 0) {
       ++rot_seeds;
-      if (o.state.corruption_detected > 0 || o.state.lost_acked_writes == 0) {
+      const bool noticed = o.state.corruption_detected > 0 || !o.violations.empty() ||
+                           o.state.lost_acked_writes == 0;
+      if (noticed) {
         ++rot_seeds_detected;
       } else {
         std::cerr << "  seed " << seed << ": data lost to bit rot WITHOUT the checksum "
                      "firing -- silent corruption\n";
+      }
+      continue;
+    }
+
+    if (!o.faulted.ok() || !o.settled.ok()) {
+      ++panics;
+      if (panics <= 3) {
+        std::cerr << "  seed " << seed << " failed: " << o.faulted.panic_message
+                  << o.settled.panic_message << "  (crashes=" << o.faults.process.crashes
+                  << " torn=" << o.faults.disk.sectors_torn
+                  << " rot=" << o.faults.disk.bit_rots << " eio=" << o.faults.disk.io_errors
+                  << ")\n";
+        for (std::size_t i = 0; i < o.violations.size() && i < 2; ++i) {
+          std::cerr << "    " << o.violations[i].render() << "\n";
+        }
       }
       continue;
     }
@@ -153,7 +175,7 @@ void test_correct_under_faults(std::uint64_t seeds) {
     }
   }
 
-  check(panics == 0, "no seed may panic");
+  check(panics == 0, "no seed may panic or violate an invariant with correct settings");
   check(lost == 0,
         "absent media corruption, no promised increment may ever be lost, under any fault");
   check(not_converged == 0, "every node must catch up once the faults stop (liveness)");
@@ -256,46 +278,94 @@ void test_fault_coverage(std::uint64_t seeds) {
 // ---------------------------------------------------------------------------
 
 void test_seeded_durability_bugs(std::uint64_t seeds) {
-  // Bug A: acknowledge before fsync. The write is in the page cache, the client
-  // has been told it is durable, and a crash takes it. INV-LSM-01 in miniature.
-  {
-    anvil::workloads::CounterConfig broken;
-    broken.fsync_before_ack = false;
+  // Two deliberate durability bugs, each measured twice: once by the workload's
+  // own bookkeeping, and once by the armed invariants.
+  //
+  // The second number is the one that matters. INV-SIM-05 says an invariant
+  // that has never been observed to fire is an untested assertion -- possibly a
+  // vacuous one, a predicate over a set that is always empty. Watching
+  // INV-CTR-01 and INV-CTR-02 catch a bug that was planted on purpose is the
+  // only evidence that they would catch one that was not.
+  std::set<std::string> invariants_that_fired;
 
-    std::uint64_t detected = 0;
+  const auto sweep = [&](const char* label, anvil::workloads::CounterConfig broken) {
+    std::uint64_t by_workload = 0;
+    std::uint64_t by_invariant = 0;
     std::uint64_t crashing_seeds = 0;
+
     for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
       const Outcome o = run_seed(seed, broken, true);
       if (o.faults.process.crashes == 0) continue;  // no crash, nothing to lose
       ++crashing_seeds;
-      if (o.state.lost_acked_writes > 0) ++detected;
+      if (o.state.lost_acked_writes > 0) ++by_workload;
+      if (!o.violations.empty()) {
+        ++by_invariant;
+        for (const auto& v : o.violations) invariants_that_fired.insert(v.id);
+      }
     }
+
     check(crashing_seeds > 0, "the sweep must contain seeds that actually crash a node");
-    check(detected > 0,
-          "acknowledging before fsync must produce DETECTED data loss -- if the "
+    check(by_workload > 0,
+          "the seeded durability bug must produce DETECTED data loss -- if the "
           "harness cannot catch a bug it planted, it cannot catch a real one");
-    std::cout << "  seeded bug A (ack before fsync): detected in " << detected << "/"
-              << crashing_seeds << " crashing seeds\n";
-  }
+    check(by_invariant > 0, "the armed invariants must catch the seeded bug too");
+    std::cout << "  seeded bug " << label << ": workload check " << by_workload << "/"
+              << crashing_seeds << ", invariants " << by_invariant << "/" << crashing_seeds
+              << "\n";
+  };
 
-  // Bug B: never fsync the directory. Contents are synced on every write and the
-  // file still does not exist after a crash. This is the one a page-cache-only
-  // disk model reports as correct code.
-  {
-    anvil::workloads::CounterConfig broken;
-    broken.fsync_dir_on_create = false;
+  anvil::workloads::CounterConfig bug_a;
+  bug_a.fsync_before_ack = false;
+  sweep("A (ack before fsync)", bug_a);
 
-    std::uint64_t detected = 0;
-    std::uint64_t crashing_seeds = 0;
-    for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
-      const Outcome o = run_seed(seed, broken, true);
-      if (o.faults.process.crashes == 0) continue;
-      ++crashing_seeds;
-      if (o.state.lost_acked_writes > 0) ++detected;
-    }
-    check(detected > 0, "never fsyncing the directory must produce DETECTED data loss");
-    std::cout << "  seeded bug B (no dir fsync):     detected in " << detected << "/"
-              << crashing_seeds << " crashing seeds\n";
+  anvil::workloads::CounterConfig bug_b;
+  bug_b.fsync_dir_on_create = false;
+  sweep("B (no dir fsync)   ", bug_b);
+
+  std::cout << "  invariants observed firing:";
+  for (const std::string& id : invariants_that_fired) std::cout << " " << id;
+  std::cout << "\n";
+
+  // Non-vacuity. An invariant that has never fired against any seeded mutation
+  // has not been shown to be capable of firing at all.
+  //
+  // Only INV-CTR-01 is asserted here, and the reason is a finding in its own
+  // right: it *shadows* INV-CTR-02. Recovery always yields a prefix of the log,
+  // so a node missing a promised increment is always also short by count -- the
+  // cheap tick-class proxy fires first and stops the run before the epoch-class
+  // check gets a turn. INV-CTR-02 is still the real property and the proxy is
+  // only an approximation of it, so it stays armed; it gets its non-vacuity
+  // evidence from a targeted case instead. See ANV-0005.
+  check(invariants_that_fired.count("INV-CTR-01") > 0,
+        "INV-CTR-01 must be observed to fire against a seeded durability bug");
+}
+
+// INV-CTR-02's targeted non-vacuity case: a node holding the right *number* of
+// increments and the wrong ones. Unreachable through the counter workload, and
+// exactly the situation the size proxy cannot see.
+void test_inv_ctr_02_is_not_vacuous() {
+  anvil::sim::SimConfig cfg;
+  cfg.nodes = 2;
+  cfg.faults = anvil::sim::FaultProfile::none();
+  anvil::sim::Simulation sim{cfg};
+
+  anvil::workloads::CounterState state;
+  anvil::workloads::arm_invariants(sim, &state);
+
+  auto& node = state.nodes[1];
+  node.ready = true;
+  node.promised = {1, 2, 3};
+  node.applied = {1, 2, 99};  // same cardinality, wrong contents
+  state.nodes[2].ready = false;
+
+  const auto tick = sim.invariants().evaluate(anvil::checker::CostClass::kTick, {}, 1);
+  check(tick.empty(), "INV-CTR-01 cannot see this -- the counts match, which is the point");
+
+  const auto epoch = sim.invariants().evaluate(anvil::checker::CostClass::kEpoch, {}, 1);
+  check(epoch.size() == 1 && epoch.front().id == "INV-CTR-02",
+        "INV-CTR-02 must catch a node holding the right number of the wrong increments");
+  if (!epoch.empty()) {
+    std::cout << "  INV-CTR-02 non-vacuity: " << epoch.front().detail << "\n";
   }
 }
 
@@ -330,6 +400,7 @@ int main(int argc, char** argv) {
   test_determinism_under_faults(seeds / 3 + 1);
   test_fault_coverage(seeds);
   test_seeded_durability_bugs(seeds);
+  test_inv_ctr_02_is_not_vacuous();
 
   if (g_failures == 0) {
     std::cout << "fault injection: all checks passed\n";

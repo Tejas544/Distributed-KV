@@ -42,6 +42,18 @@ target_link_libraries(anvil_disk_crash PRIVATE anvil::sim anvil::sanitizers)
 add_test(NAME sim.disk_crash COMMAND anvil_disk_crash)
 set_tests_properties(sim.disk_crash PROPERTIES LABELS "faults;gate" TIMEOUT 300)
 
+# ---------------------------------------------------------------------------
+# P1 stream D: the oracles.
+#
+# INV-SIM-03 (the checker flags every known-bad history) and INV-SIM-04 (it
+# accepts every known-good one). The second is the one people skip, and it is
+# the one that decides whether the checker survives contact with a real team.
+# ---------------------------------------------------------------------------
+add_executable(anvil_checker_test checker_test.cc)
+target_link_libraries(anvil_checker_test PRIVATE anvil::checker anvil::sanitizers)
+add_test(NAME checker.elle COMMAND anvil_checker_test)
+set_tests_properties(checker.elle PROPERTIES LABELS "checker;gate" TIMEOUT 300)
+
 add_executable(anvil_sim_faults sim_faults.cc)
 target_link_libraries(anvil_sim_faults PRIVATE anvil::workloads anvil::sanitizers)
 add_test(NAME sim.faults COMMAND anvil_sim_faults 150)

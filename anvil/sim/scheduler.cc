@@ -11,6 +11,7 @@ const char* to_string(StopReason reason) noexcept {
     case StopReason::kDeadlineHit: return "deadline";
     case StopReason::kStopRequested: return "stopped";
     case StopReason::kPanic: return "panic";
+    case StopReason::kInvariantViolated: return "invariant-violated";
   }
   return "unknown";
 }
@@ -247,6 +248,22 @@ RunResult Scheduler::run(Duration max_time) {
       reason = StopReason::kPanic;
       break;
     }
+
+    if (invariants_ != nullptr && !invariants_->empty()) {
+      // Tick class after every event; epoch class every N. The predicates run
+      // *after* the event has been applied, so they observe the state the
+      // protocol just produced rather than the state it started from.
+      auto fired = invariants_->evaluate(checker::CostClass::kTick, now_, tick_);
+      if (invariants_->epoch() > 0 && tick_ % invariants_->epoch() == 0) {
+        auto epoch = invariants_->evaluate(checker::CostClass::kEpoch, now_, tick_);
+        fired.insert(fired.end(), epoch.begin(), epoch.end());
+      }
+      if (!fired.empty()) {
+        violations_.insert(violations_.end(), fired.begin(), fired.end());
+        reason = StopReason::kInvariantViolated;
+        break;
+      }
+    }
   }
 
   RunResult result;
@@ -256,6 +273,7 @@ RunResult Scheduler::run(Duration max_time) {
   result.tasks_outstanding = roots_.size();
   result.digest = digest_;
   result.panic_message = panic_message_;
+  result.violations = violations_;
   return result;
 }
 

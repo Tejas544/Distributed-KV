@@ -32,6 +32,7 @@ std::uint64_t SimConfig::config_hash() const noexcept {
 Simulation::Simulation(SimConfig config) : config_(config) {
   trace_ = std::make_unique<Trace>(config_.record_trace);
   scheduler_ = std::make_unique<Scheduler>(config_.seed, trace_.get());
+  scheduler_->set_invariants(&invariants_);
   clock_ = std::make_unique<ClockModel>(config_.seed, config_.faults.clock, config_.nodes);
   net_ = std::make_unique<NetworkModel>(scheduler_.get(), config_.seed, config_.faults.net);
   disk_ = std::make_unique<DiskModel>(scheduler_.get(), config_.seed, config_.faults.disk);
@@ -124,7 +125,22 @@ RunResult Simulation::heal_and_settle(Duration grace) {
   // run() interprets its argument as an absolute deadline measured from time
   // zero, so the remaining grace has to be expressed that way.
   const Timestamp deadline = scheduler_->now().advanced_by(grace);
-  return scheduler_->run(Duration{static_cast<std::int64_t>(deadline.physical)});
+  RunResult result = scheduler_->run(Duration{static_cast<std::int64_t>(deadline.physical)});
+
+  // Quiesce-class invariants run only here, and only here is where they mean
+  // anything. "Every replica has converged" is false by design during a
+  // partition; asking it before the adversary has stopped would produce a
+  // stream of violations that are correct behaviour, and a check that reports
+  // correct behaviour as a failure gets switched off.
+  if (result.ok()) {
+    auto fired = invariants_.evaluate(checker::CostClass::kQuiesce, scheduler_->now(),
+                                      result.events);
+    if (!fired.empty()) {
+      result.reason = StopReason::kInvariantViolated;
+      result.violations.insert(result.violations.end(), fired.begin(), fired.end());
+    }
+  }
+  return result;
 }
 
 }  // namespace anvil::sim

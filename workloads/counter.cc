@@ -341,6 +341,64 @@ Task<void> boot_follower(Runtime& rt, CounterConfig cfg, CounterState* st) {
 
 }  // namespace
 
+void arm_invariants(sim::Simulation& simulation, CounterState* state) {
+  auto& invariants = simulation.invariants();
+  const std::uint32_t nodes = simulation.node_count();
+
+  // A node mid-recovery has deliberately cleared its applied set and has not
+  // rebuilt it yet, so every predicate here skips nodes that are not `ready`.
+  // Without that guard these would fire on every single crash -- which is how
+  // an invariant earns a reputation for false positives and gets disarmed.
+  invariants.arm(
+      "INV-CTR-01", "a node never promises more than it holds",
+      checker::CostClass::kTick, [state, nodes]() -> std::optional<std::string> {
+        for (std::uint32_t i = 1; i <= nodes; ++i) {
+          const auto it = state->nodes.find(i);
+          if (it == state->nodes.end() || !it->second.ready) continue;
+          if (it->second.applied.size() < it->second.promised.size()) {
+            return "node " + std::to_string(i) + " has promised " +
+                   std::to_string(it->second.promised.size()) + " increments but holds only " +
+                   std::to_string(it->second.applied.size());
+          }
+        }
+        return std::nullopt;
+      });
+
+  invariants.arm(
+      "INV-CTR-02", "every promise is durably held",
+      checker::CostClass::kEpoch, [state, nodes]() -> std::optional<std::string> {
+        for (std::uint32_t i = 1; i <= nodes; ++i) {
+          const auto it = state->nodes.find(i);
+          if (it == state->nodes.end() || !it->second.ready) continue;
+          for (const std::uint64_t id : it->second.promised) {
+            if (!it->second.applied.contains(id)) {
+              return "node " + std::to_string(i) + " promised increment " +
+                     std::to_string(id) + " and does not hold it";
+            }
+          }
+        }
+        return std::nullopt;
+      });
+
+  invariants.arm(
+      "INV-CTR-03", "every node converges on every acknowledged increment",
+      checker::CostClass::kQuiesce, [state, nodes]() -> std::optional<std::string> {
+        for (std::uint32_t i = 1; i <= nodes; ++i) {
+          const auto it = state->nodes.find(i);
+          if (it == state->nodes.end()) {
+            return "node " + std::to_string(i) + " has no recorded state at quiesce";
+          }
+          for (const std::uint64_t id : state->acked_ids) {
+            if (!it->second.applied.contains(id)) {
+              return "node " + std::to_string(i) + " is missing acknowledged increment " +
+                     std::to_string(id) + " after the faults healed";
+            }
+          }
+        }
+        return std::nullopt;
+      });
+}
+
 void install(sim::Simulation& simulation, CounterConfig config, CounterState* state) {
   const std::uint32_t nodes = simulation.node_count();
   if (nodes < 2) throw sim::SimulationPanic("counter workload needs at least two nodes");
@@ -372,6 +430,8 @@ void install(sim::Simulation& simulation, CounterConfig config, CounterState* st
       }
     });
   }
+
+  arm_invariants(simulation, state);
 
   // Boot everything for the first time.
   for (std::uint32_t i = 1; i <= nodes; ++i) {

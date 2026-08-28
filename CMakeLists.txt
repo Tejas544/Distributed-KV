@@ -55,9 +55,11 @@ if(ANVIL_BUILD_TESTS)
 endif()
 
 add_subdirectory(anvil/core)
+# checker before sim: the scheduler evaluates invariants inside its run loop, so
+# anvil::checker must be an ALIAS target by the time anvil/sim references it.
+add_subdirectory(anvil/checker)
 add_subdirectory(anvil/sim)
 add_subdirectory(anvil/prod)
-add_subdirectory(anvil/checker)
 add_subdirectory(workloads)
 
 # ---------------------------------------------------------------------------

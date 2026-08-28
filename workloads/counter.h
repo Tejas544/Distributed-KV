@@ -109,10 +109,27 @@ struct CounterState {
   bool done = false;
 };
 
-// Registers boot functions for every node and starts the cluster. The boot
-// function is re-invoked on every restart, so it performs recovery rather than
-// assuming a blank machine.
+// Registers boot functions for every node, arms the workload's invariants, and
+// starts the cluster. The boot function is re-invoked on every restart, so it
+// performs recovery rather than assuming a blank machine.
 void install(sim::Simulation& simulation, CounterConfig config, CounterState* state);
+
+// Arms INV-CTR-*. Called by install(); exposed separately so a test can build a
+// simulation without them and confirm they are what is doing the catching.
+//
+// Three predicates at three cost classes, and the split is the point:
+//
+//   INV-CTR-01  tick     |applied| >= |promised| for every ready node. O(nodes),
+//                        cheap enough to run after every scheduler event. A weak
+//                        approximation of the real property, but it catches a
+//                        durability regression within one event of it happening.
+//   INV-CTR-02  epoch    promised is a subset of applied. The real property, but
+//                        O(total promised) -- affordable every thousand events,
+//                        ruinous every event.
+//   INV-CTR-03  quiesce  every node holds every acknowledged increment. Only
+//                        meaningful once the adversary has stopped: during a
+//                        partition this is false by design.
+void arm_invariants(sim::Simulation& simulation, CounterState* state);
 
 // True once every node's applied set contains every acknowledged id. The
 // liveness property, checked after faults heal.

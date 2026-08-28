@@ -26,8 +26,11 @@ add_library(anvil::sim ALIAS anvil_sim)
 
 target_include_directories(anvil_sim PUBLIC "${PROJECT_SOURCE_DIR}")
 
+# anvil::checker is PUBLIC because scheduler.h exposes InvariantRegistry in its
+# interface: invariants are evaluated inside the run loop, not bolted on
+# afterwards, so anything that includes the scheduler needs the checker's types.
 target_link_libraries(anvil_sim
-  PUBLIC anvil::core anvil::warnings
+  PUBLIC anvil::core anvil::checker anvil::warnings
   PRIVATE anvil::sanitizers)
 
 # BUGGIFY is always compiled in for anything that links the simulator. A

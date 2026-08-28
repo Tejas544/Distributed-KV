@@ -272,6 +272,57 @@ lesson: |
 </details>
 
 <details>
+<summary><b>ANV-0005</b> · S4 · checker · <b>an armed invariant that could never fire</b></summary>
+
+```yaml
+id:              ANV-0005
+title:           INV-CTR-02 is shadowed by INV-CTR-01 and cannot fire through the workload
+status:          fixed
+severity:        S4
+class:           test-infra
+layer:           checker
+invariant:       INV-SIM-05 (an invariant that has never fired is presumed vacuous)
+found_by:        dst-random (the non-vacuity assertion itself, on its first run)
+api_visible:     n/a
+commit_found:    P1 stream D
+root_cause: |
+  INV-CTR-01 (tick class, O(nodes)) asserts |applied| >= |promised| as a cheap
+  proxy. INV-CTR-02 (epoch class) asserts the real property, promised subset of
+  applied. For the counter workload the proxy strictly subsumes the real check:
+  recovery always yields a *prefix* of the log, so a node missing a promised
+  increment is always also short by count. The tick check fires first and stops
+  the run, and the epoch check never gets a turn.
+  It did not look that way at first. At 60 and 100 seeds INV-CTR-02 never
+  appeared; at 300 seeds it did, which briefly looked like the shadowing being
+  only partial. It is not. The scheduler evaluates tick class after every event
+  and *additionally* evaluates epoch class on epoch boundaries, collecting both
+  into one violation list -- so when a violation happens to be live on an epoch
+  boundary, INV-CTR-02 reports the same defect INV-CTR-01 had already caught.
+  That is co-firing, not detection, and counting it as coverage would have been
+  exactly the false comfort INV-SIM-05 exists to prevent.
+fix: |
+  INV-CTR-02 stays armed -- it is the actual property and the size check is only
+  an approximation of it, so deleting it would trade a real assertion for a
+  proxy. It now has a targeted non-vacuity case instead: a node holding the
+  right *number* of increments and the wrong ones, which INV-CTR-01 cannot see
+  by construction.
+fix_commit:      P1 stream D
+regression:      test_inv_ctr_02_is_not_vacuous in test/sim_faults.cc
+lesson: |
+  A cheap tick-class proxy in front of an expensive epoch-class check will
+  shadow it, and the shadowing is invisible from evaluation counts -- INV-CTR-02
+  was being *run* constantly. Even firing counts are not enough on their own,
+  because co-firing on an epoch boundary looks identical to detection. What
+  distinguishes them is whether the invariant can catch something the proxy
+  cannot, and the only way to know is to construct that case deliberately.
+  Every future pair of (cheap proxy, real property) needs the same treatment.
+  The wider point: the fleet's "invariant health" report must not count
+  violations alone. An invariant needs a case it *uniquely* catches, or it is
+  decoration.
+```
+</details>
+
+<details>
 <summary><b>EXAMPLE (format reference, not a finding)</b> — ANV-EX01 · S1 · raft · api_visible: no</summary>
 
 <details>

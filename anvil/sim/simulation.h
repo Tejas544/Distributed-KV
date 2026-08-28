@@ -71,6 +71,12 @@ class Simulation {
   // machine. A workload that cannot be booted twice cannot be crash-tested.
   void set_boot(NodeId id, ProcessModel::BootFn boot);
 
+  // Arm invariants here. Tick- and epoch-class predicates are evaluated inside
+  // the run loop; quiesce-class ones run when the simulation settles, which is
+  // the only point at which "after the faults stop, does everything converge"
+  // is a meaningful question to ask.
+  checker::InvariantRegistry& invariants() noexcept { return invariants_; }
+
   Scheduler& scheduler() noexcept { return *scheduler_; }
   Trace& trace() noexcept { return *trace_; }
   NetworkModel& net() noexcept { return *net_; }
@@ -96,6 +102,7 @@ class Simulation {
 
  private:
   SimConfig config_;
+  checker::InvariantRegistry invariants_;
   std::unique_ptr<Trace> trace_;
   std::unique_ptr<Scheduler> scheduler_;
   std::unique_ptr<ClockModel> clock_;
