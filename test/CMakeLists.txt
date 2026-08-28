@@ -60,6 +60,30 @@ add_test(NAME sim.faults COMMAND anvil_sim_faults 150)
 set_tests_properties(sim.faults PROPERTIES LABELS "faults;gate" TIMEOUT 900)
 
 # ---------------------------------------------------------------------------
+# P2: the storage engine.
+#
+# lsm_test covers the building blocks in isolation -- a bug in internal key
+# ordering or in the block encoder is far cheaper to find here than as "a read
+# returned the wrong version under a specific compaction interleaving".
+#
+# lsm_crash is the engine under the disk model's full adversary, and carries
+# P2's exit criteria: no acknowledged write lost, every corruption detected and
+# none served, no orphaned files, and four planted durability bugs all caught.
+# The other four planted bugs are source mutations, driven by
+# tools/lsm_mutations.sh, which cannot run from ctest because it rewrites the
+# tree it is testing.
+# ---------------------------------------------------------------------------
+add_executable(anvil_lsm_test lsm_test.cc)
+target_link_libraries(anvil_lsm_test PRIVATE anvil::lsm anvil::sim anvil::sanitizers)
+add_test(NAME lsm.units COMMAND anvil_lsm_test)
+set_tests_properties(lsm.units PROPERTIES LABELS "lsm" TIMEOUT 300)
+
+add_executable(anvil_lsm_crash lsm_crash.cc)
+target_link_libraries(anvil_lsm_crash PRIVATE anvil::lsm anvil::sim anvil::sanitizers)
+add_test(NAME lsm.crash COMMAND anvil_lsm_crash 60)
+set_tests_properties(lsm.crash PROPERTIES LABELS "lsm;faults;gate" TIMEOUT 900)
+
+# ---------------------------------------------------------------------------
 # The gate's negative test.
 #
 # This archive is deliberately full of forbidden symbols. The test passes only

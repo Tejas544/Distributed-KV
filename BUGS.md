@@ -323,6 +323,227 @@ lesson: |
 </details>
 
 <details>
+<summary><b>ANV-0006</b> · S4 · lsm · <b>the crash suite passed on a database with fsync switched off</b></summary>
+
+```yaml
+id:              ANV-0006
+title:           memtable flush threshold equalled the arena block size, so the WAL never held unsynced data
+status:          fixed
+severity:        S4
+class:           test-infra
+layer:           lsm
+invariant:       INV-LSM-01 (no acknowledged write is lost)
+found_by:        seeded-mutation drill
+api_visible:     n/a
+commit_found:    P2
+root_cause: |
+  The crash test configured memtable_bytes = 4096, which is exactly the arena's
+  block size. The first insert allocated a block, memory_usage() immediately met
+  the threshold, and every single write triggered a flush to an fsynced SSTable.
+  The write-ahead log therefore never accumulated anything: data was durable by a
+  different route entirely.
+  The consequence is the interesting part. With sync_wal_on_write deliberately
+  set to false -- the single most important durability guarantee the engine has,
+  switched off on purpose -- the suite reported a clean pass across every seed.
+  Not a weak signal, not an intermittent one: zero detections out of eleven.
+fix:             memtable_bytes = 16384, roughly four arena blocks
+fix_commit:      P2
+regression:      the seeded-bug sweep in test/lsm_crash.cc now detects it in 30/31 seeds
+lesson: |
+  A test configuration can disable the mechanism under test without disabling
+  the test. Nothing about the suite looked wrong -- it crashed, it recovered, it
+  verified every acknowledged write -- and it was checking a code path the
+  workload never reached.
+  This is exactly what the seeded-mutation drill exists for and it is the first
+  bug the drill found. A green suite is evidence of nothing until you have
+  watched it go red for a reason you planted.
+```
+</details>
+
+<details>
+<summary><b>ANV-0007</b> · S4 · lsm · <b>the crash audit reported a false INV-LSM-11 violation</b></summary>
+
+```yaml
+id:              ANV-0007
+title:           stale reads caused by media corruption were scored as "a corrupted block was served"
+status:          fixed
+severity:        S4
+class:           test-infra
+layer:           lsm
+invariant:       INV-LSM-11 (a corrupted block is never served as data)
+found_by:        dst-random
+api_visible:     n/a
+seed:            1..11 of the bit-rot sweep
+commit_found:    P2
+root_cause: |
+  The audit classified any read whose value differed from the acknowledged one
+  as an INV-LSM-11 violation. Bit rot in the WAL makes recovery truncate, which
+  loses the newest write and leaves the reader seeing the *previous* one -- real
+  bytes, genuinely written, just not the latest. That is durability loss, which a
+  single-replica log has no redundancy to avoid, and it is not the same thing as
+  serving bytes nobody ever wrote.
+  The suite reported 15 INV-LSM-11 violations against behaviour that is both
+  correct and unavoidable.
+fix: |
+  Track every value ever acknowledged per key. A read is now classified as
+  correct, stale (an older acknowledged value -- durability loss, and required to
+  be accompanied by a detection), or invented (bytes nobody wrote -- the actual
+  INV-LSM-11 violation, required to be zero).
+fix_commit:      P2
+regression:      test_corruption_is_detected_not_served in test/lsm_crash.cc
+lesson: |
+  False positives are the more dangerous failure mode. A checker that misses
+  bugs is merely useless; one that reports correct behaviour as a violation gets
+  argued with, then distrusted, then switched off -- taking every result that
+  depended on it. The taxonomy has to be exactly as precise as the invariant it
+  claims to enforce.
+```
+</details>
+
+<details>
+<summary><b>ANV-0008</b> · S4 · lsm · <b>detection was scored as survival</b></summary>
+
+```yaml
+id:              ANV-0008
+title:           the crash audit treated a corrupt-read error as a pass rather than as data loss
+status:          fixed
+severity:        S4
+class:           test-infra
+layer:           lsm
+found_by:        seeded-mutation drill
+api_visible:     n/a
+commit_found:    P2
+root_cause: |
+  When a read returned kCorruption the audit counted a detection and moved on,
+  never recording that the acknowledged value was unreachable. With
+  sync_table_on_finish deliberately disabled, the engine was loudly reporting 47
+  checksum failures per seed and the suite scored the run clean.
+fix:             a corrupt or failed read of an acknowledged key now counts as
+                 unreadable, which is data loss whatever the error code says
+fix_commit:      P2
+regression:      the seeded-bug sweep detects it in 22/31 seeds
+lesson: |
+  "The engine noticed" and "the data survived" are different claims, and only the
+  second is what durability means. An audit that stops at the first is measuring
+  error handling, not correctness.
+```
+</details>
+
+<details>
+<summary><b>ANV-0009</b> · S1 · lsm · <b>a truncated MANIFEST lost version edits in silence</b></summary>
+
+```yaml
+id:              ANV-0009
+title:           MANIFEST checksum failures dropped version edits with no signal to the caller
+status:          fixed
+severity:        S1
+class:           safety
+layer:           lsm
+invariant:       INV-LSM-08 (the recovered VersionSet reflects a crash-atomic manifest)
+found_by:        dst-random (bit-rot sweep)
+api_visible:     conditional -- the database silently reverts to an older state
+commit_found:    P2
+root_cause: |
+  VersionSet::recover replayed the manifest through the same
+  truncate-at-first-invalid-record reader as the data WAL, which is correct: the
+  dropped edits were never durable, so the recovered version is consistent.
+  But nothing recorded that it had happened. Media corruption of the manifest
+  therefore presented as data quietly reverting to an older state, with every
+  status code reporting success -- indistinguishable, from outside, from an
+  engine bug that lost files.
+  Surfaced by the bit-rot sweep as "lost data with no corruption detected",
+  which was the only symptom available.
+fix:             VersionSet counts manifest truncations; Db surfaces the count
+                 in DbStats
+fix_commit:      P2
+regression:      test_corruption_is_detected_not_served asserts every loss is
+                 accompanied by a detection
+lesson: |
+  Correct handling and adequate reporting are separate requirements, and the
+  second is easy to forget precisely when the first is done well. Every place the
+  engine legitimately discards data because a checksum failed needs a counter, or
+  the difference between "corruption happened" and "the engine has a bug" cannot
+  be established after the fact.
+```
+</details>
+
+<details>
+<summary><b>ANV-0011</b> · S4 · lsm · <b>the crash suite could not reach the situation the tombstone guard protects</b></summary>
+
+```yaml
+id:              ANV-0011
+title:           dropping tombstones above the bottom level was undetectable; the workload never built three levels
+status:          fixed
+severity:        S4
+class:           test-infra
+layer:           lsm
+invariant:       INV-LSM-12 (compaction preserves the visible-key set)
+found_by:        seeded-mutation drill (mutation 6)
+api_visible:     n/a
+commit_found:    P2
+root_cause: |
+  Compaction may only drop a tombstone where nothing below it could still hold
+  an older value; dropping one too early resurrects a deleted key, silently and
+  permanently. The guard is a single `bottom_most` condition, and removing it
+  changed nothing that any test could observe.
+  Not because the property held. Because the crash workload wrote 300 small
+  values into a database with a 16 KiB memtable, which never built more than two
+  levels -- so `bottom_most` was true in essentially every compaction and the
+  guard was dead weight in every run. The mutation was *nearly equivalent* under
+  that workload, which looks identical to "the code is fine" from the outside.
+fix: |
+  A targeted case in test/lsm_test.cc: 900 keys with a 4 KiB base level, driven
+  until at least two levels are populated, then a third of the keys deleted and
+  the tombstones compacted downward with older values still beneath them.
+  Verified in both directions -- passes on the real engine, fails on the mutant.
+fix_commit:      P2
+regression:      test_tombstones_survive_until_the_bottom_level
+lesson: |
+  The same shape as ANV-0005: a property that cannot be reached is a property
+  that is not being tested, and the symptom is indistinguishable from
+  correctness. Coverage of *code* is not coverage of *situations* -- the
+  compaction path ran thousands of times per sweep and the branch that mattered
+  never had anything to decide.
+  General rule now: any guard of the form "only do X when Y" needs a case that
+  reaches it with Y false, constructed deliberately, because a random workload
+  will not find it.
+```
+</details>
+
+<details>
+<summary><b>ANV-0010</b> · S1 · lsm · <b>CURRENT had no checksum</b></summary>
+
+```yaml
+id:              ANV-0010
+title:           the CURRENT file was unchecksummed, so its corruption surfaced as "no such file"
+status:          fixed
+severity:        S1
+class:           safety
+layer:           lsm
+invariant:       INV-LSM-11 (corruption is detected, never misreported)
+found_by:        code-review, prompted by the bit-rot sweep
+api_visible:     conditional
+commit_found:    P2
+root_cause: |
+  CURRENT is fifteen bytes and the entire database hangs from it: it names the
+  live MANIFEST. It was written and read as a bare string. A single flipped bit
+  produced a filename that did not exist, so recovery failed with kNotFound --
+  sending anyone debugging it to look for a missing file rather than for damaged
+  media.
+fix:             CURRENT is now [crc32c][name], verified on read, reported as
+                 kCorruption
+fix_commit:      P2
+lesson: |
+  Every persisted byte needs a checksum, including the small ones -- especially
+  the small ones, because they tend to be the pointers everything else depends
+  on. The cost here was four bytes and the benefit is that the failure names
+  itself.
+  Worth noting how this was found: not by a test failing, but by asking why a
+  test failure said "no such file". Diagnostics that lie cost more than the bug.
+```
+</details>
+
+<details>
 <summary><b>EXAMPLE (format reference, not a finding)</b> — ANV-EX01 · S1 · raft · api_visible: no</summary>
 
 <details>

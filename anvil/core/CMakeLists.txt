@@ -31,4 +31,6 @@ target_sources(anvil_core PRIVATE
   runtime/runtime.h
 )
 
+add_subdirectory(lsm)
+
 anvil_add_hermetic_check(anvil_core)

@@ -14,9 +14,9 @@
 
 | | |
 |---|---|
-| Phase | `P1 — Simulator core`, **complete** (see [docs/ROADMAP.md](docs/ROADMAP.md)) |
-| Working | Runtime seam · hermeticity gate + negative control · deterministic scheduler on virtual time · **19 fault kinds** across network, disk, clock and process · swarm-drawn fault profiles · **invariant framework with cost classes**, evaluated inside the run loop · **Elle-style consistency checker** (version-order recovery, DSG, Tarjan, Adya classification, minimal witnesses) · serial reference model · durable replicated-counter workload · execution digest · causal trace |
-| Next | P2: the LSM storage engine — WAL, memtable, SSTables, compaction — against a disk model that can already lose data |
+| Phase | `P2 — LSM storage engine`, **complete** (see [docs/ROADMAP.md](docs/ROADMAP.md)) |
+| Working | Runtime seam · hermeticity gate + negative control · deterministic scheduler on virtual time · **19 fault kinds** across network, disk, clock and process · invariant framework with cost classes · Elle-style consistency checker · serial reference model · **LSM engine: WAL, skiplist memtable, block-based SSTables with Bloom filters, MANIFEST/VersionSet, leveled compaction, block cache, crash recovery** · execution digest · causal trace |
+| Next | P3: Raft, with the twelve `INV-RAFT-*` predicates armed inside the run loop |
 | Language | C++20 (coroutines, concepts, ranges) + Python 3 tooling + TLA+ specs |
 | Platforms | Linux x86-64 (primary), macOS arm64 (determinism cross-check), Windows via WSL2 |
 | Bug ledger | [BUGS.md](BUGS.md) |
@@ -162,25 +162,47 @@ checker precision (INV-SIM-04) ....... 500/500 serial histories accepted
 checker mutation score ............... 13/13 non-equivalent mutants caught
   (2 further mutants confirmed equivalent -- masked by BFS pruning
    and by Tarjan discarding single-node components)
+
+-- P2, the storage engine --
+crash cycles, 60 seeds ............... 13,116 acknowledged writes, 0 lost
+  deleted keys resurrected ........... 0
+  orphaned files after recovery ...... 0 seeds
+corruption (bit rot before crash) .... detected in 31/31 seeds
+  bytes served that nobody wrote ..... 0        (INV-LSM-11)
+ENOSPC + EIO sweep ................... 5,193 writes acknowledged, 0 lost
+storage engine hermeticity ........... clean (141 strong undefined symbols)
+seeded storage bugs .................. 10/10 caught (P2 required 8)
+  via DurabilityOptions .............. 4/4
+  no fsync before ack ................ 30/31 crashing seeds
+  no MANIFEST fsync .................. 21/31
+  no directory fsync ................. 31/31
+  SSTable published before durable ... 22/31
+  via source mutation ................ 6/6
+  WAL salvages past a bad checksum ... caught
+  tombstones dropped above bottom .... caught
+  orphan sweep deletes live files .... caught
+  Bloom probe count off by one ....... caught
+  key comparator inverts versions .... caught
+  block checksum never verified ...... caught
 isolation-level discrimination ....... write skew accepted at SI, rejected at
                                        serializable; real-time violations
                                        accepted at SER, rejected at strict
 cycle witnesses ...................... minimal (2 txns) even for 8-txn SCCs
 
-bugs found (S0/S1/S2/S3/S4) .......... 0/0/1/0/4   (see BUGS.md)
+bugs found (S0/S1/S2/S3/S4) .......... 0/2/1/0/7   (see BUGS.md)
 BUGGIFY site activation coverage ..... n/a -- no BUGGIFY sites in the core yet
-TLA+ trace-validation conformance .... (pending P7)
 TLA+ trace-validation conformance .... (pending P7)
 YCSB-A throughput / p99 .............. (pending P9)
 TPC-C tpmC / p99 ..................... (pending P9)
 ```
 
-Measured on the ping-pong and replicated-counter workloads. These are properties
-of the **harness**, not of a database — there is no storage engine, consensus,
-or transaction code yet. The five bugs in the ledger are four harness defects
-and one workload defect, which is the expected shape this early: the adversary
-currently has far more to say about the simulator than about the system under
-test. See [docs/ROADMAP.md](docs/ROADMAP.md).
+Measured on the ping-pong, replicated-counter and key-value workloads. There is
+still no consensus or transaction layer. Ten of the eleven ledger entries are
+harness or workload defects and only two are engine bugs — which is the honest
+shape at this stage, and the reason the seeded-mutation drills matter more than
+the pass counts: five of the eleven were found by deliberately breaking
+something and discovering the suite did not notice.
+See [docs/ROADMAP.md](docs/ROADMAP.md).
 <!-- END GENERATED RESULTS -->
 
 ---
@@ -191,7 +213,8 @@ test. See [docs/ROADMAP.md](docs/ROADMAP.md).
 anvil/
   core/           # hermetic: no syscalls, no clock, no threads. The state machines.
     runtime/      #   Runtime interface: clock, random, net, disk, spawn, timers
-    lsm/          #   WAL, memtable, sstable, compaction, cache, manifest
+    lsm/          #   format, WAL, memtable, sstable, version/manifest,
+                  #   compaction, block cache, db  -- P2, gated as hermetic
     mvcc/         #   version store, lock table, GC safepoints
     raft/         #   consensus, membership, snapshots, leases
     shard/        #   range descriptors, split/merge, placement driver
