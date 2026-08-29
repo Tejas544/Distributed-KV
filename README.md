@@ -249,6 +249,7 @@ Local toolchain notes for this machine are in [docs/SCOPE.md](docs/SCOPE.md#tool
 
 | Document | What it is |
 |---|---|
+| [CONTEXT.md](CONTEXT.md) | **Start here.** Engineering context: architecture, file map, APIs, conventions, current state, gotchas. Enough to make a correct change without reading the codebase. |
 | [docs/SCOPE.md](docs/SCOPE.md) | Exact scope, guarantee matrix, interface contracts, non-goals, tiering, team split |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Ten phases, deliverables, measurable exit criteria, risks |
 | [docs/INVARIANTS.md](docs/INVARIANTS.md) | The numbered invariant catalogue — the heart of protocol-aware DST |
