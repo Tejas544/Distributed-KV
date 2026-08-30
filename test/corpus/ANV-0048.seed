@@ -1,0 +1,14 @@
+# ANV-0048 -- a restarted node served a lease read before re-applying its log
+# the lease is durable and comes back with the node; the state machine comes
+# back at its last snapshot and re-applies from there
+seed        = 19
+workload    = shard_kv
+nodes       = 5
+faults      = drawn from seed; requires a crash of a lease holder
+invariant   = INV-SHARD-CLIENT
+reproduce   = anvil_shard_faults 24
+note        = the condition is applied >= commit, and it covers the other case
+              too: a leader elected a moment ago has committed entries it has
+              not applied.
+found_at    = P5
+fixed_at    = P5

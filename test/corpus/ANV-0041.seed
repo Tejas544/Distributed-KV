@@ -1,0 +1,13 @@
+# ANV-0041 -- read freshness measured with a number that legitimately regresses
+# the read reply carried the state machine's applied index, which resets across
+# a snapshot install while the state it describes moves forward
+seed        = 4
+workload    = shard_kv
+nodes       = 5
+faults      = drawn from seed
+invariant   = INV-SHARD-CLIENT (a lease read never returns older state)
+reproduce   = anvil_shard_faults 12
+note        = the same confusion as ANV-0040, on the serving path rather than
+              the checking path; both were found the same afternoon
+found_at    = P5
+fixed_at    = P5

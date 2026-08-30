@@ -195,7 +195,8 @@ void VersionSet::apply(const VersionEdit& edit) {
     next_file_number_ = std::max(next_file_number_, *edit.next_file_number());
   }
   if (edit.last_sequence().has_value()) {
-    last_sequence_ = std::max(last_sequence_, *edit.last_sequence());
+    // Through the setter, so the allocator stays ahead of the watermark.
+    set_last_sequence(*edit.last_sequence());
   }
 
   // Deletions before additions: a compaction edit can legitimately remove a

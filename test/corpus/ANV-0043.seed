@@ -1,0 +1,14 @@
+# ANV-0043 -- the audit treated an unbounded key range as the smallest one
+# survivor_end >= desc.end is true for every range at the top of the key space,
+# because an empty end sorts first as a string and means +inf as a value
+seed        = 11
+workload    = shard_kv
+nodes       = 5
+faults      = drawn from seed
+invariant   = the conservation audit -- a checker bug, not a system bug
+reproduce   = anvil_shard_faults 12
+note        = six accounts of twenty-four reported missing on a cluster that had
+              lost nothing. descriptor.h warns about exactly this, and the code
+              below it made the mistake anyway.
+found_at    = P5
+fixed_at    = P5

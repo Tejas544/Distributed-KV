@@ -483,6 +483,66 @@ void test_tombstones_survive_until_the_bottom_level() {
   });
 }
 
+// ANV-0025. A write that returns ok must be readable by the very next get, even
+// while other writers are in flight.
+//
+// The failure this pins is not subtle once you see it and is invisible until
+// then. `write` used to take its sequence numbers from the published watermark
+// and *then* suspend for the log append and the fsync, so every writer that
+// started during that window was handed the same numbers; when they finished in
+// the other order, the second one published a watermark below the first one's
+// entries and those entries stopped being visible. They came back later, when an
+// unrelated write pushed the watermark past them again -- a key that is absent
+// for a while and then returns, which no layer above can make sense of. It
+// surfaced four layers up, as a transaction intent that its own owner could not
+// find and therefore never cleaned up.
+//
+// The test runs writers concurrently, each reading back its own key immediately
+// after the write returns.
+void test_concurrent_writers_never_lose_read_after_write() {
+  run([](Runtime& rt) -> Task<void> {
+    DbOptions options;
+    options.seed = 7;
+    options.memtable_bytes = 4096;  // small, so flushes interleave with the writes
+    std::unique_ptr<Db> db;
+    if (!(co_await Db::open(&rt, options, &db)).is_ok()) {
+      check(false, "db opens");
+      co_return;
+    }
+
+    int invisible = 0;
+    int done = 0;
+    constexpr int kWriters = 6;
+    constexpr int kOps = 25;
+
+    auto writer = [&](int id) -> Task<void> {
+      for (int op = 0; op < kOps; ++op) {
+        char key[32];
+        std::snprintf(key, sizeof(key), "w%02d-k%03d", id, op);
+        const std::string value(48, static_cast<char>('a' + id));
+        if (!(co_await db->put(key, value)).is_ok()) continue;
+
+        // The write said ok. There is exactly one correct answer here.
+        std::string got;
+        bool found = false;
+        if (!(co_await db->get(key, &got, &found)).is_ok()) continue;
+        if (!found || got != value) ++invisible;
+      }
+      ++done;
+    };
+
+    for (int id = 0; id < kWriters; ++id) rt.spawn(writer(id));
+    for (int i = 0; i < 2000 && done < kWriters; ++i) co_await rt.sleep_for(Duration::millis(1));
+
+    check(done == kWriters, "every writer finishes");
+    check(invisible == 0, "a write that returned ok is visible to the next read");
+
+    // And the mechanism itself: no two batches may be handed the same sequence.
+    check(db->last_sequence() >= static_cast<SequenceNumber>(kWriters * kOps),
+          "each write consumed its own sequence number");
+  });
+}
+
 void test_block_cache() {
   BlockCache cache{100};
   cache.insert(1, 0, std::string(40, 'a'));
@@ -526,6 +586,7 @@ int main() {
   test_sstable_corruption_is_detected_not_served();
   test_tombstones_survive_until_the_bottom_level();
   test_block_cache();
+  test_concurrent_writers_never_lose_read_after_write();
 
   if (g_failures == 0) {
     std::cout << "lsm units: all checks passed\n";

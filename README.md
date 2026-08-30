@@ -14,9 +14,9 @@
 
 | | |
 |---|---|
-| Phase | `P2 — LSM storage engine`, **complete** (see [docs/ROADMAP.md](docs/ROADMAP.md)) |
-| Working | Runtime seam · hermeticity gate + negative control · deterministic scheduler on virtual time · **19 fault kinds** across network, disk, clock and process · invariant framework with cost classes · Elle-style consistency checker · serial reference model · **LSM engine: WAL, skiplist memtable, block-based SSTables with Bloom filters, MANIFEST/VersionSet, leveled compaction, block cache, crash recovery** · execution digest · causal trace |
-| Next | P3: Raft, with the twelve `INV-RAFT-*` predicates armed inside the run loop |
+| Phase | `P5 — sharding, split/merge, placement driver`, **complete** (see [docs/ROADMAP.md](docs/ROADMAP.md)) |
+| Working | Runtime seam · hermeticity gate + negative control · deterministic scheduler on virtual time · **19 fault kinds** across network, disk, clock and process · invariant framework with cost classes · Elle-style consistency checker · serial reference model · **LSM engine: WAL, skiplist memtable, block-based SSTables with Bloom filters, MANIFEST/VersionSet, leveled compaction, block cache, crash recovery** · **Raft: pre-vote, CheckQuorum, pipelined replication, joint consensus, learners, log compaction, chunked snapshot install, leases, ReadIndex, leadership transfer** · **MVCC: inverted-timestamp versions, snapshot reads, write intents, wound-wait, deadlock detection, safepoint-driven GC, single-node transactions at snapshot isolation** · **sharding: MultiRaft with one Raft group per range, a Raft-replicated placement driver, atomic split and merge, range leases, a two-level meta index, a client range cache with generation invalidation, replica rebalancing and range quiescence** · execution digest · causal trace |
+| Next | P6: distributed transactions -- Percolator/SI, SSI, and commit-wait |
 | Language | C++20 (coroutines, concepts, ranges) + Python 3 tooling + TLA+ specs |
 | Platforms | Linux x86-64 (primary), macOS arm64 (determinism cross-check), Windows via WSL2 |
 | Bug ledger | [BUGS.md](BUGS.md) |
@@ -189,19 +189,169 @@ isolation-level discrimination ....... write skew accepted at SI, rejected at
                                        accepted at SER, rejected at strict
 cycle witnesses ...................... minimal (2 txns) even for 8-txn SCCs
 
-bugs found (S0/S1/S2/S3/S4) .......... 0/2/1/0/7   (see BUGS.md)
-BUGGIFY site activation coverage ..... n/a -- no BUGGIFY sites in the core yet
+-- P3, consensus --
+safety, 12 seeds under full faults ... 12/12 clean -- no INV-RAFT-* violation,
+                                       no lost acked write, no stale read
+liveness after healing ............... leader elected in 12/12 runs
+  time to a leader ................... p50 0ms, p90 495ms, max 1,195ms
+client work per 12 seeds ............. 1,259 writes acknowledged, 451 linearizable reads
+membership change during the workload  ~117 joint-consensus transitions
+simulated node-time .................. ~1h20m per 12 seeds
+INV-RAFT-* armed ..................... 16 (14 at tick class, 1 at epoch, 1 client-side)
+seeded consensus bugs ................ 10/10 caught (9 by the sweep, 1 targeted)
+  caught by an internal invariant .... 9/10   <- invisible at the client API
+  reply before fsync ................. 7/7 seeds (INV-RAFT-09)
+  learner counted in a quorum ........ 7/7 seeds (INV-RAFT-15)
+  lease counted in ticks ............. 7/7 seeds (INV-RAFT-13, pause scenario)
+  joint consensus exits on append .... 5/7 seeds (INV-RAFT-12)
+  term and vote unsynced ............. 4/7 seeds (INV-RAFT-06, INV-RAFT-08)
+  commit across terms (Figure 8) ..... 3/7 seeds (INV-RAFT-10, needs BUGGIFY)
+  snapshot without truncation ........ 3/7 seeds (INV-RAFT-11)
+  log unsynced ....................... 3/7 seeds (INV-RAFT-08, INV-RAFT-09)
+  vote without the log restriction ... 2/7 seeds (INV-RAFT-04, INV-RAFT-05)
+  append without the prev-term check . constructed case; shown non-equivalent
+                                       rather than reported as a gap
+pause longer than the lease .......... wall-clock lease safe; tick-counted lease
+                                       caught by INV-RAFT-13
+
+-- P4, MVCC and single-node transactions --
+safety, 20 seeds under full faults ... 20/20 clean -- no INV-MVCC-* violation, no
+                                       version lost that a live snapshot could
+                                       still resolve
+transactions ......................... 634 committed; 734 versions collected
+long readers across GC passes ........ 4,060 re-reads, 6,973 versions audited
+                                       against a model of every version committed
+deadlock ............................. 11 wounded, 0 wait-for cycles, 0 stalls
+INV-MVCC-* armed ..................... 8 (5 audited through the workload's
+                                       auditor, 3 evaluated live)
+isolation level, confirmed ........... one write-skew history: VALID at snapshot
+                                       isolation with no G1c, INVALID at
+                                       serializable with the cycle reported
+                                       (T1 -rw-> T2 -rw-> T1)
+seeded MVCC bugs ..................... 2/2 must-detect caught; control silent;
+                                       1 classified equivalent with an argument
+  gc drops the boundary version ...... 10/11 seeds (INV-MVCC-01, 9/11 API-visible)
+  gc ignores the safepoint ........... 11/11 seeds (INV-MVCC-02, API-invisible)
+  reads ignore intents ............... equivalent at SI under one monotonic
+                                       clock; expected to become detectable in P6
+sweep runtime ........................ 0.4s for 20 seeds
+defects P4 found *below* P4 .......... 4 -- three in the LSM, one in the simulator
+
+-- P5, sharding, split/merge and the placement driver --
+safety, 40 seeds under full faults ... 40/40 clean -- no INV-SHARD-* violation,
+                                       no account lost, the total conserved on
+                                       every seed, no acknowledged transfer that
+                                       the cluster later forgot
+topology churn during the workload ... 563 splits, 552 merges, 73 replica
+                                       changes, 1,367 leadership transfers to
+                                       colocate a merge
+Raft groups created / destroyed ...... 1,860 / 1,382, mid-run, under faults
+transactions over a moving boundary .. 21,377 sent believing one range covered
+                                       both accounts; 18,602 rejected because
+                                       the topology had moved underneath them;
+                                       0 applied partially
+client work per 40 seeds ............. 2,342 transfers acknowledged, 1,076 lease
+                                       reads
+simulated node-time .................. 2h43m per 40 seeds
+INV-SHARD-* armed .................... 9, plus 1 client-visible check
+MultiRaft heartbeat coalescing ....... 735,397 heartbeats in 570,903 messages;
+                                       13,092 ticks skipped on quiesced ranges
+determinism with groups created and
+  destroyed mid-run .................. 4/4 seeds reproduce exactly
+clock bound, measured every tick ..... 24/40 seeds put a node's clock outside the
+                                       bound its own configuration declared
+                                       (worst 17.2s against 248ms); lease
+                                       findings on those runs are classified
+seeded sharding bugs ................. 6/6 must-detect caught; control silent;
+                                       1 classified equivalent with an argument
+  generation not bumped .............. 20/20 seeds (INV-SHARD-05, 4/20 API)
+  voter added before catch-up ........ 18/20 seeds (INV-SHARD-06, 2/18 API)
+  quiesce over a lagging replica ..... 15/20 seeds (INV-SHARD-08, API-invisible)
+  split in two applies ............... 14/20 seeds (INV-SHARD-01, API-invisible)
+  lease granted without waiting ...... 14/20 seeds (INV-SHARD-04, API-invisible)
+  merge without colocation ........... 2/20 seeds (INV-SHARD-03) -- weakly caught
+                                       by the sweep and squarely by the unit test
+  stale route served ................. equivalent here: the span check already
+                                       rejects every key the generation check
+                                       would. Expected to become detectable in
+                                       P6, where a follower can serve a key at a
+                                       closed timestamp it no longer owns
+sweep runtime ........................ ~60s for 40 seeds
+
+bugs found (S0/S1/S2/S3/S4) .......... 15/12/6/0/13   (see BUGS.md; two open)
+BUGGIFY site activation coverage ..... 1 site in the core (raft/send_append);
+                                       makes the Figure-8 window reachable in
+                                       tens of seeds instead of thousands
 TLA+ trace-validation conformance .... (pending P7)
 YCSB-A throughput / p99 .............. (pending P9)
 TPC-C tpmC / p99 ..................... (pending P9)
 ```
 
-Measured on the ping-pong, replicated-counter and key-value workloads. There is
-still no consensus or transaction layer. Ten of the eleven ledger entries are
-harness or workload defects and only two are engine bugs — which is the honest
-shape at this stage, and the reason the seeded-mutation drills matter more than
-the pass counts: five of the eleven were found by deliberately breaking
-something and discovering the suite did not notice.
+Measured on the ping-pong, replicated-counter, key-value, replicated-KV,
+MVCC-transaction and sharded-bank workloads. The transaction layer is
+single-node and single-range; distributed transactions arrive in P6.
+
+The shape of the ledger changed with P3. Of twenty-two entries, ten are now
+genuine protocol or storage defects rather than harness problems, and the
+consensus layer produced the project's first S0s: a quorum computed as two of
+four voters, a retried append that duplicated a run of indices and cost a node
+its committed log, and a crash inside a rename window that lost an entire log
+file. Five of the thirteen fixed P3 bugs were invisible at the client API and
+were found only by an internal invariant, which is the column the whole
+technique is an argument for.
+
+Four of the five storage bugs were the same mistake in different clothing: a
+write path that is not idempotent under retry, and a size change that is not
+atomic under crash. That is a more useful finding than any of them individually.
+
+P4 repeated the pattern one level up, and the more interesting result is *where*
+its findings landed. Four of the defects the MVCC sweep produced were not in
+MVCC: three in the storage engine and one in the simulator, all of them past two
+P2 suites and a 40-seed Raft sweep. They share a single shape -- a value read
+before a `co_await` and used after it, a pointer handed out by a cache and held
+across a suspension, a long operation that installs shared state and then
+suspends without excluding a second one. None of them look like concurrency bugs
+on the page; there is no lock to forget and no thread in sight. The MVCC layer
+found them because it is the first thing in the tree that writes a key and reads
+it straight back from several coroutines at once, which is the argument for
+stacking layers rather than testing each in isolation.
+
+P5 is where the bug density spiked, exactly as the roadmap predicted it would.
+Seventeen ledger rows from one phase, six of them S0 -- data inside a range that
+does not claim it, data in two ranges at once, and twelve accounts that existed
+nowhere at all. Every one of those left the cluster answering every request it
+was asked, correctly, for as long as anyone was looking.
+
+Four of the seventeen were in the test harness rather than the system, and three
+of *those* manufactured findings out of nothing: an audit that compared an
+unbounded key range as a string and reported six accounts missing from a cluster
+that had lost none; two checks that used a state machine's applied index as
+though it were the log's, and so reported a divergence between two nodes that
+were both perfectly correct. A checker over a topology that changes several
+times a second turns out to be about as likely to be wrong as the topology is,
+and the phase's own discipline is that a manufactured finding is written down
+with the same seriousness as a real one.
+
+Three more were the same mistake wearing different clothes, and it is the
+sharding equivalent of P3's durability lesson: **reading two halves of one fact
+from two different places**. A merge trigger that took its span from the
+topology and its data from the machine. A lease margin that allowed one clock
+bound where a handover between two clocks needs two. A placement timer that
+subtracted a timestamp stamped on one node from the clock of another. Each is a
+one-line fix and none of them is visible in a code review that does not ask
+where each value came from.
+
+Two findings are open, and both are filed with their evidence, their ruled-out
+hypotheses and the next measurement to take rather than guessed at. ANV-0032 is a
+learner that stops converging after a heal on one seed in sixteen; no safety
+invariant fires and no acknowledged write is at risk. ANV-0033 is the serious
+one: sixteen bytes of environment variable change a seed's digest and its event
+count, so something reads an uninitialised automatic variable and the schedule
+diverges. Replay is the foundation everything else rests on, and a seed that
+misbehaves inside a sweep should misbehave identically when replayed alone. The
+instrument that localises it -- clang with MemorySanitizer -- is not available on
+this toolchain, so the bug is characterised precisely and left open rather than
+papered over. Both gates stay red on them.
 See [docs/ROADMAP.md](docs/ROADMAP.md).
 <!-- END GENERATED RESULTS -->
 

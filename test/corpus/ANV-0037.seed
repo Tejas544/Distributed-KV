@@ -1,0 +1,13 @@
+# ANV-0037 -- a range adopted a shorter span and kept the data
+# kSetDescriptor overwrote start and end from the topology; a span change is
+# also a data movement, and that command moves nothing
+seed        = 1
+workload    = shard_kv
+nodes       = 5
+faults      = drawn from seed
+invariant   = INV-SHARD-02 (a range holds only keys inside its own span)
+reproduce   = anvil_shard_faults 8
+note        = also reproduces on seed 6. A range's span now changes only through
+              a trigger that carries the data with it.
+found_at    = P5
+fixed_at    = P5

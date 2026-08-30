@@ -1,0 +1,15 @@
+# ANV-0050 -- a group retired before it booted was freed under its own boot()
+# collect_retired() used driver->idle(), and a driver whose spawned boot has not
+# run yet has never been busy
+seed        = 1
+workload    = shard_kv
+nodes       = 5
+faults      = drawn from seed; needs a merge decided within a few milliseconds
+              of a group being created
+invariant   = none -- SIGSEGV inside RaftDriver::boot
+reproduce   = anvil_shard_faults 4
+note        = ready() && idle(). "Not busy" and "has finished starting" are
+              different states, and the stack pointed into Raft while saying
+              nothing about merges.
+found_at    = P5
+fixed_at    = P5

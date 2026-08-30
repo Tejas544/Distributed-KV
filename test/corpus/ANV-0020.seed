@@ -1,0 +1,11 @@
+# ANV-0020 -- recovery kept a stale log tail above a newer snapshot
+# a crash between save_snapshot and rewrite_log
+seed        = 1
+workload    = raft_kv
+nodes       = drawn from seed
+faults      = drawn from seed
+invariant   = INV-RAFT-04, INV-RAFT-03
+reproduce   = anvil_raft_faults 12    (or: --seed 1 --workload raft_kv --faults)
+note        = snapshots must have been taken; log terms ran backwards
+found_at    = P3
+fixed_at    = P3

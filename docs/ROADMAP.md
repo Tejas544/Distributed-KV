@@ -111,6 +111,13 @@ Rule: **a phase does not exit on "the code is written." It exits on the measurab
 
 ## P3 — Raft, with protocol-aware invariants · Weeks 11–14
 
+**Status: complete.** All five deliverables landed, sixteen `INV-RAFT-*` are
+armed, and the drill catches 9 of 10 planted bugs from the sweep plus the tenth
+from a constructed case. Thirteen real bugs were found and fixed on the way
+(ANV-0012..ANV-0024), five of them invisible at the client API and three of them
+S0. See [CONTEXT.md §11](../CONTEXT.md) for the decisions and
+[BUGS.md](../BUGS.md) for the findings.
+
 **Goal.** Consensus that is checked from the inside.
 
 **Deliverables (Stream C)**
@@ -153,6 +160,35 @@ Rule: **a phase does not exit on "the code is written." It exits on the measurab
 
 **Risk.** GC safepoints are the classic silent-corruption source. Over-invest here; the invariant is cheap and the bug is catastrophic.
 
+**Status: complete.** All four exit criteria met. `anvil_mvcc_test` covers the
+mechanism; `anvil_mvcc_faults` covers the criteria and runs the whole 20-seed
+sweep in 0.4s.
+
+- (1) 8 `INV-MVCC-*` armed, 20/20 seeds clean, 6,973 versions audited against a
+  god's-eye model of every version ever committed.
+- (2) Long readers hold snapshots deliberately across GC passes: 4,060 re-reads,
+  zero versions lost. The mutant that drops the boundary version is caught
+  10/11 seeds, 9 of them visible at the API.
+- (3) 11 transactions wounded, 0 wait-for cycles, 0 stalls.
+- (4) One write-skew history, VALID at snapshot isolation with no G1c, and
+  INVALID at serializable with the cycle reported: `T1 -rw-> T2 -rw-> T1`.
+
+**Deferred, and noted rather than pretended.**
+- Version GC runs as its own collector task, not inside compaction. The safepoint
+  logic and the invariants are identical either way; folding it into compaction
+  is a scheduling change, and doing it inside the LSM's compaction would put
+  transaction state into the storage engine, which the layering does not allow
+  yet. P5 should revisit it when ranges arrive.
+- MVCC crash recovery. Intents are durable, the transaction table is not.
+  The P4 profile runs with process crashes disabled and says so in the source.
+- The SSI certifier. Read spans and write sets are recorded; the engine that
+  turns them into aborts needs distributed conflict tracking and belongs in P6.
+
+**What it found below itself.** Three storage-engine defects (ANV-0025, 0026,
+0027) and one simulator defect (ANV-0028), none of them in P4. The MVCC workload
+is the first thing in the tree that writes a key and reads it straight back from
+several coroutines at once.
+
 ---
 
 ## P5 — Sharding, split/merge, placement driver · Weeks 18–21
@@ -173,6 +209,53 @@ Rule: **a phase does not exit on "the code is written." It exits on the measurab
 4. Seeded-mutation drill: 6 deliberate sharding bugs (stale range cache accepted, merge without lease colocation, split committing meta before descriptor, generation not bumped) — all detected.
 
 **Risk.** This is the phase where the bug density is highest and the invariants are hardest to state. Budget for the coverage invariant to be expensive; run it at `EPOCH` cost class if `TICK` is too slow, and always at `QUIESCE`.
+
+**Status: complete.** All four exit criteria met. `anvil_shard_test` covers the
+mechanism; `anvil_shard_faults` covers the criteria and runs 40 seeds of the
+chaos-admin sweep in about a minute.
+
+- (1) 9 `INV-SHARD-*` armed plus one client-visible check; 40/40 seeds clean, no
+  account lost, the total conserved on every seed. Coverage runs at `EPOCH` and
+  is evaluated on every live node's own applied view, not just the leader's —
+  which is what makes the non-atomic-split mutation detectable.
+- (2) The chaos-admin workload is the default profile, not an option: split and
+  merge thresholds that deliberately overlap, so the topology never settles.
+  Over 40 seeds it produced 563 splits, 552 merges, 73 replica changes, 1,367
+  leadership transfers for merge colocation, and 1,860 Raft groups created and
+  1,382 destroyed while the workload ran. 2h43m of simulated node-time.
+- (3) 21,377 transfers were sent believing one range covered both accounts;
+  18,602 were rejected because the topology had moved underneath them. Not one
+  applied partially — the split is a trigger in the range's own log, so a
+  transfer either precedes it and applies under the old descriptor or follows it
+  and is rejected against the new one.
+- (4) Seven deliberate bugs: 6 must-detect, all caught; one control, silent; one
+  classified equivalent with a written argument (the generation check is
+  redundant with the span check in this configuration — it becomes real in P6,
+  where a range can serve a key at a closed timestamp it no longer owns).
+
+**The risk prediction was right.** Seventeen ledger rows (ANV-0034..ANV-0050),
+six of them S0, against thirteen in P3 and four in P4. Four were in the test
+harness rather than the system, and three of *those* manufactured findings out
+of nothing — the phase's own lesson is that a checker over a topology that
+changes several times a second is as likely to be wrong as the topology is.
+
+**Deferred, and noted rather than pretended.**
+- The second level of the meta index is a logical bucket, not its own Raft
+  group. The client pays for both lookups and both are invalidated by
+  generation; what is missing is a meta range that can itself split, which needs
+  more than one meta group to be worth anything.
+- A range's applied state is durable through its Raft log rather than through
+  the LSM, so a split moves data as a log entry rather than as a metadata edit.
+  That is the single largest departure from how a production store does this,
+  and it is what makes the split payload a thing that has to be held, handed
+  over and confirmed (ANV-0049 is entirely downstream of it).
+- MVCC crash recovery, carried over from P4 and still open: the transaction
+  table is not durable. The shard layer's ranges are a bank rather than a
+  transactional store, so P5 did not need it; P6 does.
+- MultiRaft heartbeat coalescing landed (735,397 heartbeats in 570,903
+  messages), but the ratio is modest because these clusters have five ranges,
+  not five thousand. The mechanism is real and the number is honest about what
+  it is worth at this scale.
 
 ---
 

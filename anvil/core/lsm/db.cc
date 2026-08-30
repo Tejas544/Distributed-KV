@@ -152,29 +152,44 @@ Task<Status> Db::write(const WriteBatch& batch) {
   if (closed_) co_return Status{StatusCode::kUnavailable, "database closed"};
   if (batch.empty()) co_return Status::ok();
 
-  const SequenceNumber first = versions_->last_sequence() + 1;
+  // Reserved before the first suspension point, so two writers in flight at once
+  // cannot be handed the same numbers (ANV-0025).
+  const SequenceNumber first = versions_->allocate_sequence(batch.count());
   const std::string record = batch.encode(first);
 
+  // Every exit from here on has to account for the range, successfully or not.
+  // An allocated range that is never published is a permanent hole: publication
+  // advances along the contiguous prefix, so one abandoned range makes every
+  // later write invisible for the rest of the process's life. Abandoning is
+  // safe precisely because the entries were never added to the memtable --
+  // there is nothing at those sequences to reveal.
   Status status = co_await wal_->append(record);
-  if (!status.is_ok()) co_return status;
+  if (!status.is_ok()) {
+    versions_->publish_sequence(first, batch.count());
+    co_return status;
+  }
 
   // The acknowledgement boundary. Everything before this point is recoverable
   // from the log; everything after assumes it already is.
   if (options_.durability.sync_wal_on_write) {
     status = co_await wal_->sync();
-    if (!status.is_ok()) co_return status;
+    if (!status.is_ok()) {
+      versions_->publish_sequence(first, batch.count());
+      co_return status;
+    }
   }
 
   std::vector<WriteBatch::Entry> entries;
   SequenceNumber decoded_first = 0;
   if (!WriteBatch::decode(record, &entries, &decoded_first)) {
+    versions_->publish_sequence(first, batch.count());
     co_return Status{StatusCode::kCorruption, "self-encoded batch failed to decode"};
   }
   for (const WriteBatch::Entry& entry : entries) {
     memtable_->add(entry.sequence, entry.type, entry.key, entry.value);
   }
 
-  versions_->set_last_sequence(first + batch.count() - 1);
+  versions_->publish_sequence(first, batch.count());
   stats_.writes += batch.count();
 
   if (memtable_->memory_usage() >= options_.memtable_bytes) {
@@ -243,27 +258,49 @@ Task<Status> Db::write_table_from(const MemTable& table, FileMetadata* meta) {
 Task<Status> Db::flush() {
   if (memtable_->empty()) co_return Status::ok();
 
+  // One flush at a time.
+  //
+  // A flush installs the full memtable as `immutable_` and then suspends for the
+  // whole of writing an SSTable. A second flush starting in that window
+  // overwrites `immutable_` -- destroying the memtable the first one is still
+  // iterating, and losing every entry it had not yet written. The caller loses
+  // nothing by returning here: its write is already in the new memtable and
+  // already in the WAL, and the next write over the threshold will flush it
+  // (ANV-0027).
+  if (flushing_) co_return Status::ok();
+  flushing_ = true;
+
   immutable_ = std::move(memtable_);
   memtable_ = std::make_unique<MemTable>(memtable_seed_++);
 
   FileMetadata meta;
   Status status = co_await write_table_from(*immutable_, &meta);
-  if (!status.is_ok()) co_return status;
+  if (!status.is_ok()) {
+    flushing_ = false;
+    co_return status;
+  }
 
   // A new WAL before the edit: the edit records which log is live, and the
   // memtable that produced this file is about to stop being replayable.
   const FileHandle old_wal = wal_file_;
   const std::uint64_t old_wal_number = wal_number_;
   status = co_await open_new_wal();
-  if (!status.is_ok()) co_return status;
+  if (!status.is_ok()) {
+    flushing_ = false;
+    co_return status;
+  }
 
   VersionEdit edit;
   edit.add_file(0, meta);
   edit.set_log_number(wal_number_);
   status = co_await versions_->log_and_apply(edit);
-  if (!status.is_ok()) co_return status;
+  if (!status.is_ok()) {
+    flushing_ = false;
+    co_return status;
+  }
 
   immutable_.reset();
+  flushing_ = false;
   ++stats_.flushes;
 
   co_await runtime_->close_file(old_wal);
@@ -275,10 +312,10 @@ Task<Status> Db::flush() {
 // reads
 // ---------------------------------------------------------------------------
 
-Task<Status> Db::open_table(std::uint64_t number, Table** out) {
+Task<Status> Db::open_table(std::uint64_t number, std::shared_ptr<Table>* out) {
   const auto cached = tables_.find(number);
   if (cached != tables_.end()) {
-    *out = cached->second.get();
+    *out = cached->second;
     co_return Status::ok();
   }
 
@@ -295,8 +332,9 @@ Task<Status> Db::open_table(std::uint64_t number, Table** out) {
   }
 
   table_files_[number] = file;
-  *out = table.get();
-  tables_[number] = std::move(table);
+  auto shared = std::shared_ptr<Table>{std::move(table)};
+  tables_[number] = shared;
+  *out = std::move(shared);
   co_return Status::ok();
 }
 
@@ -329,7 +367,7 @@ Task<Status> Db::get(std::string_view key, std::string* value, bool* found) {
     for (const FileMetadata& file : version.levels[level]) {
       if (!file.overlaps_user_range(key, key)) continue;
 
-      Table* table = nullptr;
+      std::shared_ptr<Table> table;
       Status status = co_await open_table(file.number, &table);
       if (!status.is_ok()) co_return status;
 
@@ -388,7 +426,7 @@ Task<Status> Db::scan(std::string_view lo, std::string_view hi, std::size_t limi
     const auto& files = version.levels[level];
     for (auto it = files.rbegin(); it != files.rend(); ++it) {
       if (!it->overlaps_user_range(lo, hi)) continue;
-      Table* table = nullptr;
+      std::shared_ptr<Table> table;
       Status status = co_await open_table(it->number, &table);
       if (!status.is_ok()) co_return status;
       status = co_await table->for_each(consider);
@@ -483,7 +521,7 @@ Task<Status> Db::compact_level(int level) {
   std::vector<std::pair<std::string, std::string>> entries;
   const auto collect = [&](const std::vector<FileMetadata>& files) -> Task<Status> {
     for (const FileMetadata& file : files) {
-      Table* table = nullptr;
+      std::shared_ptr<Table> table;
       Status status = co_await open_table(file.number, &table);
       if (!status.is_ok()) co_return status;
       status = co_await table->for_each(
@@ -596,12 +634,23 @@ Task<Status> Db::compact_level(int level) {
 
 Task<Status> Db::delete_obsolete_files(const std::vector<std::uint64_t>& removed) {
   for (const std::uint64_t number : removed) {
+    // Retired, not destroyed, and its handle stays open: a read suspended inside
+    // pread still holds this table and will resume into it. Closing the handle
+    // here would hand that read a stale descriptor, which is the same defect as
+    // freeing the table, one level down.
+    RetiredTable retired;
+    retired.number = number;
+    const auto live = tables_.find(number);
+    if (live != tables_.end()) {
+      retired.table = live->second;
+      tables_.erase(live);
+    }
     const auto handle = table_files_.find(number);
     if (handle != table_files_.end()) {
-      co_await runtime_->close_file(handle->second);
+      retired.file = handle->second;
       table_files_.erase(handle);
     }
-    tables_.erase(number);
+    retired_tables_.push_back(std::move(retired));
     // INV-LSM-13: the cache must not outlive the file. Blocks keyed by a
     // deleted file number would otherwise sit there indefinitely.
     cache_->erase_file(number);
@@ -612,13 +661,50 @@ Task<Status> Db::delete_obsolete_files(const std::vector<std::uint64_t>& removed
   if (options_.durability.sync_dir_after_rename) {
     co_await runtime_->fsync_dir(DbPaths::kDir);
   }
+  co_await sweep_retired_tables();
   co_return Status::ok();
 }
 
+Task<void> Db::sweep_retired_tables() {
+  // The list is taken away from the member before anything is awaited. Closing a
+  // file suspends, and a compaction that retires another table during that
+  // suspension would push onto the very vector this loop is walking -- which
+  // reallocates it and leaves the loop reading freed memory. Iterating a
+  // container across a suspension point is the coroutine equivalent of mutating
+  // it while iterating, and it corrupts the heap rather than failing cleanly.
+  std::vector<RetiredTable> candidates;
+  candidates.swap(retired_tables_);
+
+  // `use_count() == 1` means this list holds the only reference: every read that
+  // was inside the table has resumed and let go. Anything still held goes back
+  // for the next sweep.
+  std::vector<RetiredTable> still_in_use;
+  for (RetiredTable& retired : candidates) {
+    if (retired.table != nullptr && retired.table.use_count() > 1) {
+      still_in_use.push_back(std::move(retired));
+      continue;
+    }
+    retired.table.reset();
+    if (retired.file.value() != 0) co_await runtime_->close_file(retired.file);
+  }
+  for (RetiredTable& retired : still_in_use) {
+    retired_tables_.push_back(std::move(retired));
+  }
+  co_return;
+}
+
 Task<Status> Db::maybe_compact() {
+  // One compaction at a time, for the same reason as flush: compact_level picks
+  // its inputs, suspends across the whole merge, and then edits the version. Two
+  // in flight pick overlapping inputs from the same version and the second one's
+  // edit deletes files the first one's edit already replaced.
+  if (compacting_) co_return Status::ok();
   const int level = pick_compaction_level();
   if (level < 0) co_return Status::ok();
-  co_return co_await compact_level(level);
+  compacting_ = true;
+  const Status status = co_await compact_level(level);
+  compacting_ = false;
+  co_return status;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,11 @@
+# ANV-0014 -- a failed append left partial records behind and the retry appended after them
+# no media corruption at all -- torn=0, rot=0
+seed        = 9
+workload    = raft_kv
+nodes       = drawn from seed
+faults      = drawn from seed
+invariant   = INV-RAFT-04 (leader completeness across terms)
+reproduce   = anvil_raft_faults 12    (or: --seed 9 --workload raft_kv --faults)
+note        = needs an EIO inside a multi-entry append; 8 crashes and 353 EIOs on this seed
+found_at    = P3
+fixed_at    = P3

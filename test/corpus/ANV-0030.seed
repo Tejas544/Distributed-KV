@@ -1,0 +1,14 @@
+# ANV-0030 -- one EIO stopped garbage collection permanently
+# a commit or abort whose batch failed left the transaction kActive forever:
+# its intents blocked their keys and its start timestamp pinned the safepoint
+seed        = 1
+workload    = mvcc_txn
+nodes       = 1
+faults      = drawn from seed; requires at least one EIO on a resolution batch
+invariant   = INV-MVCC-05 (no intent outlives its transaction)
+reproduce   = anvil_mvcc_faults 8
+note        = the tell is gc_passes climbing while versions_collected stays at
+              zero for the rest of the run; the store then grows without bound
+              and the run slows to a crawl rather than failing
+found_at    = P4
+fixed_at    = P4

@@ -133,6 +133,17 @@ void FaultInjector::schedule_partitions() {
 
 void FaultInjector::apply_partition() {
   if (!armed_ || partition_active_) return;
+
+  // A partition needs two sides, so it needs two nodes.
+  //
+  // Without this the loop below spins forever on a single-node cluster: it
+  // redraws until both groups are non-empty, and with one node one of them
+  // never is. Nothing fails and nothing crashes -- the simulation simply stops
+  // advancing, which reads from the outside as a hung test and gets debugged as
+  // one, several layers away from here (ANV-0028). Single-node configurations
+  // are not exotic; P4's whole workload is one.
+  if (nodes_ < 2) return;
+
   partition_active_ = true;
   ++partitions_applied_;
 

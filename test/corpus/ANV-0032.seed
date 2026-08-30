@@ -1,0 +1,14 @@
+# ANV-0032 -- OPEN. A learner stops converging after the network heals.
+# The leader holds it at match=0 in probe state indefinitely; the learner
+# receives and its replies do not arrive. No safety invariant fires.
+seed        = 14
+workload    = raft_kv
+nodes       = 6 (one learner, membership churn on)
+faults      = drawn from seed; no crashes, no bit rot on this seed
+invariant   = none -- convergence, not safety
+reproduce   = anvil_raft_faults 16
+note        = the learner reports 115 send failures; that is the open lead.
+              Every counter in the report is cumulative, which is exactly what
+              makes the next step per-phase counters reset at heal time.
+found_at    = P3
+status      = open as of P4

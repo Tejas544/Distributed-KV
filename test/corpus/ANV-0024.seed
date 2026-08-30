@@ -1,0 +1,11 @@
+# ANV-0024 -- a crash inside the rename window lost the entire log file
+# the temporary file's directory entry was never made durable before the rename
+seed        = 10
+workload    = raft_kv
+nodes       = 7
+faults      = drawn from seed
+invariant   = INV-RAFT-09 (per-node: everything once durable survives a restart)
+reproduce   = anvil_raft_faults 12
+note        = symptom is "log ending at 0 after having 64 durably persisted"
+found_at    = P3
+fixed_at    = P3

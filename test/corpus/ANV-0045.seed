@@ -1,0 +1,13 @@
+# ANV-0045 -- placement subtracted a timestamp stamped on one node from the
+# clock of another; every placement timer compared two different clocks
+seed        = 2
+workload    = shard_kv
+nodes       = 5
+faults      = drawn from seed; needs a frozen or badly skewed clock
+invariant   = none -- found by instrumenting a merge that never finished
+reproduce   = anvil_shard_faults 8
+note        = a freeze/abort/refreeze loop that ran thirty-three times in one
+              run. Placement decisions are now counted in placement log entries,
+              and liveness is restamped by the placement leader's own clock.
+found_at    = P5
+fixed_at    = P5

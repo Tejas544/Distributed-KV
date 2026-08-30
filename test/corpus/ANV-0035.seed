@@ -1,0 +1,14 @@
+# ANV-0035 -- a subsumed range was recreated, restarting its own merge
+# the topology keeps the subsumed descriptor until kFinishMerge lands, and in
+# that window the store saw a range it should host with no local replica
+seed        = 1
+workload    = shard_kv
+nodes       = 5
+faults      = none required
+invariant   = none -- found by the group create/retire counters
+reproduce   = anvil_shard_faults 4
+note        = 146 groups created and 142 retired in a run that should have had
+              four. Conservation held, no invariant fired, and the topology was
+              coherent at every instant.
+found_at    = P5
+fixed_at    = P5

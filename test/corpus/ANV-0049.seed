@@ -1,0 +1,14 @@
+# ANV-0049 -- a split's right-hand side could never be initialised
+# the child's leader did not host the parent, so it had nowhere to read the
+# payload from and no other replica could propose into the child's log
+seed        = 21
+workload    = shard_kv
+nodes       = 5
+faults      = drawn from seed; needs a rebalance between a split and its init
+invariant   = the conservation audit -- twelve of twenty-four accounts gone
+reproduce   = anvil_shard_faults 24
+note        = the leader now hands leadership to a replica that does hold the
+              parent, chosen from the replicated topology in id order so every
+              node picks the same one.
+found_at    = P5
+fixed_at    = P5

@@ -72,6 +72,17 @@ enum class RandomDomain : std::uint64_t {
   kBuggify     = 0x6B06'61F0'0000'000BULL,
   kWorkload    = 0x70F1'0AD0'0000'000DULL,
   kApplication = 0x8A99'1100'0000'000FULL,
+  // P3. Election timeouts are randomised, and they are the one place where a
+  // shared stream would be actively harmful: every node drawing from the same
+  // sequence produces correlated timeouts, which is the split-vote livelock
+  // randomisation exists to prevent.
+  kConsensus   = 0x9C0E'5E45'0000'0011ULL,
+  // P5. The placement driver and the per-range groups. A separate stream from
+  // kConsensus because a cluster has one consensus group per range plus one for
+  // placement, and drawing all of their election timeouts from one sequence
+  // makes them correlated -- every range in the cluster campaigning at the same
+  // instant is the split-vote livelock, at scale.
+  kPlacement   = 0xADD1'5EED'0000'0013ULL,
 };
 
 class DeterministicRandom {

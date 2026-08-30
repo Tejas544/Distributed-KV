@@ -1,0 +1,14 @@
+# ANV-0026 -- compaction freed a table a suspended read was still inside
+# Table::read_block resumes from pread and dereferences cache_ and file_number_;
+# delete_obsolete_files had destroyed the Table and closed its handle
+seed        = 2
+workload    = mvcc_txn
+nodes       = 1
+faults      = drawn from seed
+invariant   = none -- the symptom is a process crash
+reproduce   = anvil_mvcc_faults 4
+note        = SIGSEGV in BlockCache::insert, called from Table::read_block;
+              the block cache is only where the freed frame's first pointer
+              dereference lands, not where the fault is
+found_at    = P4
+fixed_at    = P4

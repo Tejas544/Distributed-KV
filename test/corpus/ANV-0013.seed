@@ -1,0 +1,11 @@
+# ANV-0013 -- the majority index used (n-1)/2, so two of four voters counted as a quorum
+# five nodes with one learner == four voters
+seed        = 3
+workload    = raft_kv
+nodes       = drawn from seed
+faults      = drawn from seed
+invariant   = INV-RAFT-09 (a committed entry is durable on a quorum)
+reproduce   = anvil_raft_faults 12    (or: --seed 3 --workload raft_kv --faults)
+note        = any seed whose cluster reaches an even voter count; 1, 3 and 9 all reproduce
+found_at    = P3
+fixed_at    = P3

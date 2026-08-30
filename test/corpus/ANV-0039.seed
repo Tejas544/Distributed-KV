@@ -1,0 +1,14 @@
+# ANV-0039 -- a replica added later replayed the log against the wrong state
+# built from the descriptor the topology has NOW, then fed the range's log from
+# the beginning: the split trigger was rejected and its keys stayed behind
+seed        = 1
+workload    = shard_kv
+nodes       = 5
+faults      = drawn from seed; needs a rebalance onto a new replica
+invariant   = INV-SHARD-02
+reproduce   = anvil_shard_faults 8
+note        = kInit now carries the span as well as the data, so a replay
+              defines its starting state instead of assuming it. Pinned as a
+              unit test too: replica_that_replays_from_the_start.
+found_at    = P5
+fixed_at    = P5

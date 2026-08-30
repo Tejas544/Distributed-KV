@@ -108,6 +108,11 @@ class Scheduler {
 
   void request_stop() noexcept { stop_requested_ = true; }
 
+  // Clears a stop so the simulation can be driven again. Needed because a
+  // workload that stops the clock when its work is done still has an audit to
+  // run afterwards, and that audit needs the scheduler to actually step.
+  void clear_stop() noexcept { stop_requested_ = false; }
+
   // Armed invariants are evaluated inside the run loop: tick-class after every
   // event, epoch-class every N. A violation stops the run immediately, because
   // continuing past a broken invariant means every subsequent observation is

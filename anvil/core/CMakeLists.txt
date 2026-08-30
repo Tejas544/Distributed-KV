@@ -32,5 +32,8 @@ target_sources(anvil_core PRIVATE
 )
 
 add_subdirectory(lsm)
+add_subdirectory(raft)
+add_subdirectory(mvcc)
+add_subdirectory(shard)
 
 anvil_add_hermetic_check(anvil_core)

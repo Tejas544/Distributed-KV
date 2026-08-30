@@ -1,0 +1,14 @@
+# ANV-0027 -- two concurrent flushes dropped a whole memtable
+# flush() installs the live memtable as immutable_ and suspends for the whole
+# of writing an SSTable; a second flush overwrote it mid-flight
+seed        = n/a -- deterministic, no fault injection needed
+workload    = test_concurrent_writers_never_lose_read_after_write
+nodes       = 1
+faults      = none; six concurrent writers and a small memtable are sufficient
+invariant   = read-after-write
+reproduce   = anvil_lsm_test
+note        = found by the regression test written for ANV-0025, which kept
+              failing after that fix. A property-shaped test found the second
+              cause; a replay of the first trace would not have
+found_at    = P4
+fixed_at    = P4

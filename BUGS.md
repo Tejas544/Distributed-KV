@@ -110,6 +110,571 @@ regression seeds pinned ............. 0
 > before/after bisect does not exist. From here on every row carries two SHAs or
 > it does not go in.
 
+### P5 (sharding), ANV-0034..ANV-0050
+
+Seventeen rows from one phase, which is more than any phase before it, and the
+distribution is the interesting part rather than the count:
+
+- **Six are S0** — data in a range that does not claim it, data in two ranges at
+  once, data in none at all. Every one of them left the cluster answering every
+  request correctly.
+- **Four are in the test harness**, not the system. Three of those manufactured
+  findings out of nothing: an audit that compared an unbounded key range as a
+  string, and two checks that used a state machine's applied index as if it were
+  the log's. Recording them is the point — a checker that can invent a finding
+  can also hide one.
+- **Three are the same mistake in different clothing**: reading two halves of one
+  fact from two different places. A merge trigger that took its span from the
+  topology and its data from the machine; a lease margin that compared two
+  clocks as if they were one; a placement timer that subtracted a timestamp
+  stamped on one node from the clock of another.
+
+<details>
+<summary><b>ANV-0034</b> · S1 · shard · <b>a lazy coroutine outlived its own reference parameter</b></summary>
+
+```yaml
+id:              ANV-0034
+title:           spawn(reply_to(to, local_reply)) reads a Reply that was destroyed before the body ran
+status:          fixed
+severity:        S1
+class:           safety
+layer:           shard
+invariant:       none -- found because every client request timed out
+found_by:        unit
+api_visible:     yes
+seed:            1 (no faults; the failure is not timing-dependent)
+sim_time_to_detect: immediate
+runs_to_first_hit:  1 in 1
+root_cause: |
+  ShardStore::reply_to was declared `Task<void> reply_to(NodeId, const Reply&)`
+  and called as `runtime_->spawn(reply_to(dest, reply))` with a local `reply`.
+  A Task is lazy: the coroutine body does not run until the task is awaited or
+  scheduled, by which point handle_request had returned and its frame -- and the
+  Reply in it -- was gone. The frame captures a *reference*, so the body read a
+  destroyed object, encoded whatever was on the stack, and sent it.
+  The reply therefore arrived, decoded into plausible-looking rubbish, and was
+  discarded by the client's (client, seq) filter. Every request timed out and
+  retried forever; the server-side counters showed 80 requests received and 80
+  replies sent, and the client-side counters showed nothing at all. Nothing
+  crashed.
+fix_commit:      P5
+regression:      test/corpus/ANV-0034.seed
+lesson: |
+  A lazy coroutine's parameters must be by value. This is CONTEXT.md 10.14 --
+  anything derived before a suspension is stale after it -- with the suspension
+  moved to before the first line of the body. The tree now takes every coroutine
+  parameter by value; the cost is a copy per call and the alternative is a
+  use-after-free that presents as a network problem.
+```
+</details>
+
+<details>
+<summary><b>ANV-0035</b> · S2 · shard · <b>a subsumed range was recreated by the next reconciliation, restarting its own merge</b></summary>
+
+```yaml
+id:              ANV-0035
+title:           materialise() recreates a group destroyed by a merge, because the topology still lists it
+status:          fixed
+severity:        S2
+class:           liveness
+layer:           shard
+invariant:       none -- found by the group-churn counter
+found_by:        dst-random
+api_visible:     no
+seed:            1
+runs_to_first_hit:  1 in 1
+root_cause: |
+  A merge retires the subsumed group locally when the survivor's merge trigger
+  applies. The topology keeps the subsumed descriptor until kFinishMerge lands,
+  one Raft round trip later. In that window the store saw a range it should host
+  with no local replica, created it, elected a leader, took a lease, and drove
+  the whole merge again -- 145 times in a twenty-second run.
+  Everything about the cluster looked healthy: conservation held, no invariant
+  fired, the topology was coherent at every instant. The only visible symptom
+  was 146 groups created and 142 retired where the run should have had four.
+fix_commit:      P5
+regression:      test/corpus/ANV-0035.seed
+lesson: |
+  Cheap counters on structural events -- groups created, groups retired -- are
+  worth having before you need them. This was invisible in every other number.
+```
+</details>
+
+<details>
+<summary><b>ANV-0036</b> · S2 · shard · <b>every merge was abandoned the instant it began</b></summary>
+
+```yaml
+id:              ANV-0036
+title:           the merge timeout was measured from the last size report, not from the freeze
+status:          fixed
+severity:        S2
+class:           liveness
+layer:           shard
+invariant:       none -- found by the merge counter
+found_by:        dst-random
+api_visible:     no
+seed:            1
+root_cause: |
+  decide() abandons a merge that has been frozen for longer than merge_timeout.
+  It read the freeze time from RangeStats::reported_at, which is when the range
+  last reported its *size*. A range whose size has not changed has an old
+  report, so `now - reported_at` was already several seconds at the moment of
+  the freeze and every merge was aborted before it could finish.
+fix_commit:      P5
+regression:      test/corpus/ANV-0036.seed
+lesson: |
+  "When did this happen" and "when did we last hear about this" are different
+  questions, and a struct that answers only the second will be used to answer
+  the first.
+```
+</details>
+
+<details>
+<summary><b>ANV-0037</b> · S0 · shard · <b>a range adopted a shorter span from the topology and kept the data</b></summary>
+
+```yaml
+id:              ANV-0037
+title:           kSetDescriptor overwrote the range's span without moving the keys outside it
+status:          fixed
+severity:        S0
+class:           safety
+layer:           shard
+invariant:       INV-SHARD-02
+found_by:        dst-random
+api_visible:     no
+seed:            1 and 6, with faults
+root_cause: |
+  The topology's view of a descriptor is replicated into the range's own log so
+  the range can validate requests against it. That command set start, end,
+  replicas and generation. But a span change is also a *data* movement, and
+  kSetDescriptor moves nothing -- so a range that had absorbed a neighbour and
+  then received a topology descriptor with the older, shorter end kept twelve
+  accounts it no longer claimed. They were unreachable: routing sent every
+  request for them elsewhere.
+fix_commit:      P5
+regression:      test/corpus/ANV-0037.seed
+lesson: |
+  A range's span changes only through a trigger that carries the data with it.
+  Stated as a rule in range.cc rather than as a special case, because the same
+  mistake is available at every other place the topology is copied inward.
+```
+</details>
+
+<details>
+<summary><b>ANV-0038</b> · S0 · shard · <b>the lease margin was one clock bound where it needed two</b></summary>
+
+```yaml
+id:              ANV-0038
+title:           a lease handover allowed only one uncertainty bound between expiry and grant
+status:          fixed
+severity:        S0
+class:           safety
+layer:           shard
+invariant:       INV-SHARD-04
+found_by:        dst-random
+api_visible:     conditional -- as a stale read, on the seeds where it happened
+seed:            3, 4, 8 and 10 with faults
+root_cause: |
+  A range grants its lease with an entry carrying the granting node's clock
+  reading. The apply refused a grant starting before the previous expiry plus
+  the declared clock uncertainty. But the declared bound is how far *one* node's
+  clock may be from true time, and a handover involves two: the old holder's
+  clock may be slow by a bound while the new holder's is fast by one, so the
+  interval that must have elapsed is two bounds wide.
+  With one bound the implementation is safe on most seeds and wrong on the ones
+  where the two errors point apart. Four of twelve seeds produced two nodes each
+  serving reads under a lease it believed valid, with the clock model inside the
+  bound it had declared.
+fix_commit:      P5
+regression:      test/corpus/ANV-0038.seed
+invariant_added: INV-SHARD-04's log-sequence half -- see the lesson
+lesson: |
+  Two lessons. The factor of two is the obvious one. The other is that the first
+  version of INV-SHARD-04 could only catch this when a replica was *also*
+  lagging, because it looked for two nodes simultaneously believing they held
+  the lease -- which needs a partition on top of the defect. Checking the rule
+  instead of the coincidence (successive leases in the range's own log must not
+  overlap by two bounds) turned a 0-in-6 detection rate into 8-in-12.
+```
+</details>
+
+<details>
+<summary><b>ANV-0039</b> · S0 · shard · <b>a replica added later replayed the log against the wrong starting state</b></summary>
+
+```yaml
+id:              ANV-0039
+title:           a new replica is built from the current descriptor and then fed the log from the beginning
+status:          fixed
+severity:        S0
+class:           safety
+layer:           shard
+invariant:       INV-SHARD-02
+found_by:        dst-random
+api_visible:     no
+seed:            1 and 6, with faults
+root_cause: |
+  A replica added to an existing range by a rebalance is constructed from the
+  descriptor the topology has *now*, and then catches up from the range's log --
+  which starts before that descriptor existed. Replaying a history against the
+  wrong starting state is not a replay: the split trigger that took the range
+  from [a,c) to [a,b) checks that the new end is below the current one, sees
+  that the machine already ends at b, and does nothing. The keys the trigger
+  would have moved stay behind, on a replica that does not claim them.
+fix_commit:      P5
+regression:      test/corpus/ANV-0039.seed
+lesson: |
+  The initial state has to be in the log too. kInit now carries the span as well
+  as the data, so a replay defines the starting state instead of assuming it.
+  test_a_replica_that_replays_from_the_start_reaches_the_same_state pins it.
+```
+</details>
+
+<details>
+<summary><b>ANV-0040</b> · S4 · checker · <b>the divergence check compared a log index against a state machine that had not been given it</b></summary>
+
+```yaml
+id:              ANV-0040
+title:           TopologyMachine::applied_index() does not advance across a snapshot install
+status:          fixed
+severity:        S4
+class:           test-infra
+layer:           checker
+invariant:       INV-SHARD-09
+found_by:        dst-random
+api_visible:     no
+seed:            4 and 6, with faults
+root_cause: |
+  INV-SHARD-09 groups replicas by applied index and requires equal states. It
+  used the *state machine's* applied index, which is the index of the last entry
+  handed to apply(). A snapshot install hands the machine a whole state and no
+  index at all, so a restored replica reports a stale number beside a fresh
+  state -- and the invariant reported a divergence between two nodes that were
+  both perfectly correct.
+  There is a second, narrower window with the same shape: between the log
+  installing a snapshot and the driver handing it to the machine, the log's
+  index is ahead of the machine by construction.
+fix_commit:      P5
+regression:      test/corpus/ANV-0040.seed
+lesson: |
+  Fixed twice over: the checker now reads the Raft log's applied index, and
+  RaftNode::snapshot_pending() lets it skip a node that is between the two.
+  A checker that can manufacture a finding is worse than one that misses one,
+  because the manufactured finding costs a day and teaches nothing.
+```
+</details>
+
+<details>
+<summary><b>ANV-0041</b> · S4 · shard · <b>read freshness was measured with a number that goes backwards legitimately</b></summary>
+
+```yaml
+id:              ANV-0041
+title:           a lease read reported the state machine's applied index, which resets across a snapshot
+status:          fixed
+severity:        S4
+class:           test-infra
+layer:           shard
+invariant:       INV-SHARD-CLIENT
+found_by:        dst-random
+api_visible:     no
+seed:            4 and 9, with faults
+root_cause:      the same confusion as ANV-0040, on the serving path rather than
+                 the checking path. The read reply carried machine applied index;
+                 the client used it to assert that lease reads never go backwards.
+fix_commit:      P5
+regression:      test/corpus/ANV-0041.seed
+lesson: |
+  Two consumers, one wrong number, found on the same afternoon. The interface is
+  the problem: StateMachine::apply(index, bytes) hands out an index that stops
+  being meaningful the moment a snapshot arrives, and nothing in the type says
+  so.
+```
+</details>
+
+<details>
+<summary><b>ANV-0042</b> · S0 · shard · <b>a merge took its span from the topology and its data from the machine</b></summary>
+
+```yaml
+id:              ANV-0042
+title:           the merge trigger absorbed twelve accounts while recording that it now owned six
+status:          fixed
+severity:        S0
+class:           safety
+layer:           shard
+invariant:       INV-SHARD-02
+found_by:        dst-random
+api_visible:     no
+seed:            12, with faults
+root_cause: |
+  The survivor's leader built the merge trigger with `end` taken from the
+  subsumed range's *topology* descriptor and `payload` taken from its *local
+  machine*. Those are two readings of one fact at two different times: the
+  subsumed range may itself have absorbed a neighbour that the topology has not
+  caught up with. The survivor then took in the whole of the subsumed range's
+  data and set its end to the shorter, stale value -- leaving six accounts
+  inside a range that stops before them.
+fix_commit:      P5
+regression:      test/corpus/ANV-0042.seed
+lesson: |
+  Span and data come from the same place, always: the machine, whose descriptor
+  and contents are consistent by construction. This is the third bug in the
+  phase with the same shape and it is worth naming as a class -- see CONTEXT.md
+  10.21.
+```
+</details>
+
+<details>
+<summary><b>ANV-0043</b> · S4 · checker · <b>the audit treated an unbounded key range as the smallest possible one</b></summary>
+
+```yaml
+id:              ANV-0043
+title:           `survivor_end >= desc.end` with an empty end reports every top-of-keyspace range as absorbed
+status:          fixed
+severity:        S4
+class:           test-infra
+layer:           checker
+invariant:       the conservation audit
+found_by:        dst-random
+api_visible:     no
+seed:            11, with faults
+root_cause: |
+  An empty `end` means +infinity. Compared as a string it is the smallest value
+  there is. The conservation audit skips a frozen range whose survivor has
+  already absorbed it, and expressed that as `survivor_end >= desc.end` -- which
+  is true for every desc at the top of the key space, whatever the survivor
+  holds. Six accounts of twenty-four were reported missing on a cluster that had
+  lost nothing.
+fix_commit:      P5
+regression:      test/corpus/ANV-0043.seed
+lesson: |
+  The comment in descriptor.h warns about exactly this and the code below it
+  made the mistake anyway. Sentinels that are also legal values need a helper,
+  not a comment: `covers()` now exists and every comparison goes through it.
+```
+</details>
+
+<details>
+<summary><b>ANV-0044</b> · S2 · shard · <b>a quiesced range with no leader could never elect one</b></summary>
+
+```yaml
+id:              ANV-0044
+title:           quiescence deadlocks a leaderless group
+status:          fixed
+severity:        S2
+class:           liveness
+layer:           shard
+invariant:       none -- found by code review while diagnosing a non-converging seed
+found_by:        code-review
+api_visible:     conditional -- as an unavailable key range
+seed:            none pinned; the reasoning is deductive and the fix is one condition
+root_cause: |
+  Quiescence stops a replica ticking, and ticking is what drives the election
+  timeout. A group whose replicas have all quiesced with no leader has no way to
+  elect one: waking requires a message, and a message requires a leader. The
+  range stops serving, stops replicating and stops being repairable, and nothing
+  reports an error -- the cluster has a hole in its key space that no client has
+  happened to address.
+fix_commit:      P5
+regression:      none -- see the status note
+lesson: |
+  Honest note: this was reasoned about rather than observed, and fixing it did
+  not improve the convergence rate, so the seed that motivated the search was
+  something else (ANV-0045). It is still a real deadlock and the fix is correct;
+  it is filed without a pinned seed and that is a weaker row than the rest.
+```
+</details>
+
+<details>
+<summary><b>ANV-0045</b> · S2 · shard · <b>placement subtracted a timestamp stamped on one node from the clock of another</b></summary>
+
+```yaml
+id:              ANV-0045
+title:           every placement timer compared two different clocks
+status:          fixed
+severity:        S2
+class:           liveness
+layer:           shard
+invariant:       none -- found by instrumenting a merge that never finished
+found_by:        dst-random
+api_visible:     no
+seed:            2, with faults
+root_cause: |
+  A descriptor records `changed_at` from the clock of whichever node proposed
+  the change. The cooldown that stops split/merge oscillation, and the timeout
+  that abandons a stalled merge, both subtracted that from the *placement
+  leader's* clock. With the clock model inside its declared bound that is a
+  small error; with a node whose clock the fault injector had frozen it is
+  seconds, and the merge timeout fired the instant the freeze landed -- forever,
+  in a freeze/abort/refreeze loop that ran thirty-three times in one run.
+  Node liveness had the same defect from the other end: a heartbeat carried the
+  sender's clock and was aged against the leader's, so a node whose clock ran
+  slow was declared dead while heartbeating perfectly well.
+fix_commit:      P5
+regression:      test/corpus/ANV-0045.seed
+lesson: |
+  Placement decisions are now expressed in *placement log entries*, not seconds:
+  replicated by construction, monotone, and the same number on every replica.
+  Liveness still needs a clock, so the placement leader restamps every heartbeat
+  with its own -- one clock decides who is alive, and it is the clock of whoever
+  is doing the deciding.
+```
+</details>
+
+<details>
+<summary><b>ANV-0046</b> · S0 · shard · <b>a merge abandoned after the survivor absorbed put the data in two places</b></summary>
+
+```yaml
+id:              ANV-0046
+title:           kAbortMerge can land after the merge trigger, un-freezing a range whose contents have moved
+status:          fixed
+severity:        S0
+class:           safety
+layer:           shard
+invariant:       the conservation audit
+found_by:        dst-random
+api_visible:     yes -- the total was 4,200 in a cluster that started with 2,400
+seed:            8, with faults
+root_cause: |
+  The survivor absorbs the subsumed range's data through an entry in its own
+  log. The placement driver cannot see that happen, so an abort issued because
+  the merge looked stalled could land afterwards, un-freezing a range whose
+  contents were now in two places at once. Twelve accounts, both copies live,
+  both reachable, and eighteen hundred pounds that did not exist.
+fix_commit:      P5
+regression:      test/corpus/ANV-0046.seed
+lesson: |
+  A merge, once begun, is now completed and never abandoned automatically. The
+  cost is availability of the subsumed span until some node leads both groups
+  again; the alternative is a correctness hazard that only appears when the
+  abort wins a race it usually loses. kAbortMerge still exists for an operator,
+  because a human can check what an automatic rule cannot.
+```
+</details>
+
+<details>
+<summary><b>ANV-0047</b> · S0 · shard · <b>a restart resurrected a subsumed range from its own durable log</b></summary>
+
+```yaml
+id:              ANV-0047
+title:           the "this group was merged away" tombstone was in memory only
+status:          fixed
+severity:        S0
+class:           durability
+layer:           shard
+invariant:       the conservation audit
+found_by:        dst-random
+api_visible:     yes -- the total was 3,600 against an expected 2,400
+seed:            8, with faults
+root_cause: |
+  When a merge trigger applies, the store retires the subsumed group and
+  remembers not to recreate it (ANV-0035). That memory was a std::set in the
+  store. A crash loses it, and the restarted node sees a range the topology
+  still lists, creates it, and its durable Raft log replays the data the
+  survivor already holds.
+fix_commit:      P5
+regression:      test/corpus/ANV-0047.seed
+lesson: |
+  The answer is re-derived rather than remembered: a frozen range is subsumed if
+  some local range's own applied span already covers it. The survivor's log
+  survives the crash, so the fact can be recomputed from durable state. Any
+  decision a node must still make after a restart has to be derivable from
+  something that also survived it.
+```
+</details>
+
+<details>
+<summary><b>ANV-0048</b> · S1 · shard · <b>a restarted node served a lease read before re-applying its own log</b></summary>
+
+```yaml
+id:              ANV-0048
+title:           a valid lease is not sufficient; the holder must also have applied what it has committed
+status:          fixed
+severity:        S1
+class:           safety
+layer:           shard
+invariant:       INV-SHARD-CLIENT
+found_by:        dst-random
+api_visible:     yes -- a read returned state older than one already returned
+seed:            19, with faults
+root_cause: |
+  The lease is in the range's durable log, so it comes back with a restarted
+  node -- while the state machine comes back at its last snapshot and re-applies
+  from there. In that window the node holds a genuinely valid lease over a state
+  machine that is behind, and a read served from it returns values from before
+  entries the previous holder had already served.
+fix_commit:      P5
+regression:      test/corpus/ANV-0048.seed
+lesson: |
+  The condition is `applied >= commit`, and it covers the other case too: a
+  leader elected a moment ago has committed entries it has not applied. "I hold
+  the lease" and "I have the state the lease entitles me to serve" are two
+  different claims.
+```
+</details>
+
+<details>
+<summary><b>ANV-0049</b> · S0 · shard · <b>a split's right-hand side could never be initialised, and its accounts were lost</b></summary>
+
+```yaml
+id:              ANV-0049
+title:           the new range's leader did not host the parent, so nothing could propose its data
+status:          fixed
+severity:        S0
+class:           durability
+layer:           shard
+invariant:       the conservation audit
+found_by:        dst-random
+api_visible:     yes -- twelve of twenty-four accounts gone, total 1,132 of 2,400
+seed:            21, with faults
+root_cause: |
+  A range born from a split holds nothing until its leader proposes a kInit
+  carrying the half it was split off with -- read from the *parent* range on the
+  same node. If a rebalance has moved the two ranges' replica sets apart, the
+  child's leader may be a node that does not host the parent. It has nowhere to
+  read the payload from, and no other replica can propose into the child's log.
+  The range stays empty for the rest of the run, and the only copy of the data
+  is a payload buffer on nodes that are not its leader.
+fix_commit:      P5
+regression:      test/corpus/ANV-0049.seed
+lesson: |
+  The leader now hands leadership to a replica that does hold the parent, chosen
+  from the replicated topology in id order so every node picks the same one.
+  The deeper lesson is about where data lives during a split: it is in a buffer
+  attached to one range and needed by another, which is a coupling that only
+  works while their replica sets agree.
+```
+</details>
+
+<details>
+<summary><b>ANV-0050</b> · S1 · shard · <b>a group retired before it had booted was freed under its own boot coroutine</b></summary>
+
+```yaml
+id:              ANV-0050
+title:           collect_retired() freed a driver whose spawned boot() had not run yet
+status:          fixed
+severity:        S1
+class:           safety
+layer:           shard
+invariant:       none -- SIGSEGV
+found_by:        dst-random
+api_visible:     no
+seed:            1..4 of the fault sweep; the crash is inside RaftDriver::boot
+root_cause: |
+  A retired group is kept in a graveyard until it is safe to free, and "safe"
+  was `driver->idle()` -- no batch being drained. A driver whose boot coroutine
+  has been spawned but not yet scheduled has never been busy, so it looks idle;
+  freeing it leaves the spawned boot() pointing at a destroyed object. It
+  happens when a merge is decided in the window between a group being created
+  and the first tick, which is a handful of milliseconds and perfectly reachable
+  under a chaos-admin workload.
+fix_commit:      P5
+regression:      test/corpus/ANV-0050.seed
+lesson: |
+  `ready() && idle()`. "Not busy" and "has finished starting" are different
+  states and only their conjunction means "nothing is holding a pointer to
+  this". The stack pointed into Raft and said nothing about merges.
+```
+</details>
+
 <details open>
 <summary><b>ANV-0001</b> · S4 · sim · <b>the scheduler silently discarded one event at every deadline</b></summary>
 
@@ -543,11 +1108,947 @@ lesson: |
 ```
 </details>
 
+<details open>
+<summary><b>ANV-0023</b> · S0 · raft · <b>a retried append duplicated a run of indices and recovery ate the log</b></summary>
+
+```yaml
+id:              ANV-0023
+title:           RaftStorage::append was not idempotent, so a retry after a post-write failure wrote the batch twice
+status:          fixed
+severity:        S0
+class:           durability
+layer:           raft
+invariant:       INV-RAFT-09 (per-node: everything once durable survives a restart)
+found_by:        dst-random, then a post-fsync file verification
+api_visible:     yes -- acknowledged writes were missing from the audit on the same seeds
+seed:            1, 9, 10, 13, 18 of the P3 sweep
+config:          workloads/raft_kv defaults, faults drawn from the seed
+commit_found:    P3
+sim_time_to_detect: 00:00:25
+runs_to_first_hit:  roughly 3 seeds in 12
+faults_minimised:   [an EIO on the fsync or the hard-state write, after the entries
+                     were already appended; no crash and no media damage required]
+root_cause: |
+  ANV-0014 made append() roll back the records it had written when the write
+  itself failed. It did not cover the other half: a failure *after* a successful
+  append -- in put_hard_state, or in the fsync -- returns an error from persist()
+  and the caller correctly advances nothing. The identical batch is then handed
+  back on the next tick and appended again, on top of the records the previous
+  attempt had already written.
+  The log file ended up holding a run of indices twice: `1 2 3 4 5 6 6`. Recovery
+  stops at the repeat, so every entry above it is discarded -- entries that had
+  been fsynced, acknowledged and committed. No crash was needed to produce the
+  bad file; a transient EIO on an fsync was sufficient.
+fix: |
+  append() now begins by truncating back to the first index it is being asked to
+  write, if the file already holds it. That makes the whole persist path
+  idempotent under retry, which is the property the caller had been assuming it
+  had all along. The earlier rollback stays as the fast path.
+fix_commit:      P3
+regression:      test/corpus/ANV-0023.seed; the P3 sweep is clean on all of 1, 9,
+                 10, 13 and 18 after the fix
+lesson: |
+  The diagnosis took four wrong fixes first, and each of them was a real bug --
+  in-place log rewrite, in-place suffix truncation, an unrecoverable rollback,
+  and a double append on the snapshot path. All four were worth fixing and none
+  of them was this one.
+  What finally settled it was refusing to keep guessing: a temporary check after
+  every fsync that read the log back and asserted the records were contiguous.
+  It fired immediately, with no crash involved, and printed the index sequence.
+  Ten minutes of instrumentation against two hours of reading code -- the lesson
+  is to reach for the instrument much earlier when the hypotheses start
+  outnumbering the facts.
+```
+</details>
+
+<details>
+<summary><b>ANV-0033</b> · S0 · sim · <b>OPEN — a run's outcome depends on the process environment: an uninitialised read reaches the simulation</b></summary>
+
+```yaml
+id:              ANV-0033
+title:           the same seed produces two different digests depending on stack contents at startup
+status:          OPEN
+severity:        S0
+class:           determinism
+layer:           unknown -- somewhere in sim / lsm / mvcc, not yet localised
+invariant:       the determinism check in test/mvcc_faults.cc
+api_visible:     no, and that is what makes it serious: it silently breaks replay
+seed:            9 of the P4 sweep. Only reached at `anvil_mvcc_faults 40`,
+                 because the determinism section runs seeds/4+1 seeds
+commit_found:    P4
+reproduce: |
+  The cleanest demonstration is a 16-byte environment variable:
+
+      $ ./det 9                                    # digest=161e76145fd18bea, 622 events
+      $ PADVAR=AAAAAAAAAAAAAAAA ./det 9            # digest=5bae78ea324017a6, 658 events
+
+  Same binary, same seed, same machine. The environment shifts the initial
+  stack, the simulation reads uninitialised memory, and the run takes a
+  different path -- 36 more events and a different number of commits.
+symptom: |
+  `anvil_mvcc_faults 40` reports "seed 9 diverged". Within one process the first
+  run of a seed can differ from every later run of it, because by then the stack
+  holds the previous run's remains rather than whatever it held at startup.
+root_cause: |
+  Not yet localised. What is established:
+
+    * It is an *automatic* variable, not heap or static. Building everything with
+      -ftrivial-auto-var-init=zero makes all runs of seed 9 agree, and that flag
+      touches nothing else.
+    * It is read early enough to change control flow, not just a reported value:
+      the event count differs, so the schedule itself diverges.
+    * -Wall -Wextra -Wmaybe-uninitialized -Wuninitialized at -O2, -O1 and -Og
+      report nothing across the whole tree.
+what_did_not_work: |
+  * Per-file bisection by removing -ftrivial-auto-var-init=zero from one
+    translation unit at a time. The flag changes stack layout globally, so
+    removing it anywhere moves the garbage and 16 of 40 files look guilty.
+    Layout-sensitive bugs defeat layout-changing bisection.
+  * Sanitizers. This toolchain (MinGW-w64 UCRT, GCC 15.2) ships no libasan and
+    no MSan, and valgrind does not run on Windows. MSan is the right instrument
+    and is not available here.
+next_step: |
+  Build the tree with clang + MemorySanitizer on Linux and run seed 9. MSan
+  reports the exact read with a stack trace and an allocation site, and this
+  becomes a five-minute fix. Failing that, the padding trick above is a reliable
+  oracle: it flips the outcome on demand, so a manual bisection can proceed by
+  initialising candidate locals and re-testing under both paddings.
+impact: |
+  Replay is the foundation the whole project rests on. In practice a seed
+  replayed in a fresh process with the same environment does reproduce, which is
+  why this survived to P4 -- but "same environment" is not a guarantee anyone
+  should have to rely on, and a seed that misbehaves inside a 40-seed sweep may
+  not misbehave when replayed alone. That is exactly the failure mode
+  deterministic simulation exists to eliminate.
+why_open: |
+  The bug is real and precisely characterised; what is missing is the one tool
+  that localises it. Guessing at initialisers until the symptom stops is how a
+  codebase acquires a dozen unexplained `= 0`s and keeps the bug.
+```
+</details>
+
+<details>
+<summary><b>ANV-0032</b> · S1 · raft · <b>OPEN — a learner stops converging and the leader's probe never re-establishes a match</b></summary>
+
+```yaml
+id:              ANV-0032
+title:           after a partition heals, one learner never catches up; the leader holds it at match=0 in probe forever
+status:          OPEN
+severity:        S1
+class:           liveness (convergence)
+layer:           raft / driver
+invariant:       none fires -- this is why it is filed rather than caught
+api_visible:     yes, but only to a reader pinned to that node: the entry is
+                 committed and durable on a quorum, so no acknowledged write is
+                 at risk and no linearizable read is affected
+seed:            14 of the P3 sweep (6 nodes, 1 learner, membership churn)
+config:          workloads/raft_kv, faults from the seed, no crashes, no bit rot
+commit_found:    P3, diagnosed further in P4
+reproduce:       anvil_raft_faults 16
+symptom: |
+  After heal_and_settle(60s), with the cluster otherwise converged:
+
+    n6 is missing acknowledged write k0=c6:22 (index 179);
+      leader n1 has it at match=0 next=189 state=probe inflight=1 idle_rounds=1
+      silent learner; that node's applied index is 108
+      (sent 716, received 2607, log ends at 159, send failures 115, reconnects 0);
+      the leader has sent 7935 with 14 failures
+what_is_known: |
+  * No safety invariant fires on this seed, and no other node is behind. The
+    entry is committed on a quorum of voters; the learner is not one.
+  * n6 is alive, was never crashed, and is a member of the leader's
+    configuration (it is skipped by the audit if it is not).
+  * n6 receives (2607) and its log has grown to 159, so replication worked for
+    most of the run and then stopped.
+  * The leader re-probes correctly: idle_rounds cycles and the unpause path in
+    broadcast_heartbeat frees the window every two rounds.
+  * step_append always replies, including when its log is too short, so a probe
+    past the end is answered rather than dropped.
+  * n6 reports 115 send failures. That is the strongest lead: its replies are
+    not reaching the leader, which is exactly the "receives and never answers"
+    shape the leader observes.
+ruled_out: |
+  * A removed member the leader stopped replicating to (the audit now skips
+    non-members, and this node is still a member).
+  * A cached dead outbound connection handle -- fixed while chasing this, and
+    correct on its own merits, but the seed's counters are unchanged by it, so
+    it was not the cause here.
+  * Heartbeats not reaching learners (broadcast_heartbeat iterates members, not
+    voters).
+  * A follower that fails to adopt a higher term (step() adopts before dispatch).
+next_step: |
+  Totals are not enough: every counter here is cumulative over the run, so
+  "received 2607" cannot distinguish "received nothing since the heal" from
+  "receiving fine". The next move is per-phase counters -- reset at heal time --
+  or a message trace filtered to the n1/n6 pair over the settle window. That
+  will say in one line whether the post-heal probes arrive and whether the
+  replies leave.
+why_open: |
+  Filed rather than fixed because the remaining hypotheses are not separable
+  from the evidence in hand, and guessing at a fix for a liveness bug is how a
+  suite acquires a change that makes the symptom rarer without making it go
+  away. The gate stays red on this seed on purpose.
+```
+</details>
+
+<details>
+<summary><b>ANV-0029</b> · S0 · mvcc · <b>a reader could see half a transaction</b></summary>
+
+```yaml
+id:              ANV-0029
+title:           commit resolved intents one key at a time, so a concurrent reader saw some keys at their new values and the rest at their old ones
+status:          fixed
+severity:        S0
+class:           correctness (atomicity)
+layer:           mvcc
+invariant:       INV-MVCC-04 (a read returns the newest version at or below its snapshot)
+found_by:        dst-random, the P4 auditor
+api_visible:     yes -- a transaction is observably non-atomic
+commit_found:    P4
+root_cause: |
+  TxnManager::commit looped over the write set calling commit_intent per key,
+  and each of those suspends for its own write. Any reader scheduled inside the
+  loop saw a partially committed transaction. Snapshot isolation promises
+  precisely that this cannot happen, and nothing in the layer below was going to
+  provide it.
+fix:             MvccStore::commit_all / abort_all -- read every intent, then
+                 apply one lsm::WriteBatch, which is a single record with a
+                 single checksum: all of it lands or none of it does
+fix_commit:      P4
+regression:      the P4 auditor compares every live snapshot against the model
+lesson: |
+  Atomicity is not something a loop acquires by having each step be durable. It
+  has to come from a primitive that is atomic, and the storage engine already had
+  one -- the write batch -- which the first version of the commit path simply did
+  not reach for.
+```
+</details>
+
+<details>
+<summary><b>ANV-0030</b> · S0 · mvcc · <b>one EIO stopped garbage collection for the rest of the process's life</b></summary>
+
+```yaml
+id:              ANV-0030
+title:           a commit or abort whose write failed left the transaction neither committed nor aborted, holding intents and pinning the safepoint
+status:          fixed
+severity:        S0
+class:           liveness / resource leak
+layer:           mvcc
+invariant:       INV-MVCC-05 (no intent outlives its transaction)
+found_by:        dst-random with EIO injection
+api_visible:     partly -- keys become permanently unwritable; the storage leak is silent
+commit_found:    P4
+symptom: |
+  "k2 has held an intent from t12 across a whole audit interval, and that
+  transaction is committed", plus a collector reporting gc_passes climbing and
+  versions_collected stuck at zero for the rest of the run.
+root_cause: |
+  commit_all and abort_all can fail. The caller got an error and moved on, and
+  the transaction stayed kActive forever: its intents blocked their keys against
+  every later writer, and because the safepoint is the minimum over live
+  transactions, its start timestamp pinned the floor permanently. GC then
+  collected nothing for the remainder of the run, the version store grew without
+  bound, and the whole simulation slowed to a crawl -- which presented as a hang
+  rather than as a fault.
+fix: |
+  A decided-but-unwritten transaction enters kResolving and keeps its outcome in
+  memory; a janitor retries the batch until it lands. Retrying is sound because
+  resolution is one atomic batch: it landed or it did not, and replaying writes
+  the same keys with the same values at the same timestamp. abort() refuses a
+  kResolving transaction, since letting an abort through there would turn a
+  commit that failed to land into a reversal of a decision already taken.
+fix_commit:      P4
+regression:      the P4 sweep under EIO injection
+lesson: |
+  Every failure path in a transaction manager has to reach a *decided* state.
+  "Return the error and let the caller sort it out" is fine for an operation and
+  wrong for an outcome, because there is no caller left to sort it out once the
+  transaction is gone -- and what is left behind is not a failed transaction, it
+  is an object with no owner holding locks nobody can release.
+```
+</details>
+
+<details>
+<summary><b>ANV-0031</b> · S1 · mvcc · <b>a write-write conflict announced an abort that had not happened yet</b></summary>
+
+```yaml
+id:              ANV-0031
+title:           the first-committer-wins path set state to kAborted in place, leaving the transaction's intents on disk under an owner that claimed to be finished
+status:          fixed
+severity:        S1
+class:           correctness
+layer:           mvcc
+invariant:       INV-MVCC-05
+found_by:        dst-random, the P4 auditor
+api_visible:     no -- observable as a key blocked by a transaction that is over
+commit_found:    P4
+root_cause: |
+  TxnManager::write, on detecting a version committed above the snapshot, wrote
+  `txn->state = kAborted` and returned. Intents from the transaction's earlier
+  writes were still on disk, and the locks were still held, until whoever called
+  it got around to calling abort() -- which has to reach the disk, and under
+  injected latency is long enough for another writer to find the key blocked by a
+  transaction that no longer exists.
+fix:             await abort(id) from that path, so the state change and the
+                 intent removal happen together
+fix_commit:      P4
+regression:      the P4 auditor's orphan-intent rule
+lesson: |
+  Same shape as ANV-0021 one layer down: a component published a state that its
+  durable form did not yet reflect. A status field is a claim about the world,
+  and it should not be set before the world agrees.
+```
+</details>
+
+<details>
+<summary><b>ANV-0025</b> · S0 · lsm · <b>concurrent writers were handed the same sequence numbers, and a completed write went invisible</b></summary>
+
+```yaml
+id:              ANV-0025
+title:           write() derived its sequence range from the published watermark before suspending, so writers in flight collided
+status:          fixed
+severity:        S0
+class:           correctness (visibility)
+layer:           lsm
+invariant:       read-after-write; no invariant existed for it before this bug
+found_by:        dst-random, four layers up -- the P4 MVCC workload
+api_visible:     yes -- a key that put() acknowledged is absent from the next get()
+seed:            3 of the P4 sweep; also 1, 5, 6
+config:          workloads/mvcc_txn, default profile, EIO and latency injection
+commit_found:    P4
+sim_time_to_detect: 00:00:00.4
+runs_to_first_hit:  1 in ~2 seeds once several writers overlap
+symptom: |
+  An MVCC intent was written successfully, and the transaction that wrote it
+  could not find it when it went to clean up moments later. Every other
+  transaction found it, forever after. The trace is unambiguous:
+
+      put_intent   key=k1 txn=9  status=ok
+      abort_all    key=k1 txn=9  found=0          <- its own cleanup, blind
+      abort_all    key=k1 txn=18 found=1 owner=9  <- and there it is
+root_cause: |
+  Db::write computed `first = last_sequence() + 1` and then suspended twice --
+  once to append to the WAL, once to fsync it -- before publishing. Every writer
+  that started inside that window read the same watermark and was handed the
+  same numbers. Worse, publication was an assignment: a writer that had
+  allocated a lower range and finished later set the watermark *below* entries
+  another writer had already published, and reads are bounded by that watermark.
+  The entries were in the memtable the whole time. They were simply not visible,
+  and became visible again when an unrelated write pushed the watermark past
+  them -- so the key was absent for a while and then came back.
+fix: |
+  Reserve the range before the first suspension point (VersionSet::allocate_sequence)
+  and publish monotonically (publish_sequence takes the maximum). The maximum is
+  sufficient rather than a contiguous-prefix rule because entries reach the
+  memtable only after their own fsync succeeds, so a higher watermark can only
+  expose what is already durable. The contiguous-prefix version was written first
+  and was wrong in the other direction: it held a write invisible until unrelated
+  earlier writers finished, so put() returned ok on something the next get()
+  could not see.
+fix_commit:      P4
+regression:      test/lsm_test.cc -- test_concurrent_writers_never_lose_read_after_write
+lesson: |
+  Reading a counter, suspending, and then using what you read is the coroutine
+  form of a torn read, and it looks entirely innocent on the page: there is no
+  lock to forget and no shared mutable state in sight. The rule that survives is
+  that any value derived before a co_await is stale after it.
+
+  The find is also the argument for stacking layers rather than testing each in
+  isolation. Two P2 suites and a 40-seed Raft sweep ran over this engine without
+  exposing it; the MVCC layer did, because it is the first thing in the tree that
+  writes a key and immediately reads it back from several coroutines at once.
+```
+</details>
+
+<details>
+<summary><b>ANV-0026</b> · S0 · lsm · <b>compaction destroyed tables that suspended reads were still inside</b></summary>
+
+```yaml
+id:              ANV-0026
+title:           delete_obsolete_files freed Table objects and closed their handles while reads were suspended in pread
+status:          fixed
+severity:        S0
+class:           memory safety
+layer:           lsm
+found_by:        dst-random (process crash) during the P4 sweep
+api_visible:     yes -- process crash
+seed:            2 of the P4 sweep
+commit_found:    P4
+symptom:         "SIGSEGV in BlockCache::insert, reached from Table::read_block"
+root_cause: |
+  Table::read_block suspends inside pread and then touches `cache_` and
+  `file_number_` on resume. Compaction is free to run during that suspension,
+  and delete_obsolete_files erased the Table from the cache -- destroying it --
+  and closed the file handle the outstanding read was using. The read resumed
+  into freed memory. It surfaced as a crash in the block cache because that is
+  the first pointer the resumed frame dereferences; the corruption was earlier.
+fix: |
+  The table cache holds shared_ptr<Table> and open_table hands out a reference,
+  so a suspended read keeps its table alive. Obsolete tables are retired to a
+  list rather than destroyed, and their handles are closed by a sweep that runs
+  once nothing holds them. The sweep takes the list away from the member before
+  awaiting anything: closing a file suspends, and a compaction that retires
+  another table during that suspension would push onto the vector being walked.
+fix_commit:      P4
+regression:      the P4 sweep; seed 2 crashed reliably before the fix
+lesson: |
+  "This object is in a cache and the cache is alive" is not the same as "this
+  object is alive", once a reader can suspend inside it. A raw pointer handed out
+  by a cache is safe exactly as long as nothing between the handing-out and the
+  last use can suspend, which in a coroutine engine is almost never true.
+```
+</details>
+
+<details>
+<summary><b>ANV-0027</b> · S0 · lsm · <b>two flushes at once dropped a whole memtable</b></summary>
+
+```yaml
+id:              ANV-0027
+title:           flush() and maybe_compact() had no exclusion, so a second one overwrote the first one's state mid-flight
+status:          fixed
+severity:        S0
+class:           durability
+layer:           lsm
+found_by:        the regression test written for ANV-0025, which still failed after that fix
+api_visible:     yes -- acknowledged writes disappear
+commit_found:    P4
+root_cause: |
+  flush() installs the live memtable as `immutable_` and then suspends for the
+  whole of writing an SSTable. A second flush starting inside that window ran
+  `immutable_ = std::move(memtable_)` over the top of it: the memtable the first
+  flush was still iterating was destroyed, and every entry it had not yet written
+  out went with it. The first flush then cleared `immutable_`, dropping the
+  second one's entries too. Two concurrent compactions had the matching problem,
+  picking overlapping inputs from the same version.
+fix:             one flush and one compaction in flight at a time; a caller that
+                 finds one running returns ok, because its write is already in the
+                 memtable and already in the WAL, and the next threshold crossing
+                 will flush it
+fix_commit:      P4
+regression:      test/lsm_test.cc -- test_concurrent_writers_never_lose_read_after_write
+lesson: |
+  This is the second defect the same regression test found, and that is the
+  argument for writing the test as a property rather than as a replay of the
+  trace that led to it. "A write that returned ok is visible to the next read"
+  mentions neither sequence numbers nor memtables, so it kept failing after the
+  sequence bug was fixed and pointed straight at the next cause.
+```
+</details>
+
+<details>
+<summary><b>ANV-0028</b> · S1 · sim · <b>the fault injector never terminated on a single-node cluster</b></summary>
+
+```yaml
+id:              ANV-0028
+title:           apply_partition retried until both sides were non-empty, which never happens with one node
+status:          fixed
+severity:        S1
+class:           liveness (harness)
+layer:           sim
+found_by:        attaching a debugger to a suite that had been "hanging" for eight minutes
+api_visible:     no -- it hangs the harness, not the system under test
+seed:            3 of the P4 sweep, and any single-node run that draws a partition
+commit_found:    P4
+symptom: |
+  The P4 suite ran for over eight minutes and timed out, while individual seeds
+  finished in milliseconds. One stack frame settled it:
+
+      #0 anvil::sim::FaultInjector::apply_partition()
+      #1 anvil::sim::Scheduler::run(Duration)
+root_cause: |
+  The random split assigns each node to one of two groups by coin flip and
+  redraws while either group is empty. With one node, one group is always empty,
+  so the loop never exits. Simulated time stops advancing and the process spins
+  on RNG draws.
+fix:             a partition needs two sides, so return early when nodes < 2
+fix_commit:      P4
+regression:      the P4 suite is single-node by construction; before the fix,
+                 seed 3 hung indefinitely. Suite runtime went from >8 minutes
+                 (timeout) to 0.4s for 20 seeds.
+lesson: |
+  Cost of the wrong instrument, measured: roughly two hours theorising about GC
+  safepoints, LSM compaction and quadratic invariant scans, against ninety
+  seconds to attach gdb to the stuck process and read one frame. ANV-0023
+  recorded this lesson already and it was not applied quickly enough. The trigger
+  to reach for a debugger is not "I am out of hypotheses"; it is "I have more
+  than two hypotheses and no measurement that separates them".
+
+  The bug itself is the ordinary kind: a loop whose termination argument assumed
+  a configuration the caller was never obliged to provide.
+```
+</details>
+
+<details>
+<summary><b>ANV-0024</b> · S0 · raft · <b>a crash inside the rename window lost the entire log</b></summary>
+
+```yaml
+id:              ANV-0024
+title:           the replacement log's directory entry was only made durable after the rename, not before
+status:          fixed
+severity:        S0
+class:           durability
+layer:           raft
+invariant:       INV-RAFT-09 (per-node half)
+found_by:        dst-random
+api_visible:     yes
+seed:            10 of the P3 sweep (7 nodes)
+commit_found:    P3
+symptom:         "n4 came back with its log ending at 0 after having 64 durably persisted"
+root_cause: |
+  Replacing the log atomically is write -> fsync -> rename -> fsync_dir, and the
+  fsync_dir at the end makes the *rename* durable. It does not help with the
+  window before it: the temporary file was created and never had its own
+  directory entry persisted, so a crash between the rename and the final
+  fsync_dir erased it -- and because this rename replaces the log rather than
+  adding to it, what was lost was not a suffix but the whole file. The node came
+  back with an empty log and no snapshot to fall back on.
+fix:             fsync the directory once before the rename as well, so the file
+                 being renamed into place is itself durable first
+fix_commit:      P3
+regression:      the P3 sweep; seed 10 reproduces the empty log before the fix
+lesson: |
+  "Atomic replace" has four steps and the usual write-up lists three. The one
+  that gets dropped is the one that protects the *source* of the rename, and it
+  only matters on a disk model that tracks directory entries separately from
+  contents -- which is exactly why this project models them separately.
+```
+</details>
+
+<details>
+<summary><b>ANV-0013</b> · S0 · raft · <b>an even voter count committed on half a cluster</b></summary>
+
+```yaml
+id:              ANV-0013
+title:           the majority index used (n-1)/2, so two of four voters counted as a quorum
+status:          fixed
+severity:        S0
+class:           safety
+layer:           raft
+invariant:       INV-RAFT-09 (a committed entry is durable on a quorum)
+found_by:        dst-random
+api_visible:     yes -- an acknowledged write can be lost to a single subsequent election
+seed:            3 (5 nodes with a learner, so four voters); also 1 and 9
+config:          workloads/raft_kv, membership churn + one learner, faults from the seed
+commit_found:    P3
+sim_time_to_detect: 00:00:01
+runs_to_first_hit:  1 in ~3 seeds that reach an even voter count
+faults_minimised:   [none required -- a four-voter configuration is sufficient]
+root_cause: |
+  Config::majority_index sorted the peers' match indices in descending order and
+  took the element at (n-1)/2. For odd n that is the majority element. For even
+  n it is one position too high: with four voters at 12/12/6/6 it returns 12,
+  which only two of the four hold.
+  The leader therefore committed entries replicated to exactly half the cluster.
+  Half is not a quorum, and the two halves need not intersect -- so a later
+  election could legitimately produce a leader without the entry, and the
+  entry, already acknowledged to a client, would be overwritten.
+  Even voter counts are not a corner case. Every joint-consensus transition
+  passes through one, and a four- or six-node cluster is what you get the moment
+  someone adds a replica. The bug is invisible on three and five nodes, which is
+  what every hand-written test uses.
+fix:             indices[voters.size() / 2], with the denominator staying at the
+                 voter count so the learner rule is unaffected
+fix_commit:      P3
+regression:      test_quorum_math in test/raft_test.cc asserts the four- and
+                 six-voter cases directly
+lesson: |
+  The first invariant to fire was INV-RAFT-09, at 1.4 seconds of simulated time,
+  naming the entry and listing which nodes held it durably. No client-facing
+  test could have asked that question: the write was acknowledged, the data was
+  present, and the divergence only becomes observable after an election that may
+  never happen. This is the protocol-aware case in its purest form.
+  Also: the arithmetic is three lines and was written from memory. The unit test
+  that would have caught it did not exist because three-node quorums are what
+  everyone pictures.
+```
+</details>
+
+<details>
+<summary><b>ANV-0014</b> · S0 · raft · <b>a retried append duplicated records and recovery ate the log</b></summary>
+
+```yaml
+id:              ANV-0014
+title:           RaftStorage::append left partial records behind on failure; the retry appended after them
+status:          fixed
+severity:        S0
+class:           durability
+layer:           raft
+invariant:       INV-RAFT-04 (leader completeness), via a node that lost committed entries
+found_by:        dst-random
+api_visible:     yes -- committed, acknowledged writes disappear
+seed:            9 (5 nodes, 8 crashes, 353 injected EIOs, no media corruption at all)
+config:          workloads/raft_kv, faults from the seed
+commit_found:    P3
+sim_time_to_detect: 00:00:25
+runs_to_first_hit:  1 in ~10 seeds; needs an EIO inside a multi-entry append
+faults_minimised:   [io_error during append of a batch, followed by the retry]
+root_cause: |
+  append() wrote a batch entry by entry. On an I/O error partway through it
+  returned the error but left log_offset_ and the offset table pointing past the
+  records it had already written. The caller correctly advances nothing on
+  failure, so the next Ready contained the same entries -- and appended them
+  *after* the ones the failed attempt had left in the file.
+  The log file then held a repeated run of indices. Recovery stops at the first
+  index that is not the previous plus one, so everything above the repeat was
+  discarded: on this seed a node came back twenty entries short, having lost
+  entries it had fsynced and acknowledged. Two such nodes were enough to make an
+  election legitimate for a candidate that lacked a committed entry.
+  Nothing was corrupt. No sector was torn, no bit flipped. A transient EIO and a
+  correct retry were sufficient.
+fix: |
+  append() is now all-or-nothing: it records the starting offset, and on any
+  failure restores log_offset_ and the offset table and truncates the file back.
+  put_hard_state() does the same. The contiguity rule in recover() stays as the
+  backstop for the case where the rollback truncate itself fails.
+fix_commit:      P3
+regression:      the P3 fault sweep; seed 9 reproduces the loss before the fix
+invariant_added: none -- the contiguity rule in recover() is what turned a silent
+                 corrupt log into a detected truncation, and it was added first
+lesson: |
+  Every partial-failure path needs a defined post-state, and "returns an error"
+  is not one. The retry is the correct behaviour; it was the retry that turned a
+  recoverable device hiccup into permanent data loss, which is the same shape as
+  ANV-0003 one layer down.
+  Worth noting how it was found: INV-RAFT-04 fired twenty-five seconds in, naming
+  a leader that lacked a committed entry. That is a symptom four steps removed
+  from the cause. What closed the gap was adding the votes cast in that term to
+  the violation report -- the answer was immediately visible once the report
+  showed the winner's voters had *shorter* logs than the entry required.
+```
+</details>
+
+<details>
+<summary><b>ANV-0015</b> · S1 · raft · <b>messages were stepped inside the fsync window</b></summary>
+
+```yaml
+id:              ANV-0015
+title:           the driver stepped incoming messages while a persist was in flight
+status:          fixed
+severity:        S1
+class:           safety
+layer:           raft
+invariant:       INV-RAFT-09, INV-RAFT-03
+found_by:        dst-random
+api_visible:     no -- the divergence is repaired by normal log reconciliation
+                 before any client can route a read to it
+seed:            9 and 10 of the P3 sweep
+commit_found:    P3
+root_cause: |
+  recv_loop called node_.step() the moment a message arrived, including while
+  pump() was suspended on an fsync. The batch being written therefore no longer
+  described the log by the time it landed: an AppendEntries reply generated
+  before the suspension claimed entries that a conflicting append had since
+  truncated, and the leader counted that claim toward a quorum.
+  Real implementations do not have this hazard because they serialise Step and
+  Ready in a single loop. The Ready model is only equivalent to a single-threaded
+  step loop if nothing steps during the batch, and that had been left implicit.
+fix:             incoming messages and fired ticks are queued and applied at the
+                 top of pump(), so nothing mutates the state machine between
+                 producing a batch and finishing it
+fix_commit:      P3
+regression:      the P3 fault sweep
+lesson: |
+  The bug was in the seam, not in the protocol or the storage engine. Batching
+  I/O changes what "the state when I decided this" means, and every value
+  computed before a suspension and used after it has to be re-justified.
+```
+</details>
+
+<details>
+<summary><b>ANV-0016</b> · S1 · raft · <b>a truncation inside the fsync window left the old records on disk</b></summary>
+
+```yaml
+id:              ANV-0016
+title:           truncate_suffix decided whether to shorten the file from persisted_, ignoring writes in flight
+status:          fixed
+severity:        S1
+class:           durability
+layer:           raft
+invariant:       INV-RAFT-16 (one index and one term means one entry)
+found_by:        dst-random, then a temporary assertion on log contiguity
+api_visible:     conditional
+seed:            1 (4 nodes, 3 crashes, 21 duplicated messages)
+commit_found:    P3
+root_cause: |
+  RaftLog::truncate_suffix only requested a file truncation when persisted_ was
+  at or above the truncation point. Entries handed to the driver but not yet
+  fsynced are already being written and are not covered by that test, so a
+  conflicting append arriving during the fsync concluded there was nothing on
+  disk to remove. The replacement entries were then appended after the records
+  that should have been cut, and the file held the same index twice.
+fix:             the log tracks `writing_`, the highest index handed out for
+                 persistence, and truncation compares against max(persisted_,
+                 writing_); mark_persisted additionally refuses to advance past
+                 an outstanding truncation point
+fix_commit:      P3
+regression:      the P3 fault sweep
+lesson: |
+  Three watermarks now exist -- writing_, persisted_, committed -- and the
+  temptation is to collapse them. Each answers a different question, and the
+  questions differ by exactly one fsync.
+```
+</details>
+
+<details>
+<summary><b>ANV-0017</b> · S2 · raft · <b>a connection reset made a node permanently deaf to one peer</b></summary>
+
+```yaml
+id:              ANV-0017
+title:           recv_loop returned on the first failed recv instead of reconnecting
+status:          fixed
+severity:        S2
+class:           liveness
+layer:           raft
+invariant:       none -- surfaced as replicas that never converged after healing
+found_by:        dst-random
+api_visible:     yes -- the replica stops catching up and stays behind forever
+seed:            8 of the P3 sweep (5 nodes, 20 resets)
+commit_found:    P3
+root_cause: |
+  A failed recv means the link was reset, which the network model injects on
+  purpose. The loop treated it as end-of-stream and returned. The node then kept
+  sending to that peer, kept ticking, kept looking healthy from every angle, and
+  never heard from it again. Nothing reports this: there is no error, no
+  timeout, no counter -- just a replica that quietly stops converging.
+fix:             an outer loop reconnects after a short delay and counts the
+                 reconnection
+fix_commit:      P3
+regression:      the liveness half of the P3 sweep (every live replica must hold
+                 every acknowledged write after the faults heal)
+lesson: |
+  Connection reset is a fault the models have injected since P1, and the first
+  three protocols written on top of the seam all treated a failed recv as a
+  reason to stop. The seam should make that harder to get wrong; noted as a
+  candidate for a reconnecting helper rather than a rule everyone re-derives.
+```
+</details>
+
+<details>
+<summary><b>ANV-0018</b> · S1 · raft · <b>a restart applied conf changes twice and skipped the joint state</b></summary>
+
+```yaml
+id:              ANV-0018
+title:           restore() replayed committed conf changes that advance() then replayed again
+status:          fixed
+severity:        S1
+class:           safety
+layer:           raft
+invariant:       INV-RAFT-12 (configuration follows only from the committed prefix)
+found_by:        dst-random
+api_visible:     no
+seed:            1 of the P3 sweep, with membership churn enabled
+commit_found:    P3
+root_cause: |
+  Recovery applied every committed conf-change entry to rebuild the membership,
+  and then left applied_ at the snapshot index -- so the ordinary apply path
+  replayed exactly the same entries and applied them a second time.
+  Applying kEnterJoint twice is not idempotent: the second application sets the
+  outgoing set to the incoming one, they compare equal, and the joint state is
+  dropped. A node that restarted mid-transition therefore jumped straight to
+  C_new while its peers were still running C_old,new, and the two computed
+  quorums over sets that need not intersect -- the precise thing joint consensus
+  exists to prevent.
+fix:             restore() no longer replays; the configuration is rebuilt by the
+                 normal committed-entry path on the first pump after recovery
+fix_commit:      P3
+regression:      the churn-enabled P3 sweep
+lesson: |
+  Recovery that "helpfully" reconstructs derived state duplicates whatever the
+  normal path also reconstructs. The rule that came out of this: recovery
+  restores *durable* state and nothing else; everything derived is derived once,
+  by the same code that derives it at run time.
+```
+</details>
+
+<details>
+<summary><b>ANV-0019</b> · S2 · raft · <b>the pipelining window never drained after a partition</b></summary>
+
+```yaml
+id:              ANV-0019
+title:           inflight is decremented by replies, and a partitioned peer sends none
+status:          fixed
+severity:        S2
+class:           liveness
+layer:           raft
+invariant:       none -- surfaced as a follower that never caught up
+found_by:        unit test (snapshot install to a lagging follower)
+api_visible:     conditional
+commit_found:    P3
+root_cause: |
+  Replication pipelines up to max_inflight_appends messages and decrements the
+  counter on each reply. A partition answers nothing, so the window filled and
+  send_append returned early forever. When the partition healed, heartbeat
+  replies resumed and the leader's own view of the peer became healthy again --
+  but the window stayed full, so it never sent another entry.
+  A second, related defect: the heartbeat-reply path decided whether to send by
+  comparing against the tail the *follower* reported. A follower with a divergent
+  tail reports a longer log than the leader has, so the leader concluded it
+  needed nothing and never sent the append that would have truncated it.
+fix:             a heartbeat reply frees a slot; two silent heartbeat rounds
+                 unpause the peer entirely; and the send decision is made against
+                 the leader's own record of what the peer has acknowledged
+fix_commit:      P3
+regression:      test_snapshot_install_catches_a_lagging_follower_up and
+                 test_conflict_backtracking_is_by_term_not_by_index
+lesson: |
+  Every flow-control counter needs an answer to "what decrements this when the
+  peer is gone?". Both halves of this bug are the same mistake: trusting a
+  counter or a report that a fault can silently stop updating.
+```
+</details>
+
+<details>
+<summary><b>ANV-0020</b> · S1 · raft · <b>recovery spliced a stale log tail onto a newer snapshot</b></summary>
+
+```yaml
+id:              ANV-0020
+title:           records above the snapshot index were kept without checking they belonged to it
+status:          fixed
+severity:        S1
+class:           safety
+layer:           raft
+invariant:       INV-RAFT-04, INV-RAFT-03
+found_by:        dst-random
+api_visible:     conditional
+seed:            1 of the P3 sweep
+commit_found:    P3
+root_cause: |
+  A snapshot at index K supersedes everything at or below K. Recovery dropped
+  those records and kept the rest -- unconditionally. A crash between writing a
+  snapshot and rewriting the log leaves exactly the state where the retained
+  records belong to a *different* history, and the node came back holding
+  entries from term 2 sitting on top of a snapshot from term 3.
+  Terms never decrease along a Raft log. This one did, and every consistency
+  check downstream faithfully trusted it.
+fix: |
+  Recovery now enforces three rules: records at or below the snapshot are
+  dropped; what remains must be contiguous and start exactly one past the
+  snapshot; and the first surviving entry's term must not be below the
+  snapshot's. Anything else is treated as a damaged tail and truncated.
+fix_commit:      P3
+regression:      the snapshot-heavy seeds of the P3 sweep
+lesson: |
+  "Impossible" states are worth an explicit check at the point where durable
+  bytes become in-memory structure. Recovery is the one place where the
+  invariants the rest of the code relies on have to be *established* rather than
+  assumed, and a log with decreasing terms is cheap to detect and catastrophic
+  to trust.
+```
+</details>
+
+<details>
+<summary><b>ANV-0012</b> · S2 · raft · <b>snapshot flow control was dropped by its own codec</b></summary>
+
+```yaml
+id:              ANV-0012
+title:           chunk_offset and chunk_total were encoded inside the optional snapshot block
+status:          fixed
+severity:        S2
+class:           liveness
+layer:           raft
+invariant:       none -- caught by a unit test that encodes every message on every hop
+found_by:        unit
+api_visible:     conditional -- a follower that needs a snapshot never receives one
+commit_found:    P3
+root_cause: |
+  A chunked snapshot install acknowledges progress with an InstallSnapshotReply
+  that carries the next expected offset and no snapshot body. The two
+  flow-control fields were serialised inside the block that is only written when
+  a snapshot is attached, so every reply lost them and decoded as offset zero.
+  The leader read that as "start again" and shipped chunk one forever.
+fix:             both fields are encoded unconditionally, two bytes when zero
+fix_commit:      P3
+regression:      test_codecs_round_trip asserts a reply with no snapshot keeps them
+lesson: |
+  The unit-test harness pushes every message through encode/decode on every hop
+  rather than passing structs between nodes. That decision cost nothing and
+  found this immediately; passing structs would have left it for the fault sweep
+  to find as an unexplained stall.
+```
+</details>
+
+<details>
+<summary><b>ANV-0021</b> · S4 · checker · <b>the god's-eye checker read volatile state and invented violations</b></summary>
+
+```yaml
+id:              ANV-0021
+title:           INV-RAFT-06/07/08 were evaluated against in-memory term, vote and commit index
+status:          fixed
+severity:        S4
+class:           test-infra
+layer:           checker
+invariant:       INV-RAFT-06 (a term never decreases, including across restart)
+found_by:        dst-random (the invariant firing on correct behaviour)
+api_visible:     n/a
+seed:            2 and 4 of the P3 sweep
+commit_found:    P3
+root_cause: |
+  The observer compared the term a node was *running at*, which changes the
+  moment it becomes a candidate and before anything is persisted. A crash during
+  an election therefore looked like a term regression on every single seed that
+  crashed at the wrong microsecond.
+  It is not one. The driver sends nothing until the hard state is durable, so a
+  term bump that never reached the disk also never reached a peer: it is a
+  decision the cluster never saw, and losing it costs nothing.
+fix: |
+  All three are judged on persisted_hard_state(). A second, cheap check was
+  added in the same place for the other direction -- a node must never run at a
+  term below one it has already written down, which would mean recovery read its
+  own record and ignored it.
+fix_commit:      P3
+regression:      the clean-profile sweep, which must produce zero violations
+lesson: |
+  This is ANV-0007 again in a different layer: a checker that reports correct
+  behaviour as a violation gets argued with, then distrusted, then switched off,
+  taking every result that depended on it. The taxonomy has to be exactly as
+  precise as the property, and for durability properties that means reading the
+  durable state, not the state.
+  Three further false positives had the same shape and were fixed the same way:
+  a node that is alive but has not finished recovering is *unknown*, not empty;
+  a leader's commit decision must be judged against the configuration in force
+  when it was made, not the one in force now; and a stale leader's commit index
+  is not the cluster's.
+```
+</details>
+
+<details>
+<summary><b>ANV-0022</b> · S4 · workload · <b>the client changed its request on retry, and invented stale reads</b></summary>
+
+```yaml
+id:              ANV-0022
+title:           a retried operation redrew its key and its read/write choice
+status:          fixed
+severity:        S4
+class:           test-infra
+layer:           client (workloads/raft_kv.cc)
+invariant:       INV-RAFT-14 (a linearizable read never returns stale state)
+found_by:        dst-random
+api_visible:     n/a
+seed:            1, 2 and 5 of the P3 sweep
+commit_found:    P3
+root_cause: |
+  The client identified a request by (client, sequence) and drew the operation
+  fresh on every attempt. A timed-out write therefore came back as a read under
+  the same identity, and a late reply to the first attempt was matched to the
+  second. The client recorded an acknowledgement for an operation it had never
+  issued, and the resulting "stale read" was entirely the harness's invention.
+fix:             the request is drawn once per sequence number and held across
+                 retries, which is also what a real client does
+fix_commit:      P3
+regression:      the P3 sweep reports zero stale reads on clean settings
+lesson: |
+  The idempotency argument for retrying an unknown outcome is "the same request,
+  again". The harness satisfied the letter of it -- same identity -- and not the
+  substance, which produced a correctness report about a system that was
+  behaving perfectly.
+```
+</details>
+
 <details>
 <summary><b>EXAMPLE (format reference, not a finding)</b> — ANV-EX01 · S1 · raft · api_visible: no</summary>
 
 <details>
-<summary><b>EXAMPLE (not a real finding — delete on first real bug)</b> — ANV-EX01 · S1 · raft · api_visible: no</summary>
+<summary><b>EXAMPLE (superseded by the real ANV-00xx raft rows above)</b> — ANV-EX01 · S1 · raft · api_visible: no</summary>
 
 ```yaml
 id:              ANV-EX01

@@ -84,6 +84,85 @@ add_test(NAME lsm.crash COMMAND anvil_lsm_crash 60)
 set_tests_properties(lsm.crash PROPERTIES LABELS "lsm;faults;gate" TIMEOUT 900)
 
 # ---------------------------------------------------------------------------
+# P3: consensus.
+#
+# raft_test is the protocol itself with no simulator underneath -- elections,
+# pre-vote, CheckQuorum, conflict backtracking, the Figure-8 commit restriction,
+# joint consensus, learners, snapshot install, leases and ReadIndex, each
+# constructed directly rather than waited for. raft_faults is the exit criteria:
+# safety and liveness under the full adversary, determinism, the pause-versus-
+# lease experiment, and the ten-bug seeded-mutation drill with its API-visibility
+# column.
+# ---------------------------------------------------------------------------
+add_executable(anvil_raft_test raft_test.cc)
+target_link_libraries(anvil_raft_test PRIVATE anvil::raft anvil::sim anvil::sanitizers)
+add_test(NAME raft.units COMMAND anvil_raft_test)
+set_tests_properties(raft.units PROPERTIES LABELS "raft" TIMEOUT 300)
+
+add_executable(anvil_raft_faults raft_faults.cc)
+target_link_libraries(anvil_raft_faults PRIVATE anvil::workloads anvil::checker anvil::sanitizers)
+add_test(NAME raft.faults COMMAND anvil_raft_faults 40)
+set_tests_properties(raft.faults PROPERTIES LABELS "raft;faults;gate" TIMEOUT 3600)
+
+# ---------------------------------------------------------------------------
+# P4: MVCC and single-node transactions.
+#
+# mvcc_test is the mechanism with nothing running: key encoding order, snapshot
+# reads, intents, first-committer-wins, wound-wait, the safepoint, and the GC
+# boundary version -- each constructed rather than waited for, including the
+# mutant of the boundary rule so the test that guards it is known to fail when
+# the rule is wrong.
+#
+# mvcc_faults is the exit criteria: a collector running as aggressively as the
+# run allows against long readers holding snapshots open, checked by a god's-eye
+# auditor against a model of every version ever committed; wound-wait under
+# deliberate deadlocks; determinism; the isolation level confirmed rather than
+# asserted, by running one write-skew history through the checker at two levels;
+# and the seeded-mutation drill, whose rows are classified as must-detect,
+# control, or equivalent-with-an-argument.
+#
+# It is fast -- the whole sweep is well under a second -- because the workload
+# stops the clock when its writers are done. That was not always true; see
+# ANV-0028.
+# ---------------------------------------------------------------------------
+add_executable(anvil_mvcc_test mvcc_test.cc)
+target_link_libraries(anvil_mvcc_test PRIVATE anvil::mvcc anvil::sim anvil::sanitizers)
+add_test(NAME mvcc.units COMMAND anvil_mvcc_test)
+set_tests_properties(mvcc.units PROPERTIES LABELS "mvcc" TIMEOUT 300)
+
+add_executable(anvil_mvcc_faults mvcc_faults.cc)
+target_link_libraries(anvil_mvcc_faults PRIVATE anvil::workloads anvil::checker anvil::sanitizers)
+add_test(NAME mvcc.faults COMMAND anvil_mvcc_faults 40)
+set_tests_properties(mvcc.faults PROPERTIES LABELS "mvcc;faults;gate" TIMEOUT 900)
+
+# ---------------------------------------------------------------------------
+# P5: sharding, split/merge, and the placement driver.
+#
+# shard_test is the mechanism with nothing running: descriptor encoding, the
+# coverage tiling, split and merge preconditions, the two-level meta index, the
+# client range cache, the lease rule with its two clock bounds, and the
+# placement driver's decisions -- each constructed rather than waited for,
+# including the non-atomic split so the thing that guards it is known to fail
+# when the rule is wrong.
+#
+# shard_faults is the exit criteria: continuous splits, merges, replica changes
+# and lease moves running *during* a transactional workload under the full
+# adversary, with the total balance as the client-visible oracle and nine
+# INV-SHARD-* predicates as the internal one; determinism with Raft groups
+# created and destroyed mid-run; and the seeded-mutation drill, whose rows are
+# classified as must-detect, control, or equivalent-with-an-argument.
+# ---------------------------------------------------------------------------
+add_executable(anvil_shard_test shard_test.cc)
+target_link_libraries(anvil_shard_test PRIVATE anvil::shard anvil::sim anvil::sanitizers)
+add_test(NAME shard.units COMMAND anvil_shard_test)
+set_tests_properties(shard.units PROPERTIES LABELS "shard" TIMEOUT 300)
+
+add_executable(anvil_shard_faults shard_faults.cc)
+target_link_libraries(anvil_shard_faults PRIVATE anvil::workloads anvil::checker anvil::sanitizers)
+add_test(NAME shard.faults COMMAND anvil_shard_faults 24)
+set_tests_properties(shard.faults PROPERTIES LABELS "shard;faults;gate" TIMEOUT 1800)
+
+# ---------------------------------------------------------------------------
 # The gate's negative test.
 #
 # This archive is deliberately full of forbidden symbols. The test passes only

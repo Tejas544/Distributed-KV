@@ -22,18 +22,36 @@
 # Still to come in P7: cross-validation against Jepsen's Elle, predicate
 # anti-dependencies (G2 proper), and the trace-validation harness.
 
+#   mvcc_invariants.{h,cc}
+#                      the same idea for versions and transactions (P4).
+#                      Split deliberately into audited and live predicates:
+#                      anything that has to read the version store goes
+#                      through the workload's auditor, because the store is
+#                      behind a coroutine and an invariant cannot await.
+#
+#   raft_invariants.{h,cc}
+#                      the god's-eye view of a Raft cluster (P3). Fifteen
+#                      predicates over every node's log, term, vote, commit
+#                      index, configuration and lease, evaluated while the
+#                      cluster runs. This is the file the protocol-aware claim
+#                      rests on: none of these questions can be asked from
+#                      outside the client API.
+
 add_library(anvil_checker STATIC
   history.cc
   invariant.cc
   elle.cc
   corpus.cc
+  raft_invariants.cc
+  mvcc_invariants.cc
+  shard_invariants.cc
 )
 add_library(anvil::checker ALIAS anvil_checker)
 
 target_include_directories(anvil_checker PUBLIC "${PROJECT_SOURCE_DIR}")
 
 target_link_libraries(anvil_checker
-  PUBLIC anvil::core anvil::warnings
+  PUBLIC anvil::core anvil::raft anvil::mvcc anvil::shard anvil::warnings
   PRIVATE anvil::sanitizers)
 
 target_sources(anvil_checker PRIVATE
@@ -41,4 +59,7 @@ target_sources(anvil_checker PRIVATE
   invariant.h
   elle.h
   corpus.h
+  raft_invariants.h
+  mvcc_invariants.h
+  shard_invariants.h
 )

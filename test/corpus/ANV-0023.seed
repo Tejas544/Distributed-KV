@@ -1,0 +1,11 @@
+# ANV-0023 -- a retried append duplicated a run of indices; recovery stopped at the repeat
+# no crash needed to produce the bad file: an EIO on the fsync was sufficient
+seed        = 1
+workload    = raft_kv
+nodes       = drawn from seed
+faults      = drawn from seed
+invariant   = INV-RAFT-09 (per-node: what was durable survives a restart)
+reproduce   = anvil_raft_faults 12    (or: --seed 1 --workload raft_kv --faults)
+note        = also reproduces on seeds 9 and 10
+found_at    = P3
+fixed_at    = P3

@@ -1,0 +1,14 @@
+# ANV-0028 -- the fault injector never terminated on a single-node cluster
+# apply_partition redraws until both sides are non-empty; with one node one
+# side always is, so simulated time stops advancing and the process spins
+seed        = 3
+workload    = mvcc_txn
+nodes       = 1
+faults      = drawn from seed, partition style from the same draw
+invariant   = none -- the harness hangs, the system under test is fine
+reproduce   = anvil_mvcc_faults 6      # before the fix: >8 minutes, then timeout
+note        = found by attaching gdb to the stuck process; one frame
+              (FaultInjector::apply_partition under Scheduler::run) was the
+              whole diagnosis. Suite runtime after the fix: 0.4s for 20 seeds
+found_at    = P4
+fixed_at    = P4

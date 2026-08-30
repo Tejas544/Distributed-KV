@@ -1,0 +1,13 @@
+# ANV-0036 -- every merge was abandoned the instant it began
+# the merge timeout was measured from RangeStats::reported_at (when the range
+# last reported its SIZE) rather than from the freeze
+seed        = 1
+workload    = shard_kv
+nodes       = 5
+faults      = none required
+invariant   = none -- found by the merge counter staying at zero
+reproduce   = anvil_shard_faults 4
+note        = a range whose size has not changed has an old report, so the
+              timeout had already expired at the moment of the freeze
+found_at    = P5
+fixed_at    = P5

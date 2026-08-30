@@ -1,0 +1,15 @@
+# ANV-0040 -- the checker compared a log index against a machine without it
+# TopologyMachine::applied_index() is the last index handed to apply(); a
+# snapshot install hands over a whole state and no index at all
+seed        = 4
+workload    = shard_kv
+nodes       = 5
+faults      = drawn from seed; needs a snapshot install
+invariant   = INV-SHARD-09 (it reported a divergence between two correct nodes)
+reproduce   = anvil_shard_faults 8
+note        = fixed twice over: the checker reads the Raft log's applied index,
+              and RaftNode::snapshot_pending() lets it skip a node that is
+              between the two. A checker that can invent a finding is worse than
+              one that misses one.
+found_at    = P5
+fixed_at    = P5

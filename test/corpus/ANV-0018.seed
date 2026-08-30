@@ -1,0 +1,11 @@
+# ANV-0018 -- restore() replayed committed conf changes that advance() then replayed again
+# applying kEnterJoint twice drops the joint state
+seed        = 1
+workload    = raft_kv
+nodes       = drawn from seed
+faults      = drawn from seed
+invariant   = INV-RAFT-12 (configuration follows only from the committed prefix)
+reproduce   = anvil_raft_faults 12    (or: --seed 1 --workload raft_kv --faults)
+note        = membership churn must be enabled
+found_at    = P3
+fixed_at    = P3

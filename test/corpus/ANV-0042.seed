@@ -1,0 +1,12 @@
+# ANV-0042 -- a merge took its span from the topology and its data from the
+# machine: two readings of one fact at two different times
+seed        = 12
+workload    = shard_kv
+nodes       = 5
+faults      = drawn from seed; needs a chained merge
+invariant   = INV-SHARD-02
+reproduce   = anvil_shard_faults 12
+note        = the survivor absorbed twelve accounts and recorded that it owned
+              six. The six left over sat inside a range that stops before them.
+found_at    = P5
+fixed_at    = P5

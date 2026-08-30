@@ -1,0 +1,13 @@
+# ANV-0046 -- a merge abandoned after the survivor absorbed duplicated the data
+# the placement driver cannot see the survivor's absorb, so an abort issued
+# because the merge looked stalled can land afterwards
+seed        = 8
+workload    = shard_kv
+nodes       = 5
+faults      = drawn from seed
+invariant   = the conservation audit -- 4,200 in a cluster that holds 2,400
+reproduce   = anvil_shard_faults 12
+note        = a merge, once begun, is now completed and never abandoned
+              automatically. kAbortMerge remains available to an operator.
+found_at    = P5
+fixed_at    = P5

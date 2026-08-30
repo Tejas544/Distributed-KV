@@ -8,9 +8,9 @@ If you change architecture, add a layer, hit a non-obvious trap, or finish a
 phase — **update this file in the same commit**. A context document that lags the
 code is worse than none, because it is trusted.
 
-- Last updated: end of **P2** (LSM storage engine), commit `e693bda`
+- Last updated: end of **P5** (sharding), branch `main`
 - Repo: `https://github.com/Tejas544/Distributed-KV.git`, branch `main`
-- ~13,300 lines C++20 + Python tooling, 63 source files
+- ~32,300 lines C++20 + Python tooling, 118 source files
 
 ---
 
@@ -52,6 +52,20 @@ FLAGS="-std=c++20 -I. -DANVIL_ENABLE_BUGGIFY=1 -O2 -fno-threadsafe-statics -ffp-
 SRC=$(find anvil workloads -name '*.cc' ! -name sim_main.cc)
 g++ $FLAGS $SRC test/lsm_crash.cc -o /tmp/lsm_crash && /tmp/lsm_crash 60
 ```
+
+The suites, and what they cost:
+
+| Binary | Argument | Runtime |
+|---|---|---|
+| `test/core_smoke.cc`, `test/*_test.cc` | none | under a second each |
+| `test/sim_faults.cc` | seeds (60) | ~10s |
+| `test/lsm_crash.cc` | seeds (40) | ~20s |
+| `test/mvcc_faults.cc` | seeds (20) | <1s |
+| `test/raft_faults.cc` | seeds (12) | ~30s |
+| `test/shard_faults.cc` | seeds (24) | ~40s |
+
+`anvil_raft_faults 16` is the pinned reproduction of ANV-0032 and is expected to
+fail on seed 14. Everything else is expected to pass.
 
 ### The CLI
 
@@ -115,6 +129,39 @@ One line each. Sizes are a rough guide to where the complexity is.
 | `version.h/.cc` | 563 | `VersionEdit`/`Version`/`VersionSet`, MANIFEST as a checksummed edit log, `CURRENT` replaced via write→fsync→rename→fsync_dir. |
 | `db.h/.cc` | 804 | Write path, flush, leveled compaction, read path, recovery, orphan sweep. |
 
+### `anvil/core/raft/` — P3 consensus, hermetic, gated
+
+| File | Lines | Purpose |
+|---|---|---|
+| `types.h` | 250 | Entries, `HardState`, `Snapshot`, `ConfChange`, messages, and **`Ready`**. Also every deliberate-bug flag, all defaulting to correct. |
+| `config.h/.cc` | 290 | Membership and quorum arithmetic. Joint consensus needs a majority of *both* sets; learners are counted in nothing. `n/2` and not `(n-1)/2` — see ANV-0013. |
+| `log.h/.cc` | 280 | The log over a snapshot base. Three watermarks — `writing_`, `persisted_`, `commit_` — which differ by exactly one fsync and must not be collapsed (ANV-0016). |
+| `message.h/.cc` | 230 | Wire codec. Snapshot flow-control fields are encoded unconditionally (ANV-0012). |
+| `raft.h/.cc` | 1,120 | The state machine. No clock, no sockets, no files. Pre-vote, CheckQuorum, pipelined replication, Figure-8 restriction, joint consensus, learners, lease, ReadIndex, transfer. Holds the project's first BUGGIFY site. |
+| `storage.h/.cc` | 430 | Durable log, hard state and snapshot, on the LSM's record framing. Every size change is atomic or immediately synced. |
+| `driver.h/.cc` | 320 | Touches a `Runtime` and a transport: `truncate → append → hard state → fsync → SEND → apply → advance`, in one loop, with nothing stepping in between. |
+| `transport.h/.cc` | 358 | **P5.** One link per pair of nodes, shared by every group on them. Demultiplexes by group id, reconnects, and coalesces heartbeats. |
+
+### `anvil/core/mvcc/` — P4 versions and transactions, hermetic, gated
+
+| File | Lines | Purpose |
+|---|---|---|
+| `key.h/.cc` | 180 | `'d' | escape(key) | be64(~commit_ts)` and `'l' | escape(key)`. Inverted timestamps make a snapshot read a forward seek and put newest first; the escape is order-preserving, so encoded order equals user order. |
+| `mvcc.h/.cc` | 420 | The version store: reads at a timestamp, intents, **atomic** multi-key resolution (`commit_all`/`abort_all` — one `WriteBatch`, see ANV-0029), and GC that keeps the boundary version. |
+| `lock_table.h/.cc` | 210 | Wound-wait, with the age comparison in one place, plus the wait-for graph `find_cycle` walks in id order. |
+| `txn.h/.cc` | 330 | Transactions: snapshots, first-committer-wins, the GC safepoint, and `kResolving` — the state for an outcome that is decided and whose write did not survive the disk (ANV-0030). |
+
+### `anvil/core/shard/` — P5 ranges and placement, hermetic, gated
+
+| File | Lines | Purpose |
+|---|---|---|
+| `descriptor.h/.cc` | 423 | `RangeDescriptor`, `Lease`, and the two-level meta index. **An empty `end` is +infinity, and comparing it as a string makes it the smallest value there is** — see ANV-0043. |
+| `topology.h/.cc` | 765 | The placement group's replicated state machine: every descriptor in the cluster. One command is one apply, which is where a split's atomicity comes from. |
+| `placement.h/.cc` | 373 | `decide()`: a pure function from replicated state to commands. Purity is INV-SHARD-09, not tidiness. Timers are counted in **log entries, not seconds** (ANV-0045). |
+| `range.h/.cc` | 730 | One range's data, lease and triggers. Splits and merges are entries in *this* log, which is what makes them atomic with respect to the transfers around them. |
+| `router.h/.cc` | 170 | The client range cache, invalidated by generation. |
+| `store.h/.cc` | 1,378 | The node's range server: many groups, one transport, one tick loop, quiescence. The only file in the layer holding a `Runtime` — the analogue of `raft/driver.cc`. |
+
 ### `anvil/sim/` — the adversary; deliberately NOT hermetic
 
 | File | Lines | Purpose |
@@ -139,6 +186,9 @@ One line each. Sizes are a rough guide to where the complexity is.
 | `history.h/.cc` | 255 | List-append history model + serial `ReferenceModel`. |
 | `elle.h/.cc` | 644 | Version-order recovery, DSG (ww/wr/rw), iterative Tarjan, Adya classification, minimal witnesses. |
 | `corpus.h/.cc` | 390 | Known-bad histories (soundness) and serial histories (precision). |
+| `raft_invariants.h/.cc` | 640 | The god's-eye view: INV-RAFT-01..16 over every node's log, term, vote, commit index, configuration and lease. No hooks in the protocol — it diffs state between ticks. |
+| `mvcc_invariants.h/.cc` | 520 | INV-MVCC-01..08, split into audited and live. |
+| `shard_invariants.h/.cc` | 838 | INV-SHARD-01..09 over every node's topology, every range's data, and every lease. Three of them are deliberately narrower than the catalogue's original wording; §13 says why. |
 
 ### `workloads/`, `test/`, `tools/`
 
@@ -146,6 +196,13 @@ One line each. Sizes are a rough guide to where the complexity is.
 |---|---|---|
 | `workloads/pingpong.*` | 177 | Token ring. P0/P1 determinism vehicle. |
 | `workloads/counter.*` | 598 | Durable replicated counter with WAL + recovery. Arms `INV-CTR-01..03`. |
+| `workloads/raft_kv.*` | 830 | Replicated KV over Raft: clients on every node, requests over the *real* transport, session table for idempotent retries, membership churn, leadership transfer. Arms `INV-RAFT-14`. |
+| `workloads/mvcc_txn.*` | 640 | Transactions against the version store, with long readers held across GC passes. |
+| `workloads/shard_kv.*` | 705 | A sharded bank over many ranges. The oracle is one integer: the total never changes, and every failure this phase is about moves it. |
+| `test/raft_test.cc` | 1,005 | Protocol units with no simulator underneath. Every message goes through its wire codec on every hop. |
+| `test/shard_test.cc` | 898 | Sharding units: coverage, split and merge preconditions, the meta index, the range cache, the lease rule, and the placement decisions. |
+| `test/shard_faults.cc` | 652 | P5 exit criteria: the chaos-admin sweep, the split point, determinism with groups created mid-run, and the seven-bug drill. |
+| `test/raft_faults.cc` | 660 | P3 exit criteria: safety, liveness distribution, determinism, pause-vs-lease, and the 10-bug drill. |
 | `test/lsm_test.cc` | 536 | LSM unit tests, incl. the tombstone-guard case from ANV-0011. |
 | `test/lsm_crash.cc` | 453 | P2 exit criteria: crash cycles, corruption, ENOSPC/EIO, 4 durability mutations. |
 | `test/sim_faults.cc` | 411 | P1 exit criteria: correctness under faults, fault coverage, 2 durability mutations. |
@@ -161,6 +218,19 @@ One line each. Sizes are a rough guide to where the complexity is.
 ## 5. APIs you will actually call
 
 ```cpp
+// anvil/core/shard/store.h -- one node's range server, P5
+ShardStore store{&rt, self, options, DeterministicRandom{seed}};
+store.start(/*bootstrap=*/true);        // idempotent; whoever leads group 1 bootstraps
+store.route(request, &route);           // client side: cache, then the meta index
+co_await store.send_request(request, route);
+store.ranges();                         // every hosted group, for the checker
+
+// anvil/core/raft/transport.h -- shared by every group on a node
+RaftTransport transport{&rt, self, tick};
+transport.register_group(GroupId{n}, handler);
+transport.set_coalesce_heartbeats(true);
+co_await transport.flush();             // once per tick, by whatever drives the groups
+
 // anvil/core/runtime/runtime.h -- everything above the seam takes this
 Timestamp        now();                   // this node's OPINION, not truth
 TimeInterval     now_uncertain();         // [earliest, latest]; may be a lie by design
@@ -240,8 +310,10 @@ planting a bug.
 | P1 stream A (faults) | done | 19 fault kinds, all firing |
 | P1 stream D (oracles) | done | Invariant framework, Elle-style checker |
 | **P2 LSM engine** | **done except benchmarks** | Benchmark criterion blocked on `ProdRuntime` |
-| P3 Raft | **next** | 12 `INV-RAFT-*` predicates to arm |
-| P4+ | not started | MVCC, sharding, transactions, verification, fleet, prod |
+| **P3 Raft** | **done, one open finding** | 16 `INV-RAFT-*` armed; 9/10 drill + 1 targeted. ANV-0032 (a learner stops converging on seed 14) is open and the gate is red on it |
+| **P4 MVCC + transactions** | **done** | 8 `INV-MVCC-*` armed; snapshot isolation confirmed against the checker at two levels; whole sweep runs in <1s |
+| **P5 sharding** | **done** | MultiRaft, one Raft group per range; 9 `INV-SHARD-*` armed; 40/40 seeds clean; 17 ledger rows, 6 of them S0 |
+| P6+ | not started | Distributed transactions, verification, fleet, prod |
 
 ### Measured (see README results block)
 
@@ -254,16 +326,128 @@ corruption ............. detected 31/31 seeds, 0 bytes served that nobody wrote
 seeded bugs ............ 10/10 caught in P2; 2/2 in P1; 13/13 checker mutants
 ```
 
+### P3 results (measured over 12 seeds of the fault sweep; scale with `--seeds`)
+
+```
+safety ................. 12/12 seeds clean -- no INV-RAFT-* violation, no lost
+                         acknowledged write, no stale linearizable read
+liveness ............... a leader after healing in 12/12; p50 0ms, p90 495ms, max 1195ms
+throughput ............. ~1,259 writes acknowledged, ~451 linearizable reads per 12 seeds
+membership ............. ~117 joint-consensus transitions during the workload
+node-time .............. ~1h20m simulated node-time per 12 seeds
+seeded bugs ............ 9/10 from the sweep, the tenth by a constructed case
+pause vs lease ......... wall-clock lease safe; tick-counted lease caught by INV-RAFT-13
+```
+
+### P4 results (measured over 20 seeds of the fault sweep)
+
+```
+safety ................. 20/20 seeds clean -- no INV-MVCC-* violation, no version
+                         lost that a live snapshot could still resolve
+gc ..................... 634 transactions committed, 734 versions collected,
+                         4,060 long-reader re-reads across GC passes,
+                         6,973 versions audited against the model
+deadlock ............... 11 transactions wounded, 0 wait-for cycles, 0 stalls
+isolation level ........ one write-skew history, VALID at snapshot isolation and
+                         INVALID at serializable with the cycle reported
+                         (T1 -rw-> T2 -rw-> T1). The level is confirmed, not asserted
+seeded bugs ............ 2/2 must-detect caught; 1 control correctly silent;
+                         1 classified equivalent with a written argument
+runtime ................ 0.4s for the whole 20-seed sweep
+```
+
+### P5 results (measured over 40 seeds of the chaos-admin sweep)
+
+```
+safety ................. 40/40 seeds clean -- no INV-SHARD-* violation, no
+                         account lost, the total conserved on every seed
+topology churn ......... 563 splits, 552 merges, 73 replica changes, 1,367
+                         leadership transfers to colocate a merge, and 1,860
+                         Raft groups created and 1,382 destroyed mid-run
+split point ............ 21,377 transfers sent believing one range covered both
+                         accounts; 18,602 rejected because the topology had
+                         moved underneath them; 0 applied partially
+client work ............ 2,342 transfers acknowledged, 1,076 lease reads
+node-time .............. 2h43m simulated node-time per 40 seeds
+multiraft .............. 735,397 heartbeats carried in 570,903 messages;
+                         13,092 ticks skipped on quiesced ranges
+determinism ............ 4/4 seeds reproduce exactly, groups created and
+                         destroyed while the run is in flight
+clock .................. 24/40 seeds put a node's clock outside the bound its own
+                         configuration declared (worst 17.2s against 248ms);
+                         lease findings on those runs are classified, measured
+                         every tick rather than inferred from a config flag
+seeded bugs ............ 6/6 must-detect caught; 1 control silent; 1 classified
+                         equivalent with a written argument
+runtime ................ ~60s for the whole 40-seed sweep
+```
+
+**What P5 cost, and it is the number worth quoting.** Seventeen ledger rows from
+one phase — more than P3's thirteen and P4's four combined — and six of them S0.
+The roadmap predicted this ("the phase where bug density is highest and the
+invariants are hardest to state") and it was right for a reason worth naming: a
+sharding layer is the first place where *the shape of the system itself* is
+under concurrent modification. Every other layer has a fixed set of participants.
+
+Four of the seventeen were in the test harness rather than the system, and three
+of those manufactured findings out of nothing. That ratio is the phase's own
+lesson: a checker over a topology that changes several times a second is about
+as likely to be wrong as the topology is.
+
+**What P4 found in P2 and P1.** Four of the defects P4 surfaced were not in P4.
+The MVCC workload is the first thing in the tree that writes a key and reads it
+straight back from several coroutines at once, and that shook out three
+storage-engine bugs (ANV-0025, 0026, 0027) and one simulator bug (ANV-0028) that
+two P2 suites and a 40-seed Raft sweep had run straight past. This is the
+strongest argument the project has for building layers on top of each other
+rather than testing each in isolation, and it is worth saying out loud in any
+write-up.
+
 ### Stubs and gaps
 - **`anvil/prod/` is an empty INTERFACE target.** No `ProdRuntime` exists. This
   blocks all benchmarking and the "same code, two runtimes" claim.
 - **CMake never executed.** All verification by hand with g++.
 - **Cross-toolchain digest gate never run** (no clang or macOS available). The
   CI job exists; `-O0/-O2/-O3` agreement is the only proxy so far.
-- **No BUGGIFY sites in the core yet.** The mechanism works; nothing uses it.
+- **One BUGGIFY site in the core** (`send_append` shortens a batch). More are
+  wanted; each needs an argument for why it cannot make correct code wrong.
+- **ANV-0032 is open**: a learner stops converging after a heal on one seed in
+  sixteen. No safety invariant fires. `anvil_raft_faults 16` reproduces it.
+- **ANV-0033 is open, and it is the important one.** A run's outcome depends on
+  the process environment: sixteen bytes of environment variable change seed 9's
+  digest and its event count. Something reads an uninitialised automatic
+  variable. `-ftrivial-auto-var-init=zero` makes it go away, which identifies the
+  class but not the site. **This needs clang + MemorySanitizer on Linux**, which
+  this toolchain does not have -- it is the single highest-value thing to do with
+  a Linux box, ahead of any new feature work.
+- **MVCC crash recovery is not implemented.** Intents are durable; the
+  transaction table is not. The P4 profile therefore runs with process crashes
+  disabled, which is a scope statement written into `test/mvcc_faults.cc` rather
+  than a default anybody has to infer. P5 did not need it — its ranges are a
+  bank, not a transactional store — so it is now P6's, and P6 cannot avoid it.
+- **A range's data is durable through its Raft log, not through the LSM.** This
+  is the largest single departure from how a production store does this, and
+  almost everything awkward about P5's split path is downstream of it: the
+  right-hand side's data has to be *carried* from the parent to the child as a
+  log entry, which means a payload held in one range and needed by another, and
+  a coupling that only works while their replica sets agree (ANV-0049). A store
+  whose applied state is in the LSM makes a split a pure metadata edit. Doing
+  that needs `StateMachine::apply/snapshot/restore` to become coroutines.
+- **The meta index's second level is a logical bucket, not its own Raft group.**
+  The client pays for both lookups and both are invalidated by generation; what
+  is missing is a meta range that can itself split.
+- **Merges are never abandoned automatically.** Once begun, a merge completes;
+  the subsumed span rejects writes until some node leads both groups again. That
+  is an availability cost taken deliberately, because an abort that races the
+  survivor's absorb is a correctness hazard (ANV-0046).
 - **Custom clang-tidy checks** are specified in `.clang-tidy` but unwritten.
 - LSM deferred: block compression, ribbon filters, tiered compaction, reverse
   iteration, streaming k-way merge (compaction buffers its inputs).
+- Raft deferred: witness replicas, quorum leases, follower reads (they need
+  closed timestamps, so P6), and asynchronous log writes that let the leader ack
+  before its own disk.
+- Suffix truncation rewrites the whole log file. Correct, and O(log) per
+  divergence; a delta scheme is the optimisation if it ever shows up.
 
 ---
 
@@ -298,10 +482,10 @@ and do not report an equivalent one as a pass.
 
 ## 9. The bug ledger
 
-[BUGS.md](BUGS.md) has 11 real entries (`ANV-0001`..`ANV-0011`) plus two format
-examples. Three non-negotiable rules: every row has a **seed**, every row has a
-**pinned regression** in `test/corpus/`, and rows are written **the day the bug is
-found**.
+[BUGS.md](BUGS.md) has 46 real entries (`ANV-0001`..`ANV-0050`, four numbers
+unused) plus two format examples. Three non-negotiable rules: every row has a
+**seed**, every row has a **pinned regression** in `test/corpus/`, and rows are
+written **the day the bug is found**.
 
 Severity: S0 client-visible correctness · S1 internal invariant · S2 liveness ·
 S3 resource/perf · S4 test infrastructure.
@@ -309,7 +493,7 @@ S3 resource/perf · S4 test infrastructure.
 The `api_visible` column is the point of the whole project — every `no` is a bug
 class an outside-in checker structurally cannot find.
 
-Highest-value entries to read before starting P3:
+Highest-value entries to read before starting a new layer:
 - **ANV-0001** — the scheduler discarded one event at every deadline, orphaning a
   coroutine. Four wrong hypotheses chased first because they all had the same
   symptom.
@@ -317,6 +501,11 @@ Highest-value entries to read before starting P3:
   shadowed it. Co-firing on an epoch boundary looked like detection.
 - **ANV-0006** — the crash suite passed on a database with fsync off.
 - **ANV-0011** — a guard whose situation the workload could not reach.
+- **ANV-0038** — a safety margin that was right by a factor of two, and an
+  invariant that could only catch it by coincidence until it was rewritten to
+  check the rule instead.
+- **ANV-0043** — the audit reported six missing accounts on a cluster that had
+  lost none, because an unbounded key range sorts like an empty string.
 
 ---
 
@@ -352,29 +541,470 @@ table; drop/duplicate/EIO/bit-rot live in the models' own fault profiles. Cleari
 only the first leaves the cluster still lossy and makes every liveness assertion
 unfalsifiable (ANV-0002).
 
-**10.8 A crashed node's ordering.** In `ProcessModel::crash()`: purge queued
+**10.8 Nothing may step the state machine while a persist is in flight.** The
+fsync is a real suspension. A message stepped inside it changes the log the
+batch was written from, and a reply generated before the suspension then claims
+entries a truncation has since removed. `RaftDriver::pump()` queues incoming
+messages and fired ticks and applies them at the top of the loop; that queueing
+is what makes the Ready model equivalent to a single-threaded step loop
+(ANV-0015).
+
+**10.9 A size change is not crash-safe in place.** The disk model marks *every*
+sector of a file dirty on `ftruncate`, which is a fair reading of what a
+filesystem may do with an uncommitted size change. A crash before the next fsync
+then resolves each sector independently, and the region past the new end keeps
+the old bytes — so the file comes back as the new prefix spliced onto the old
+tail. Every size change in `anvil/core/raft/storage.cc` is therefore either
+immediately fsynced or done as write → fsync → rename → fsync_dir.
+
+**10.10 Quorum arithmetic on even voter counts.** The majority index is `n/2`,
+not `(n-1)/2`. They agree for odd `n`, which is every hand-written test, and
+differ for even `n`, which is every joint-consensus transition (ANV-0013).
+
+**10.11 The checker must read durable state, not volatile state.** A term bump
+or a vote that has not reached the disk has not reached a peer either, so losing
+it in a crash is not a regression. Checking the in-memory field reports every
+crash during an election as a violation (ANV-0021). The same rule produced three
+sibling fixes: a node that is alive but still recovering is *unknown* rather than
+empty; a commit decision is judged against the configuration in force when it was
+made; and a stale leader's commit index is not the cluster's.
+
+**10.12 A retry must resend the same request.** The workload's client drew its
+operation fresh on each attempt, so a timed-out write came back as a read under
+the same identity and a late reply attached to the wrong one — manufacturing
+stale reads out of a perfectly healthy system (ANV-0022).
+
+**10.13 A crashed node's ordering.** In `ProcessModel::crash()`: purge queued
 events → clear network endpoints → destroy coroutine frames. Any other order is a
 use-after-free that only fires under crash-heavy seeds.
 
+**10.14 Anything derived before a `co_await` is stale after it.** This is the
+single highest-yield rule in the tree and it produced three separate S0s in P4.
+A sequence number read from a watermark and used after two suspensions collides
+with every writer that started in between (ANV-0025). A raw pointer handed out by
+a cache is valid only until the holder suspends inside it (ANV-0026). A
+long-running operation that installs shared state and then suspends -- a flush
+installing `immutable_` -- must exclude a second one, or the second overwrites
+what the first is still reading (ANV-0027). None of these look like concurrency
+bugs on the page: there is no lock to forget and no thread in sight.
+
+**10.15 Never iterate a container across a suspension point.** The coroutine form
+of mutating while iterating, and it corrupts the heap rather than failing
+cleanly. Swap the container into a local first. Cost the first time: a debug
+build and a `thread apply all bt` to find that the crash was nowhere near the
+cause.
+
+**10.16 A loop's termination argument has to hold for the configurations the
+caller is allowed to pass.** `apply_partition` redrew until both sides of a split
+were non-empty, which never happens with one node, and single-node is exactly
+what P4 runs (ANV-0028). Simulated time stops advancing, so it reads as a hung
+test rather than an infinite loop.
+
+**10.17 Reach for the debugger at two hypotheses, not at zero.** ANV-0028 cost
+about two hours of theorising about GC safepoints, compaction and quadratic
+invariant scans, against ninety seconds of `gdb -p` to read one stack frame. The
+same lesson is recorded at ANV-0023 and was not applied quickly enough the second
+time. The trigger is not "I am out of ideas"; it is "I have more than two ideas
+and no measurement that separates them".
+
+**10.18 Cumulative counters cannot answer questions about phases.** "received
+2607" over a whole run says nothing about whether anything arrived after the
+network healed. This is currently what blocks ANV-0032. Diagnostics that will be
+read after a heal need to be resettable at the heal.
+
+**10.19 Layout-sensitive bugs defeat layout-changing bisection.** Removing
+`-ftrivial-auto-var-init=zero` from one translation unit at a time to find which
+one reads uninitialised memory does not work: the flag changes stack layout
+across the whole program, so the garbage moves and sixteen of forty files look
+guilty (ANV-0033). The oracle that *does* work is perturbing the environment --
+`PADVAR=AAAAAAAAAAAAAAAA` flips the outcome on demand -- but the instrument that
+actually localises it is MemorySanitizer, which needs clang on Linux.
+
+**10.20 A checker's own bookkeeping is not evidence about the system.** The MVCC
+auditor retired finished transactions to keep a per-event scan affordable, and
+then reported intents whose owner it could no longer find as orphans -- a finding
+manufactured entirely by the checker's memory limit. An unattributable
+observation is counted separately and named as a blind spot, never reported as a
+defect.
+
+**10.21 Two halves of one fact, read from two places, will disagree.** This is
+P5's version of the durability lesson and it produced three separate S0s. A merge
+trigger took its span from the topology and its data from the machine, and
+absorbed twelve accounts while recording that it owned six (ANV-0042). A lease
+handover allowed one clock bound where the two nodes involved can be wrong in
+opposite directions, so it needed two (ANV-0038). A placement timer subtracted a
+timestamp stamped on one node from the clock of another, and fired instantly
+whenever the skew pointed the wrong way (ANV-0045). None of them is visible in a
+review that does not ask, for every value in an expression, *where did this come
+from and when*.
+
+**10.22 A lazy coroutine's parameters must be by value.** `Task` does not run
+until it is awaited or spawned, so `spawn(f(x))` with `f(const T&)` captures a
+reference into a frame that is gone by the time the body starts. It does not
+crash: it reads plausible bytes, encodes them, and sends them. The symptom was
+every client request timing out while the server counted 80 requests received and
+80 replies sent (ANV-0034). This is gotcha 10.14 with the suspension moved to
+before the first line of the body.
+
+**10.23 An index handed to a state machine is not the log's applied index.**
+`StateMachine::apply(index, bytes)` gives the machine the index of the last entry
+it was handed. A snapshot install hands it a whole state and no index at all, so
+after one the machine's number is stale beside a state that is fresh. Two
+consumers made the same mistake on the same afternoon -- an invariant that
+compared replicas by it and reported a divergence between two correct nodes
+(ANV-0040), and a read reply that used it as a freshness measure and reported a
+stale read that never happened (ANV-0041). Use `node().log().applied_index()`,
+and skip a node whose `snapshot_pending()` is true.
+
+**10.24 An empty key bound means infinity and sorts like zero.** `end == ""` is
+"unbounded above", and every string comparison makes it the smallest value there
+is. `survivor_end >= desc.end` is therefore true for every range at the top of
+the key space regardless of what the survivor holds, which made the conservation
+audit report six missing accounts on a cluster that had lost none (ANV-0043).
+Sentinels that are also legal values need a helper, not a comment -- descriptor.h
+had the comment and the code below it made the mistake anyway.
+
+**10.25 An in-memory decision that must survive a crash has to be derivable.**
+The store remembered "this group was merged away" in a `std::set`, and a restart
+lost it: the node then saw a range the topology still listed, created it, and its
+durable Raft log replayed data the survivor already held (ANV-0047). The fix is
+not to persist the set but to re-derive the fact from something that already
+survives -- the survivor's own applied span.
+
+**10.26 A checker that samples per tick cannot grade a decision made between
+ticks.** Three invariants had to be narrowed or re-sourced for this: the merge
+precondition (which lease was in force?), the rebalance rule (which learners had
+reported catching up?), and the lease sequence (which lease did this one
+replace?). The last was fixed properly, by having the range machine keep the
+lease it replaced so the *pair* is read from one place. The first was narrowed
+and the omission written down. The temptation in the middle -- a hook in the
+state machine recording its own inputs -- is the one to resist: a state machine
+that carries evidence for its checker is no longer the thing that ships.
+
 ---
 
-## 11. Next up: P3 (Raft)
+## 11. P3 (Raft): what was decided, and why
 
-Per [docs/ROADMAP.md](docs/ROADMAP.md):
+### The Ready model, and the one loop
 
-- Election with randomised timeouts, **pre-vote**, `CheckQuorum`; term and vote
-  persisted **before** responding.
-- Log replication with pipelining, batching, conflict backtracking, and commit
-  restricted to current-term entries (the Figure-8 hazard).
-- Log compaction, chunked snapshot install, **joint-consensus** membership change
-  (not the one-at-a-time shortcut), learners.
-- Leader lease + `ReadIndex` linearizable reads; leadership transfer.
-- All twelve `INV-RAFT-*` from [docs/INVARIANTS.md](docs/INVARIANTS.md) armed at
-  `kTick` over the *global* state — every node's log, term, vote, commit index.
-- Exit criteria include a **10-bug seeded-mutation drill** where each bug is
-  recorded with whether it was **visible at the client API**. That table is the
-  empirical core of the protocol-aware DST claim and is the single most valuable
-  artifact P3 produces.
+`anvil/core/raft/raft.h` is a pure state machine: no clock, no sockets, no
+files. Its only output is a `Ready` batch describing what must become durable and
+what must then be sent. `driver.cc` is the only file in the layer that holds a
+`Runtime`, and it does this and nothing else:
 
-Raft is where "invisible at the API boundary" stops being a claim about the
-technique and becomes a measurable column in the ledger.
+```
+truncate -> append -> hard state -> fsync -> SEND -> apply -> advance
+```
+
+Three things follow, and all three earned their keep during P3:
+
+1. **The durability ordering is six lines, not a discipline.** "Persist the vote
+   before replying" is the shape of the loop, so the mutation that breaks it
+   (`persist_before_reply`) is one line and was detected on 7 seeds out of 7.
+2. **The checker needs no hooks.** `raft_invariants.cc` reads every node's state
+   through const accessors and diffs it between ticks. The protocol does not
+   know it is being watched, so the thing being checked is the thing that ships.
+3. **Protocol tests need no simulator.** "A candidate at term 5 whose log is two
+   entries behind" is a sentence in `raft_test.cc`, not a seed hunt — and the
+   situations that matter most in Raft are exactly the ones a random workload
+   reaches once in thousands of runs.
+
+**Nothing may step the state machine while a persist is in flight** (gotcha 10.8).
+The fsync is a real suspension; queueing messages and ticks in `pump()` is what
+makes this equivalent to a single-threaded step loop.
+
+### Cost classes, in practice
+
+INV-RAFT-01/02/04/05/06/07/08/09/10/11/12/13/15/16 run at `kTick`, and they are
+affordable because the observer keeps a cursor per node and only looks at what
+changed — amortised O(1) per new entry, O(nodes) per tick. INV-RAFT-03 (full
+pairwise Log Matching) is O(nodes² · log) and runs at `kEpoch`; INV-RAFT-16 is
+its incremental proxy and fires within one event. Both stay armed, per ANV-0005.
+
+The leader-side properties (09, 10, 15) are evaluated at the tick a commit index
+advances, against the configuration in force at that moment. Re-deriving them
+later compares a decision made under one membership against a different one, and
+with churn running that reports correct commits as violations.
+
+### The lease refuses to exist when it cannot be sound
+
+`lease_is_sound()` turns lease reads off unless the declared clock uncertainty
+is smaller than the lease and the two together fit inside the minimum election
+timeout. The fault profile draws a declared bound anywhere in 1–250 ms and can
+*deliberately exceed it*, so on many seeds there is simply no lease and every
+read pays for a ReadIndex quorum round. That is the honest configuration: a
+lease is an optimisation licensed by a clock bound, and when the bound is too
+weak the licence is void. Seeds where the model exceeds its own declared bound
+are classified and counted rather than failed.
+
+### The drill, and the first BUGGIFY site
+
+Ten deliberate bugs, one per flag in `RaftOptions` / `RaftDurability`, every
+default correct. Two of them — the Figure-8 commit restriction and the append
+consistency check — need a *lagging follower at the moment of an election*, which
+random scheduling produces roughly once in thousands of seeds. The project's
+first BUGGIFY site lives in `send_append` and shortens a batch, which is always
+legal and cannot make a correct implementation wrong. With it the Figure-8
+window is reachable in tens of seeds. That is the whole argument for BUGGIFY,
+and it is now demonstrated rather than asserted.
+
+The drill reports three columns: whether the suite noticed at all, whether an
+internal invariant noticed, and whether a client could have seen it. The gap
+between the second and third is the protocol-aware claim.
+
+### Where P3 stands
+
+Complete. Twelve of twelve seeds are clean under the full adversary, a leader is
+elected after healing in every run, the drill catches nine of ten planted bugs
+from the sweep and the tenth from a constructed case, and the pause-versus-lease
+experiment discriminates the safe implementation from the unsafe one.
+
+Thirteen real bugs were found and fixed getting there (ANV-0012..ANV-0024), five
+of them invisible at the client API. Three were S0: a quorum computed as two of
+four voters, a retried append that duplicated a run of indices, and a crash
+inside a rename window that lost an entire log file.
+
+**The durability lesson, in one line:** four of the five storage bugs were the
+same mistake in different clothing — a write path that is not idempotent under
+retry, and a size change that is not atomic under crash.
+
+---
+
+## 12. P4 (MVCC and transactions): what was decided, and why
+
+### The safepoint is computed in one place, and judged when it is published
+
+`TxnManager::safepoint()` is the only expression of "what may be collected": the
+minimum of the closed timestamp, every live transaction's start, every open
+snapshot, and -- added after the fact -- the highest commit. That last clamp
+matters more than it looks. Without it, a moment with no live reader yields
+`kMaxCommitTs`, which means "collect everything". That is defensible in the
+abstract and a loaded gun in practice: any later change that makes a reader
+visible slightly late turns it into total data loss, and the invariant that
+would have caught it cannot even be stated against a bound of infinity.
+
+`INV-MVCC-02` checks the safepoint **at the instant it is published**, against
+the floor in force at that instant, rather than comparing the highest safepoint
+ever seen against the floor as it stands later. The second form is not a weaker
+check, it is an unsound one: a transaction that begins after a perfectly legal
+collection lowers the floor beneath a safepoint that was correct when it was
+used, and the invariant reports a bug that never existed. Same rule as gotcha
+10.11 -- a decision is judged against the state in force when it was made.
+
+### An outcome is decided in memory before it is written to disk
+
+A commit whose batch fails is the hard case, and the obvious handling is wrong.
+Returning the error and moving on leaves a transaction that is neither committed
+nor aborted, holding intents nobody will ever clear and pinning the GC safepoint
+at its start timestamp for the rest of the process's life. One transient EIO and
+the collector never collects again (ANV-0030).
+
+So `commit` records `commit_ts` *before* attempting the write and moves the
+transaction to `kResolving` on failure; a janitor retries the batch until it
+lands. Retrying is sound because resolution is one atomic batch -- it landed or
+it did not, and replaying writes the same keys with the same values at the same
+timestamp. `abort()` refuses a `kResolving` transaction, because letting an abort
+through there would not retry a decision, it would reverse one.
+
+The engine does not schedule its own retries. A state machine that starts its own
+I/O is a state machine you cannot test deterministically, so driving the janitor
+is the caller's job -- the same division as Raft's `Ready` loop.
+
+### Atomicity comes from a primitive, not from a loop
+
+The first commit path resolved intents one key at a time. Each write was durable
+and the sequence was not atomic, so a reader scheduled inside the loop saw half a
+transaction -- exactly what snapshot isolation promises cannot happen (ANV-0029).
+The storage engine already had the primitive: one `WriteBatch` is one record with
+one checksum. The fix was to reach for it.
+
+### The level is confirmed, not asserted
+
+`test_snapshot_isolation_is_the_level_claimed` runs one hand-built write-skew
+history through the checker at both levels and requires VALID at snapshot
+isolation and INVALID with `G2-item` at serializable. The first version of that
+test built the two transactions and nothing else, and reported the history as
+serializable -- correctly, because with no third transaction there is no evidence
+of which version of each key came first, so there is no version order, no
+anti-dependency edges and no cycle to find. An anomaly nobody observed is not in
+the history. The observer transaction is what makes the claim real, and the
+vacuous version is the more dangerous failure of the two because it passes.
+
+### Equivalent mutants are classified, with the argument written down
+
+`reads ignore intents` disables intent-blocking, and nothing in this
+configuration can observe the difference: every timestamp comes from one
+monotonic source, so a transaction still live when a reader takes snapshot `S`
+must commit at some `C > S`, and the version is above the snapshot either way.
+Rather than pretend to detect it, the drill classifies it `kEquivalent` and
+asserts two things -- that it is genuinely not reported, and that the flag
+genuinely disables the mechanism (`blocked_reads == 0`). It is expected to move
+to `kMustDetect` in P6, where clock skew makes `C < S` possible in real time.
+
+### Crashes are out of scope, and the scope is in the code
+
+`test/mvcc_faults.cc` disables process crashes with a paragraph saying why: the
+single node has no redundancy, and every property P4 claims is about live
+transaction state that a crash destroys by definition. Before that line existed,
+the workload kept reading from a dead node and produced findings that said
+nothing about MVCC. Recovering intents and re-deriving outcomes after a crash is
+real work and it is P5's.
+
+### The sweep has to be fast enough to run
+
+The P4 suite went from an eight-minute timeout to 0.4 seconds for 20 seeds, and
+none of that was optimisation. Three separate causes: an invariant scanning a
+transaction table nothing ever pruned, a run that only ended on a commit target
+that a heavily-aborting seed never reached, and a fault injector that never
+terminated on a single node (ANV-0028). A suite slow enough to be run rarely is a
+suite that stops finding things, so its runtime is a property worth defending.
+
+### Where P4 stands
+
+- 8 `INV-MVCC-*` armed, split into audited (the version store is behind a
+  coroutine and an invariant cannot await) and live.
+- 20/20 seeds clean; 634 transactions committed, 734 versions collected, 4,060
+  long-reader re-reads across GC passes.
+- Drill: 2/2 must-detect caught, control silent, one equivalent with an argument.
+- Four defects found *below* P4: three in the LSM, one in the simulator.
+
+---
+
+## 13. P5 (sharding): what was decided, and why
+
+### Every range is a real Raft group, which cost a transport
+
+P3's driver owned its own connections and its own receive loop, which works
+while there is one group per node. P5 has one per range plus one for placement,
+and the simulator's network gives each ordered pair of nodes a single inbox --
+two receive loops on one endpoint race for the same queue. So `raft/transport.h`
+appeared: one link per pair, shared by every group, demultiplexing on a group id
+that now travels in the message (first, before the type byte, so routing costs
+one varint and group 0 is free to mark a coalesced batch).
+
+Three things came with it, and the second is the one that matters:
+
+1. **Heartbeat coalescing.** With a group per range, per-group heartbeats are
+   O(ranges × peers) messages a tick and almost all of them carry nothing.
+   Buffering them per peer and flushing one envelope per tick makes it O(peers).
+   735,397 heartbeats in 570,903 messages over the sweep -- a real mechanism and
+   a modest ratio, because these clusters have five ranges rather than five
+   thousand, and the honest number says so.
+2. **One tick loop per node, not per group.** Coalescing is only possible if the
+   groups that produce heartbeats tick together, and a timer per range is a
+   scheduling cost that grows with the topology. `RaftDriver::set_external_ticks`
+   exists for this.
+3. **Quiescence.** A group with nothing to do stops ticking, which is the whole
+   point of MultiRaft. It comes with a trap: ticking is also what drives the
+   election timeout, so a *leaderless* group that quiesces can never elect a
+   leader -- waking needs a message and a message needs a leader (ANV-0044).
+
+### The topology is one replicated state machine, and one entry is one apply
+
+Every descriptor lives in the placement group's log. A split is not "shorten the
+left range, then create the right one": it is one command whose apply does both,
+so no observer ever sees the key space covered twice. Writing it as two commands
+is a one-line change, it is the first mutation in the drill, and the window it
+opens is a few microseconds wide and completely invisible from the client.
+
+### Splits and merges are triggers in the *range's own* log
+
+This is what makes a split atomic with respect to the transfers around it, with
+no lock anywhere: a transfer either precedes the trigger in the range's log and
+applies under the old descriptor, or follows it and is rejected against the new
+one. There is no third ordering. 21,377 transfers were sent believing one range
+covered both their accounts and 18,602 were rejected because the topology had
+moved; not one applied partially.
+
+The corollary is a rule the layer now states outright: **a range's span changes
+only through an entry that carries the data with it.** The topology's view of a
+descriptor is replicated into the range too -- the range needs it to validate
+requests without a round trip -- but that command carries membership and
+generation only. Letting it carry the span left a range holding accounts it no
+longer claimed (ANV-0037).
+
+### Placement is a pure function, and it may not read a clock
+
+`decide(state, options, now, cluster_size)` returns commands. Every input except
+`now` is replicated, which is what makes INV-SHARD-09 -- two replicas at the same
+applied index decide the same thing -- a property a checker can evaluate rather
+than a claim.
+
+`now` was the interesting part. The first version compared a descriptor's
+`changed_at` (stamped by whichever node proposed the change) against the
+placement leader's clock, and under a frozen clock that difference is seconds:
+the merge timeout fired the instant a freeze landed, forever, in a
+freeze/abort/refreeze loop (ANV-0045). Every placement timer is now counted in
+**placement log entries**, which mean the same thing on every replica. Liveness
+still needs a wall clock, so the placement leader restamps every heartbeat with
+its own -- one clock decides who is alive, and it is the clock of whoever is
+doing the deciding.
+
+### A merge is completed, never abandoned
+
+The survivor absorbs the subsumed range's data through an entry in its *own*
+log, which the placement driver cannot see. So an abort issued because the merge
+looked stalled can land after the absorb, un-freezing a range whose contents are
+now in two places at once -- 4,200 in a cluster that started with 2,400
+(ANV-0046). There is no automatic abort any more. The cost is availability of
+the subsumed span until some node leads both groups again, which under eventual
+synchrony is one election, and it is the right trade: the alternative is a
+correctness hazard that appears only when the abort wins a race it usually
+loses.
+
+### The lease margin is two clock bounds, not one
+
+The declared uncertainty is how far *one* node's clock may be from true time. A
+lease handover involves two, and they can be wrong in opposite directions, so
+the interval that must have elapsed since the previous expiry is two bounds wide
+(ANV-0038). With one bound the implementation is safe on most seeds and wrong on
+the ones where the errors point apart.
+
+INV-SHARD-04 had to be rewritten for the same reason the bug existed: its first
+form looked for two nodes *simultaneously* believing they held a lease, which
+needs a lagging replica on top of the defect. Checking the rule instead of the
+coincidence -- successive leases in a range's log never overlap by two bounds --
+took the detection rate from 0/6 to 14/20.
+
+### The oracle is one integer
+
+The workload is a bank, and that is the whole reason it is one. A split that
+drops a key, a merge that loses one, a write accepted against a stale
+descriptor, a transfer applied twice: every failure this phase is about moves a
+single number that a black-box client could compute. Three of the six S0s were
+found by that number and nothing else, and the internal invariants found the
+other three -- which is exactly the split the API-visibility column exists to
+show.
+
+### Where P5 stands
+
+Complete. Forty seeds clean under the full adversary with the topology never
+sitting still; the split point exercised twenty thousand times with no partial
+application; determinism holding while Raft groups are created and destroyed
+mid-run; six of six planted bugs caught, one control silent, one equivalent with
+an argument.
+
+Seventeen bugs found and fixed getting there (ANV-0034..ANV-0050), six of them
+S0. Four were in the harness, and three of *those* manufactured findings out of
+nothing -- which is the phase's own lesson, and the reason gotchas 10.23, 10.24
+and 10.26 exist.
+
+### Next: P6
+
+Per [docs/ROADMAP.md](docs/ROADMAP.md). Three things this phase leaves on the
+table: MVCC crash recovery (still open from P4, and P6 cannot avoid it), moving
+a range's applied state into the LSM so that a split stops having to carry data
+in a log entry, and ANV-0032, which is open and holds the Raft gate red on one
+seed in sixteen. ANV-0033 remains the highest-value thing to do with a Linux box.
+
+---
+
+## Appendix: the original P4 plan, for comparison
+
+### Next: P4 (MVCC and single-node transactions)
+
+Per [docs/ROADMAP.md](docs/ROADMAP.md): inverted-timestamp key encoding, snapshot
+reads, a lock table with wound-wait, and version GC driven by a safepoint. The
+warning in the roadmap is the one to heed — GC safepoints are the classic silent
+corruption source, so `INV-MVCC-01` (a live snapshot never loses a version it
+can still see) gets armed before the GC is written, not after.

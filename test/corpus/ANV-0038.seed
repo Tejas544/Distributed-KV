@@ -1,0 +1,14 @@
+# ANV-0038 -- the lease margin was one clock bound where it needed two
+# the declared bound is how far ONE node's clock may be from true time; a
+# handover involves two, and they can be wrong in opposite directions
+seed        = 3
+workload    = shard_kv
+nodes       = 5
+faults      = drawn from seed; needs clock offsets pointing apart
+invariant   = INV-SHARD-04 (at most one valid lease per range at any instant)
+reproduce   = anvil_shard_faults 12
+note        = also on seeds 4, 8 and 10. The clock model was inside the bound it
+              declared on all of them, so this was the implementation being
+              wrong rather than the environment.
+found_at    = P5
+fixed_at    = P5

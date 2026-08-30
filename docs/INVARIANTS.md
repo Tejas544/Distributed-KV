@@ -68,6 +68,40 @@ A violation dumps: the invariant id, the offending state, the active fault set, 
 | INV-RAFT-13 | A leader's lease never overlaps a successor's lease by more than the declared clock uncertainty bound | TICK | No |
 | INV-RAFT-14 | A `ReadIndex` or lease read never returns state older than any write completed before the read was invoked | COMMIT | Yes |
 | INV-RAFT-15 | A learner is never counted in any quorum until it is promoted | TICK | No |
+| INV-RAFT-16 | Two entries with the same index and the same term are the same entry | TICK | No |
+
+**Notes on where these are actually evaluated** (P3, `anvil/checker/raft_invariants.cc`).
+
+INV-RAFT-16 is new and is the inductive core of Log Matching: given it, plus the
+`AppendEntries` consistency check, INV-RAFT-03 follows. It exists separately
+because it can be checked incrementally as entries appear — O(1) per new entry,
+so it fires within one scheduler event of a divergence — whereas INV-RAFT-03
+itself is a pairwise prefix comparison over whole logs and runs at EPOCH class.
+Keeping both is deliberate, and the discipline from ANV-0005 applies: the cheap
+one is a proxy, the expensive one is the property, and the expensive one earns
+its place by catching what the proxy cannot. It does: a divergence that the
+incremental scanner missed because it had already advanced past those indices
+was caught by the full sweep.
+
+INV-RAFT-09, 10 and 15 are evaluated at the tick a leader's commit index
+advances, against the configuration in force at that moment, rather than
+re-derived later. The catalogue lists 09 at COMMIT class; TICK at the point of
+decision is strictly stronger, and it is the difference between a report that
+names the entry and one that says something was wrong twenty seconds ago
+(ANV-0014).
+
+INV-RAFT-06, 07 and 08 are evaluated against **durable** state, not the state a
+node happens to be running at. A term bump or a vote that has not reached the
+disk has also not reached a peer, so losing it in a crash is invisible to the
+cluster and is not a regression; checking the volatile field reports every
+crash during an election as a violation (ANV-0021).
+
+INV-RAFT-13 is only meaningful while the environment honours the clock bound it
+declares. The fault profile can deliberately exceed it (`violate_declared_bound`),
+and on those seeds a lease overlap is the characterised outcome of the
+assumption being false rather than a defect — so `lease_is_sound()` refuses to
+use leases at all when the declared uncertainty cannot fit inside an election
+timeout, and every read pays for a quorum round instead.
 
 ---
 
@@ -107,6 +141,33 @@ A violation dumps: the invariant id, the offending state, the active fault set, 
 | INV-MVCC-07 | Wound-wait victim selection is consistent with transaction start-timestamp order (no younger transaction wounds an older one) | TICK | No |
 | INV-MVCC-08 | Every lock in the table is owned by a transaction that is live or expired-and-being-resolved; no lock is owned by a transaction unknown to the system | EPOCH | No |
 
+**Evaluation notes (P4, as implemented).**
+
+The version store lives behind a coroutine and an invariant predicate cannot
+await, so these split into two groups. `INV-MVCC-01`, `03`, `04` and `05` are
+*audited*: the workload's auditor reads the store on its own schedule and posts
+findings, and the armed predicate drains them, so a violation still stops the run
+on the tick it is reported. `INV-MVCC-02`, `06`, `07` and `08` are evaluated
+live against the lock table and transaction table, which are plain memory.
+
+`INV-MVCC-02` is checked **at the moment a safepoint is published**, against the
+floor in force at that instant, rather than by comparing the highest safepoint
+ever seen against the current floor. The latter is unsound: a transaction that
+begins after a legal collection lowers the floor beneath a safepoint that was
+correct when it was used, and the invariant reports a bug that never existed.
+
+`INV-MVCC-05`'s orphan rule requires the same key and the same owner to look
+wrong on two consecutive audit passes. Reading an intent suspends and resolving
+one is several steps, so a single sample cannot distinguish "in flight" from
+"stuck". The cost is one audit interval of detection latency; the alternative is
+a checker that reports correct behaviour and gets switched off. An intent whose
+owner the checker has already retired is counted as *unattributable* and never
+reported -- that is a limit of the checker's memory, not a fact about the engine.
+
+The listed cost classes are the design intent. As implemented, the audited four
+are armed at TICK because draining a posted finding is O(1); the work they
+represent happens on the auditor's own interval.
+
 ---
 
 ## Transactions — `INV-TXN-*`
@@ -133,17 +194,65 @@ A violation dumps: the invariant id, the offending state, the active fault set, 
 
 ## Sharding — `INV-SHARD-*`
 
+**Armed in P5** (`anvil/checker/shard_invariants.cc`). All nine are live; the
+statements below are what the code actually checks, which in three places is
+narrower than the sentence originally written here. Where it is narrower, the
+reason is that the observer samples state once per tick and cannot always
+reconstruct the state a decision was made against — and grading a decision
+against a different sample manufactures findings (ANV-0040, ANV-0043). Those
+cases are named rather than quietly widened.
+
 | ID | Invariant | Class | API? |
 |---|---|---|---|
-| INV-SHARD-01 | **Coverage.** At every instant, the union of range descriptors tiles the key space exactly once — no gap, no overlap | EPOCH | Sometimes |
-| INV-SHARD-02 | A split is atomic with respect to any transaction spanning the split point: the transaction sees either the pre- or post-split topology, never a mixture | TICK | Sometimes |
-| INV-SHARD-03 | A merge proceeds only when both ranges are colocated, both leases are held by the same node, and both have quiesced | TICK | No |
-| INV-SHARD-04 | At most one valid lease per range per instant, allowing for the clock uncertainty bound | TICK | No |
-| INV-SHARD-05 | Range descriptor generations are strictly increasing; a stale-generation request is rejected, never served | TICK | Sometimes |
-| INV-SHARD-06 | Rebalancing never transiently reduces a range below quorum durability | TICK | No |
-| INV-SHARD-07 | The meta index is consistent with the actual range topology within the lease/uncertainty bound | EPOCH | Sometimes |
-| INV-SHARD-08 | A quiesced range wakes correctly: no committed entry is missed while quiesced | TICK | No |
-| INV-SHARD-09 | The placement driver's decisions are a function only of replicated state, never of a single node's local view | EPOCH | No |
+| INV-SHARD-01 | **Coverage.** On every live node's own applied view, the range descriptors tile the key space exactly once — no gap, no overlap, exactly one unbounded range and it is last | EPOCH | Sometimes |
+| INV-SHARD-02 | Every key a range holds is inside the span that range claims. This is split atomicity where it can be checked cheaply: a transaction that half-applied across a split point, a write accepted against a stale descriptor, and a split that moved the wrong half all land here | EPOCH | Sometimes |
+| INV-SHARD-03 | A merge freezes a range only when it is adjacent to its survivor and on the same replica set. *The lease half is enforced at apply time and checked in `shard_test.cc` rather than here* — see the note below | TICK | No |
+| INV-SHARD-04 | Two halves: no two nodes simultaneously believe they hold a valid lease for one range, each judged against its own clock; and successive leases in a range's own log never begin less than **two** declared clock bounds after the previous expiry | TICK | No |
+| INV-SHARD-05 | A range's generation never decreases, and a descriptor never changes span or membership without its generation moving | TICK | Sometimes |
+| INV-SHARD-06 | A voter is only ever added to a range from the set of learners that have been reported as holding its committed prefix, and successive voter sets always share a majority of both | TICK | No |
+| INV-SHARD-07 | The meta index resolves every range in the descriptor table to that range at that generation, and has exactly one record per range | EPOCH | Sometimes |
+| INV-SHARD-08 | A quiesced range's leader has every live replica holding its whole log. A replica that is behind when the group quiesces is never sent anything again | TICK | No |
+| INV-SHARD-09 | Two placement replicas that have applied the same log index hold identical state and would make identical decisions from it | EPOCH | No |
+
+Plus one client-visible check, armed by the workload rather than the checker
+because it is a statement about what a client saw:
+
+| ID | Invariant | Class | API? |
+|---|---|---|---|
+| INV-SHARD-CLIENT | A lease read never returns a range at a lower applied index than a read of that range already returned | TICK | Yes |
+
+**Three deliberate narrowings, and why.**
+
+*INV-SHARD-03's lease clause.* A lease moves several times a second. An observer
+that diffs state once per tick cannot know which lease was in force at the
+instant a merge was applied, and grading the decision against the lease it can
+see reports correct merges as violations — which it did, on the control run of
+the drill. The alternative is a hook in the topology machine recording its own
+inputs, and a state machine that carries evidence for its checker is no longer
+the thing that ships. So the lease half is checked directly in
+`test_a_merge_requires_colocation`, where the state at the decision is known
+because the test wrote it.
+
+*INV-SHARD-04's second half.* The first version looked only for two nodes
+simultaneously believing they held a lease, which needs a lagging replica *on
+top of* the defect — so a broken lease rule sat undetected for thousands of
+seeds. Checking the rule instead of the coincidence took the detection rate on
+the corresponding mutation from 0/6 to 14/20 (ANV-0038).
+
+*INV-SHARD-06.* "Never below quorum durability" is stated as "a new voter must
+already hold the data", because with joint consensus underneath, an arbitrary
+membership change is *safe* — what it costs is durability, and that is exactly
+what promoting an empty replica gives away.
+
+**The clock-bound exemption.** A lease is an optimisation licensed by a clock
+bound. The fault profile can put a node's clock outside the bound its own
+configuration declared — by skew, or by freezing it outright — and when it does,
+the licence is void. The suite therefore *measures* every live node's clock
+error against true time on every tick and classifies lease findings on runs
+where the bound was broken, rather than keying off a configuration flag that
+would miss the frozen-clock case. Over 40 seeds, 24 broke the bound (worst:
+17.2 s against a declared 248 ms). That is a large exemption and it is reported
+as a number, not as an asterisk.
 
 ---
 

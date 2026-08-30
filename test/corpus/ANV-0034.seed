@@ -1,0 +1,16 @@
+# ANV-0034 -- a lazy coroutine outlived its own reference parameter
+# spawn(reply_to(dest, local_reply)) read a Reply that had already been
+# destroyed: a Task does not run until it is scheduled, and the frame captured
+# a reference into a stack frame that was gone by then
+seed        = 1
+workload    = shard_kv
+nodes       = 5
+faults      = none required; the failure is not timing-dependent
+invariant   = none -- every client request timed out and retried forever
+reproduce   = anvil_shard_faults 4
+note        = the tell is the asymmetry: the server counted 80 requests received
+              and 80 replies sent, the clients counted zero replies handled, and
+              nothing crashed. Every coroutine parameter in the tree is now by
+              value.
+found_at    = P5
+fixed_at    = P5

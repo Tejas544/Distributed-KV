@@ -53,6 +53,14 @@ struct StoreTag {};
 
 using NodeId = Id<NodeTag>;
 using RangeId = Id<RangeTag>;
+
+// A replication group. One Raft instance per group, many groups per node: that
+// is what makes this MultiRaft rather than a single replicated log. The sharding
+// layer uses the range's own id as its group id, and reserves group 1 for the
+// placement driver's group, so a group id and a range id are numerically the
+// same thing viewed from the two layers. GroupId{0} is not a group: the wire
+// uses it as the marker for a coalesced batch (see raft/transport.h).
+using GroupId = Id<struct GroupTag>;
 using TxnId = Id<TxnTag>;
 using ConnHandle = Id<ConnTag>;
 using FileHandle = Id<FileTag>;

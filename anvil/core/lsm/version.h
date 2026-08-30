@@ -29,6 +29,7 @@
 #ifndef ANVIL_CORE_LSM_VERSION_H_
 #define ANVIL_CORE_LSM_VERSION_H_
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -139,7 +140,56 @@ class VersionSet {
   std::uint64_t new_file_number() { return next_file_number_++; }
   std::uint64_t log_number() const noexcept { return log_number_; }
   SequenceNumber last_sequence() const noexcept { return last_sequence_; }
-  void set_last_sequence(SequenceNumber s) { last_sequence_ = s; }
+
+  // Reserves `count` sequence numbers and returns the first.
+  //
+  // Allocation is separate from publication, and it has to be, because a writer
+  // suspends between the two: it appends to the log and syncs before its entries
+  // become visible. Deriving the next sequence from `last_sequence()` instead
+  // hands the *same* numbers to every writer that starts while the first is
+  // still in its fsync, and their entries then collide in the memtable. See
+  // ANV-0025.
+  SequenceNumber allocate_sequence(std::uint64_t count) {
+    const SequenceNumber first = next_sequence_;
+    next_sequence_ += count;
+    return first;
+  }
+
+  // Makes a completed range visible. Monotone: the watermark never moves back.
+  //
+  // A writer that allocated a lower range and finished later must not drag the
+  // visible watermark below entries another writer has already published --
+  // that makes a completed write vanish and later return, which is the single
+  // hardest storage symptom to diagnose from outside, because every layer above
+  // sees a key that is simply not there for a while (ANV-0025).
+  //
+  // Publishing a range whose owner is still in its fsync reveals nothing,
+  // because entries reach the memtable only *after* their own sync succeeds:
+  // the watermark can only expose what is already durable. That is what makes
+  // the plain maximum correct here, and it is worth stating, because the
+  // stricter rule -- advance only along the contiguous durable prefix -- is
+  // tempting and is actively wrong for this engine: it holds a write invisible
+  // until unrelated earlier writers finish, so `put` returns ok on something
+  // the very next `get` cannot see.
+  void publish_sequence(SequenceNumber first, std::uint64_t count) {
+    if (count == 0) return;
+    const SequenceNumber last = first + count - 1;
+    if (last > last_sequence_) last_sequence_ = last;
+  }
+
+  // Recovery's entry point: the log has been replayed and this is where it
+  // ended.
+  //
+  // Takes the maximum rather than assigning, because recovery has two sources --
+  // the MANIFEST and the WAL -- and they do not have to agree: a WAL that was
+  // truncated at a bad record replays to a lower sequence than the manifest
+  // already records. Assigning the lower one would set the allocator below
+  // sequences that already exist in the tables, and the next write would reuse
+  // them, which puts two different values at one sequence for one key.
+  void set_last_sequence(SequenceNumber s) {
+    last_sequence_ = std::max(last_sequence_, s);
+    next_sequence_ = std::max(next_sequence_, last_sequence_ + 1);
+  }
   std::uint64_t manifest_number() const noexcept { return manifest_number_; }
 
   // A MANIFEST whose tail failed its checksum. Survivable -- the dropped edits
@@ -163,7 +213,8 @@ class VersionSet {
   std::uint64_t next_file_number_ = 2;  // 1 is reserved for the first manifest
   std::uint64_t manifest_number_ = 1;
   std::uint64_t log_number_ = 0;
-  SequenceNumber last_sequence_ = 0;
+  SequenceNumber last_sequence_ = 0;   // published: visible to readers
+  SequenceNumber next_sequence_ = 1;   // allocated: handed out, not yet visible
   std::uint64_t manifest_truncations_ = 0;
 
   FileHandle manifest_file_{};

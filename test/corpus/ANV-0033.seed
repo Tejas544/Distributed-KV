@@ -1,0 +1,18 @@
+# ANV-0033 -- OPEN. A run's outcome depends on the process environment.
+# An uninitialised automatic variable is read somewhere in the exercised code
+# and changes the schedule: same binary, same seed, different result.
+seed        = 9
+workload    = mvcc_txn
+nodes       = 1
+faults      = drawn from seed
+invariant   = the determinism check in test/mvcc_faults.cc
+reproduce   = anvil_mvcc_faults 40      # the determinism section runs seeds/4+1
+reproduce   = PADVAR=AAAAAAAAAAAAAAAA <binary> 9   vs   <binary> 9
+note        = 16 bytes of environment flips it: 622 events and digest
+              161e76145fd18bea, against 658 events and 5bae78ea324017a6.
+              -ftrivial-auto-var-init=zero makes every run agree, which is what
+              identifies it as an automatic variable rather than heap or static.
+              Per-file bisection does not work: the flag changes stack layout
+              globally. MSan on Linux/clang is the instrument this needs.
+found_at    = P4
+status      = open as of P4

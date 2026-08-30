@@ -119,10 +119,21 @@ class Db {
   Task<Status> replay_wal(std::uint64_t log_number);
   Task<Status> open_new_wal();
   Task<Status> write_table_from(const MemTable& table, FileMetadata* meta);
-  Task<Status> open_table(std::uint64_t number, Table** out);
+  // Returns a *reference* to the table, not a bare pointer.
+  //
+  // A read suspends inside pread while holding the Table it is reading from,
+  // and compaction deletes obsolete files whenever it likes. Handing out a raw
+  // pointer means the table can be destroyed underneath a suspended read, which
+  // resumes into freed memory -- a crash if you are lucky, and silently wrong
+  // bytes if you are not. The reference keeps it alive until the read is done
+  // (ANV-0026).
+  Task<Status> open_table(std::uint64_t number, std::shared_ptr<Table>* out);
   Task<Status> compact_level(int level);
   int pick_compaction_level() const;
   Task<Status> delete_obsolete_files(const std::vector<std::uint64_t>& removed);
+
+  // Closes the file handles of retired tables nobody is reading any more.
+  Task<void> sweep_retired_tables();
 
   Runtime* runtime_;
   DbOptions options_;
@@ -138,7 +149,21 @@ class Db {
 
   // Open SSTables, keyed by file number. Held open because reopening on every
   // read would make the file-handle churn dominate the trace.
-  std::map<std::uint64_t, std::unique_ptr<Table>> tables_;
+  // A flush and a compaction each suspend many times, and both mutate structures
+  // the other reads. Only one of each may be in flight (ANV-0027).
+  bool flushing_ = false;
+  bool compacting_ = false;
+
+  std::map<std::uint64_t, std::shared_ptr<Table>> tables_;
+
+  // Tables removed from the cache that a suspended read may still hold. Their
+  // file handles are closed once nothing refers to them.
+  struct RetiredTable {
+    std::uint64_t number = 0;
+    std::shared_ptr<Table> table;
+    FileHandle file{};
+  };
+  std::vector<RetiredTable> retired_tables_;
   std::map<std::uint64_t, FileHandle> table_files_;
 
   std::uint64_t memtable_seed_ = 0;

@@ -1,0 +1,15 @@
+# ANV-0025 -- a write that returned ok was invisible to the next read
+# concurrent writers derived the same sequence range before suspending, and
+# publication was an assignment, so the watermark could move backwards
+seed        = 3
+workload    = mvcc_txn
+nodes       = 1
+faults      = drawn from seed (EIO and latency; no process faults on this profile)
+invariant   = read-after-write (test_concurrent_writers_never_lose_read_after_write)
+reproduce   = anvil_mvcc_faults 6      # surfaces as INV-MVCC-05, an orphaned intent
+reproduce   = anvil_lsm_test           # the direct property test, ~2s
+note        = the trace that settled it: put_intent ok, then the writer's own
+              abort_all reports found=0 for the same key, and every later
+              transaction reports found=1 owner=9
+found_at    = P4
+fixed_at    = P4

@@ -1,0 +1,15 @@
+# ANV-0047 -- a restart resurrected a subsumed range from its durable log
+# the "this group was merged away" tombstone was a std::set in the store, and a
+# crash loses it; the recreated group replayed the data the survivor holds
+seed        = 8
+workload    = shard_kv
+nodes       = 5
+faults      = drawn from seed; requires a crash after a merge trigger
+invariant   = the conservation audit -- 3,600 against an expected 2,400
+reproduce   = anvil_shard_faults 12
+note        = the fact is now re-derived from the survivor's own applied span,
+              which survives the crash. Any decision a node must still make
+              after a restart has to be derivable from something that also
+              survived it.
+found_at    = P5
+fixed_at    = P5
