@@ -125,6 +125,8 @@ void TxnObserver::refresh() {
       const txn::VersionStore& store_ref = replica.machine->txn_store();
       counters_.intents_seen += store_ref.intent_count();
 
+      const std::uint64_t applied = replica.machine->applied_index().value();
+
       for (const auto& [txn_id, record_ref] : store_ref.records()) {
         ++counters_.records_seen;
         RecordMirror& mirror = records_[txn_id];
@@ -133,6 +135,7 @@ void TxnObserver::refresh() {
           mirror.seen = true;
           mirror.source = id.value();
           mirror.source_range = range_id;
+          mirror.source_applied = applied;
           mirror.status = record_ref.status;
           mirror.commit_ts = record_ref.commit_ts;
           mirror.epoch = record_ref.epoch;
@@ -151,6 +154,7 @@ void TxnObserver::refresh() {
         if (mirror.source_range != range_id) {
           mirror.source = id.value();
           mirror.source_range = range_id;
+          mirror.source_applied = applied;
           mirror.status = record_ref.status;
           mirror.commit_ts = record_ref.commit_ts;
           mirror.epoch = record_ref.epoch;
@@ -165,6 +169,11 @@ void TxnObserver::refresh() {
         if (mirror.source != id.value()) continue;
 
         if (record_ref.status != mirror.status) {
+          // A replica that is behind where we saw this verdict is replaying,
+          // not disagreeing. Skip without touching the mirror, so the verdict
+          // we remember survives the replay and a record that settles on a
+          // different one afterwards is still caught.
+          if (applied < mirror.source_applied) continue;
           ++counters_.status_transitions;
 
           // INV-TXN-01 and INV-TXN-02, in their sharpest form. A terminal
@@ -205,6 +214,7 @@ void TxnObserver::refresh() {
           if (record_ref.status == txn::TxnStatus::kAborted) ++counters_.records_aborted;
           mirror.status = record_ref.status;
           mirror.commit_ts = record_ref.commit_ts;
+          mirror.source_applied = applied;
         }
       }
     }

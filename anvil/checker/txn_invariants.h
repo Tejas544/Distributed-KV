@@ -91,6 +91,18 @@ class TxnObserver {
     // Tracking the range alongside the node is what keeps "moved" from
     // looking like "changed its mind".
     std::uint64_t source_range = 0;
+
+    // The applied index the source replica was at when this status was
+    // recorded. A crash rebuilds the RangeMachine at index 0 and replays into
+    // it, so for the width of that replay the replica genuinely holds an
+    // earlier version of every record it owns -- comparing against it grades
+    // recovery as a transaction changing its verdict. Waiting until the
+    // replica is back at or past this index is what separates a replay from a
+    // real transition, and it is deliberately *not* a reset: the remembered
+    // terminal verdict survives the replay, so a record that settles on a
+    // different one afterwards is still caught. Resetting instead blinds
+    // INV-TXN-02 to the mutation it exists for, which is how this was found.
+    std::uint64_t source_applied = 0;
   };
 
   std::uint32_t nodes_ = 0;
@@ -104,6 +116,7 @@ class TxnObserver {
   // The highest mark each replica has been seen at. Per node, because a
   // follower behind the leader is a follower, not a regression.
   std::map<std::uint64_t, txn::Ts> oracle_seen_;
+
 
   std::map<std::string, std::vector<std::string>> pending_;
   std::uint64_t last_tick_ = UINT64_MAX;

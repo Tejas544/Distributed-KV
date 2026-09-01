@@ -1241,9 +1241,23 @@ Open, and now a short list of genuine findings rather than a fog:
 - **Seed 5 (serializable), 710/1600 with `converged=no`.** Much larger, and
   still correlated with convergence, so likely a third variant of a range not
   reachable at audit time rather than a transactional fault.
-- **`INV-TXN-02` on seed 8**, both at serializable and strict serializable: a
-  record leaving a terminal state (committed -> pending). Reproduces at the
-  same tick under both levels, which makes it the most tractable of the three.
+- **`INV-TXN-02` on seed 8 was a false positive too, and is fixed.** A crash
+  rebuilds a `RangeMachine` at applied index 0 and replays its log into it, so
+  for the width of that replay the replica genuinely holds an earlier version
+  of every record it owns -- and the mirror compared it against what the same
+  replica reported before the crash, grading recovery as a transaction changing
+  its verdict. The guard is deliberately *not* a baseline reset (that was tried
+  and it blinds the invariant): the remembered verdict survives the replay, and
+  a record that settles on a different one once the replica is back at or past
+  the index where the verdict was recorded is still caught.
+
+  Worth writing down separately: **INV-TXN-02 has never once caught its own
+  mutation.** `terminal status is not final` is detected 2/10, both times by
+  the bank's conserved total and never by the invariant armed for exactly it.
+  Every firing of INV-TXN-02 in this phase's history has been a false positive.
+  An invariant evaluated 143,953 times per seed that has never made a true
+  detection is not yet pulling its weight, and that is a finding about the
+  checker rather than about the engine.
 - **Two drill controls still fire** (`parallel commit`, `no commit-wait`).
   Both are configuration changes rather than bugs, so a firing control means
   the harness is attributing one of the above failures to the mutation. Expect
