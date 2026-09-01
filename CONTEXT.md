@@ -1238,6 +1238,25 @@ Open, and now a short list of genuine findings rather than a fog:
   1600. Both are far smaller than an account, so this is a partial transfer
   rather than an unreachable range -- a different bug from the two above, and
   the first one to chase.
+
+  **A plausible fix for these was tried and rejected; do not re-try it without
+  reading this.** `audited_value` resolves a live intent by looking the owning
+  record up in *the same range's* version store, and a cross-range
+  transaction keeps its record on the primary's range -- so the lookup finds
+  nothing for exactly the transactions this phase exists to exercise, and the
+  audit falls back to the version from before the transaction. Making the
+  lookup search the whole cluster does fix seeds 1 and 7 and silences the
+  `parallel commit` control. It also **drops the seeded-mutation drill from
+  7/7 to 3/7**: `no refresh on push`, `uncertain reads never restart`,
+  `terminal status is not final` and `uncertainty never honoured` all stop
+  being detected, because an audit that resolves every intent it can find
+  reconstructs the total the engine *should* have had and hides the lost
+  update the mutation caused. Adding the epoch check that
+  `VersionStore::commit_intent` enforces (record epoch == intent epoch) did
+  not recover the detection either. A checker that manufactures a pass is
+  strictly worse than one that manufactures a failure, so this was reverted.
+  The shortfall is real and the audit's blind spot is real; the fix has to be
+  one that does not also blind the drill.
 - **Seed 5 (serializable), 710/1600 with `converged=no`.** Much larger, and
   still correlated with convergence, so likely a third variant of a range not
   reachable at audit time rather than a transactional fault.
