@@ -41,7 +41,7 @@ add_library(anvil::shard ALIAS anvil_shard)
 target_include_directories(anvil_shard PUBLIC "${PROJECT_SOURCE_DIR}")
 
 target_link_libraries(anvil_shard
-  PUBLIC anvil::core anvil::raft anvil::warnings
+  PUBLIC anvil::core anvil::raft anvil::txn_core anvil::warnings
   PRIVATE anvil::sanitizers)
 
 target_sources(anvil_shard PRIVATE

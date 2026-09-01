@@ -163,6 +163,32 @@ add_test(NAME shard.faults COMMAND anvil_shard_faults 24)
 set_tests_properties(shard.faults PROPERTIES LABELS "shard;faults;gate" TIMEOUT 1800)
 
 # ---------------------------------------------------------------------------
+# P6: distributed transactions -- three engines behind one coordinator.
+#
+# txn_test is the mechanism with nothing running: the version store, the
+# record status lattice (pending -> staging -> committed, pending -> aborted,
+# and nothing out of a terminal state), the opaque command interface a range
+# actually applies, the GC boundary version, and the two timestamp sources --
+# the replicated oracle's monotonicity and the hybrid logical clock's
+# uncertainty interval -- each constructed rather than waited for.
+#
+# txn_faults is the exit criteria: a coordinator running all three isolation
+# levels over a sharded, fault-injected cluster, checked by the Elle-style
+# checker at the level each engine claims and by the bank's conserved total as
+# the client-visible oracle; and the seeded-mutation drill over the
+# deliberate-bug flags in CoordinatorOptions and StoreOptions.
+# ---------------------------------------------------------------------------
+add_executable(anvil_txn_test txn_test.cc)
+target_link_libraries(anvil_txn_test PRIVATE anvil::txn_core anvil::sanitizers)
+add_test(NAME txn.units COMMAND anvil_txn_test)
+set_tests_properties(txn.units PROPERTIES LABELS "txn" TIMEOUT 300)
+
+add_executable(anvil_txn_faults txn_faults.cc)
+target_link_libraries(anvil_txn_faults PRIVATE anvil::workloads anvil::checker anvil::sanitizers)
+add_test(NAME txn.faults COMMAND anvil_txn_faults 20)
+set_tests_properties(txn.faults PROPERTIES LABELS "txn;faults;gate" TIMEOUT 1800)
+
+# ---------------------------------------------------------------------------
 # The gate's negative test.
 #
 # This archive is deliberately full of forbidden symbols. The test passes only

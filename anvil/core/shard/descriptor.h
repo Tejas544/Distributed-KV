@@ -35,9 +35,17 @@
 
 namespace anvil::shard {
 
-// The placement driver's own group. Reserved, so that a range id and a group id
-// are the same number and range ids start at 2.
+// The two groups that are not ranges. Reserved, so that a range id and a
+// group id are the same number and range ids start at 3.
+//
+// The timestamp oracle gets its own group rather than a field in the
+// placement group's state, and the reason is failover: a timestamp
+// reservation and a range split are unrelated decisions, and putting them in
+// one log means every timestamp batch waits behind whatever the placement
+// driver is doing. The monotonicity argument (INV-TXN-09) is identical
+// either way -- it is Raft's -- so the split costs nothing but a group.
 inline constexpr std::uint64_t kMetaGroup = 1;
+inline constexpr std::uint64_t kOracleGroup = 2;
 
 // A lease: the right to serve reads for a range without a quorum round-trip,
 // for as long as the clock says it lasts.

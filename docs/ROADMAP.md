@@ -261,6 +261,29 @@ changes several times a second is as likely to be wrong as the topology is.
 
 ## P6 — Distributed transactions: three engines · Weeks 22–25
 
+**Status: in progress, core money-loss finding fixed, a Raft-layer question
+open.** The mechanism, the checker instrumentation and the fault harness exist
+and mostly pass. Eight real defects have now been found and fixed getting the
+sweep to run at all and then to run clean without fault injection: a tombstone
+indistinguishable from an empty value, a checker false-positive on the
+oracle's own recovery, a record whose empty key list made it invisible to
+every split and merge, a transaction id that did not survive a coordinator
+restart, a blocked reader that never resolved the intent it found, the
+checker's own record identity being keyed by node instead of by node-and-
+range, a range's reply to a transactional command being matched to whichever
+client's request sorted first by id rather than the one that actually caused
+it (money went missing under contention from two coordinators, no fault
+needed), and a merge trigger that carried only the bank half of the subsumed
+range's state, discarding every transaction the merged-away range was holding.
+The fault-free money-loss finding this section used to describe as open is
+now fixed and confirmed by direct minimal-repro experiment. What remains under
+full fault injection looks like a single shared Raft-layer issue -- an oracle
+high-water mark that goes backwards after a crash and leadership change, and
+(found while sanity-checking the fixes against plain P5) the exact ANV-0048
+corpus regression seed still failing the same way in `shard_faults`, with no
+P6 code involved at all. See [CONTEXT.md §14](../CONTEXT.md) for the full
+account. None of this is committed yet.
+
 **Goal.** The guarantee matrix from [SCOPE.md §2](SCOPE.md#2-guarantee-matrix), all three levels, one interface.
 
 **Deliverables**

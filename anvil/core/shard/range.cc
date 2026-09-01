@@ -58,6 +58,7 @@ const char* to_string(RangeOp op) noexcept {
     case RangeOp::kSplitConfirmed: return "split-confirmed";
     case RangeOp::kFreeze: return "freeze";
     case RangeOp::kMergeTrigger: return "merge-trigger";
+    case RangeOp::kTxn: return "txn";
   }
   return "?";
 }
@@ -102,6 +103,7 @@ std::string encode_range_command(const RangeCommand& cmd) {
   lsm::put_varint64(&out, cmd.time);
   lsm::put_varint64(&out, cmd.expiry);
   lsm::put_length_prefixed(&out, cmd.payload);
+  lsm::put_length_prefixed(&out, cmd.txn_command);
   return out;
 }
 
@@ -110,7 +112,7 @@ bool decode_range_command(std::string_view in, RangeCommand* out) {
   const char* limit = p + in.size();
   if (p >= limit) return false;
   const auto op = static_cast<std::uint8_t>(*p++);
-  if (op > static_cast<std::uint8_t>(RangeOp::kMergeTrigger)) return false;
+  if (op > static_cast<std::uint8_t>(RangeOp::kTxn)) return false;
   out->op = static_cast<RangeOp>(op);
 
   std::string_view from;
@@ -148,6 +150,9 @@ bool decode_range_command(std::string_view in, RangeCommand* out) {
   std::string_view payload;
   p = lsm::get_length_prefixed(p, limit, &payload);
   if (p == nullptr) return false;
+  std::string_view txn_command;
+  p = lsm::get_length_prefixed(p, limit, &txn_command);
+  if (p == nullptr) return false;
 
   out->from.assign(from);
   out->to.assign(to);
@@ -156,6 +161,7 @@ bool decode_range_command(std::string_view in, RangeCommand* out) {
   out->end.assign(end);
   out->node = NodeId{node};
   out->payload.assign(payload);
+  out->txn_command.assign(txn_command);
   return true;
 }
 
@@ -179,33 +185,79 @@ std::string RangeMachine::encode_payload(const std::map<std::string, std::int64_
   return out;
 }
 
-bool RangeMachine::decode_payload(std::string_view in,
-                                  std::map<std::string, std::int64_t>* balances,
-                                  std::map<std::uint64_t, ApplyOutcome>* decided) {
-  const char* p = in.data();
-  const char* limit = p + in.size();
+// The bank half of a payload, returning where it ended so that the
+// transactional half -- which P6 appends and P5 does not write at all -- can be
+// parsed from the same buffer. Two sections rather than one combined format,
+// because a range that only ever sees transfers still has to be able to read a
+// payload written by a range that also holds versions, and vice versa.
+const char* RangeMachine::decode_bank(const char* p, const char* limit,
+                                      std::map<std::string, std::int64_t>* balances,
+                                      std::map<std::uint64_t, ApplyOutcome>* decided) {
   std::uint32_t count = 0;
   p = lsm::get_varint32(p, limit, &count);
-  if (p == nullptr) return false;
+  if (p == nullptr) return nullptr;
   for (std::uint32_t i = 0; i < count; ++i) {
     std::string_view key;
     std::int64_t value = 0;
     p = lsm::get_length_prefixed(p, limit, &key);
-    if (p == nullptr) return false;
+    if (p == nullptr) return nullptr;
     p = get_signed(p, limit, &value);
-    if (p == nullptr) return false;
+    if (p == nullptr) return nullptr;
     (*balances)[std::string{key}] = value;
   }
   p = lsm::get_varint32(p, limit, &count);
-  if (p == nullptr) return false;
+  if (p == nullptr) return nullptr;
   for (std::uint32_t i = 0; i < count; ++i) {
     std::uint64_t id = 0;
     p = lsm::get_varint64(p, limit, &id);
-    if (p == nullptr) return false;
-    if (p >= limit) return false;
+    if (p == nullptr) return nullptr;
+    if (p >= limit) return nullptr;
     (*decided)[id] = static_cast<ApplyOutcome>(static_cast<std::uint8_t>(*p++));
   }
-  return true;
+  return p;
+}
+
+bool RangeMachine::decode_payload(std::string_view in,
+                                  std::map<std::string, std::int64_t>* balances,
+                                  std::map<std::uint64_t, ApplyOutcome>* decided) {
+  return decode_bank(in.data(), in.data() + in.size(), balances, decided) != nullptr;
+}
+
+// The whole of this range's state for [lo, hi): balances, the decision ledger,
+// and the transactional half. The transactional section is length-prefixed and
+// may be absent, which is what makes a P5 payload readable here.
+std::string RangeMachine::encode_span(std::string_view lo, std::string_view hi) const {
+  std::map<std::string, std::int64_t> slice;
+  for (const auto& [key, value] : balances_) {
+    if (key < lo) continue;
+    if (!hi.empty() && key >= hi) continue;
+    slice.emplace(key, value);
+  }
+  std::string out = encode_payload(slice, decided_);
+  lsm::put_length_prefixed(&out, txn_.encode_span(lo, hi));
+  return out;
+}
+
+bool RangeMachine::load_span(std::string_view in, bool merge) {
+  std::map<std::string, std::int64_t> balances;
+  std::map<std::uint64_t, ApplyOutcome> decided;
+  const char* p = decode_bank(in.data(), in.data() + in.size(), &balances, &decided);
+  if (p == nullptr) return false;
+
+  if (merge) {
+    for (const auto& [key, value] : balances) balances_[key] += value;
+    for (const auto& [id, outcome] : decided) decided_.emplace(id, outcome);
+  } else {
+    balances_ = std::move(balances);
+    decided_ = std::move(decided);
+  }
+
+  const char* limit = in.data() + in.size();
+  if (p >= limit) return true;  // a payload written before P6 existed
+  std::string_view txn_part;
+  p = lsm::get_length_prefixed(p, limit, &txn_part);
+  if (p == nullptr) return false;
+  return merge ? txn_.absorb(txn_part) : txn_.load(txn_part);
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +265,9 @@ bool RangeMachine::decode_payload(std::string_view in,
 // ---------------------------------------------------------------------------
 
 RangeMachine::RangeMachine(RangeDescriptor descriptor, RangeOptions options, bool initialised)
-    : desc_(std::move(descriptor)), options_(options), initialised_(initialised) {}
+    : desc_(std::move(descriptor)), options_(options), initialised_(initialised) {
+  txn_.set_options(options_.txn);
+}
 
 std::int64_t RangeMachine::total() const {
   std::int64_t sum = 0;
@@ -222,15 +276,22 @@ std::int64_t RangeMachine::total() const {
 }
 
 std::string RangeMachine::median_key() const {
-  if (balances_.size() < 2) return {};
-  auto it = balances_.begin();
-  std::advance(it, static_cast<std::ptrdiff_t>(balances_.size() / 2));
-  if (it == balances_.begin()) return {};
-  // A split key equal to the range's own start produces an empty left half,
-  // which tiles the key space perfectly and breaks everything that assumes a
-  // range contains a key.
-  if (it->first <= desc_.start) return {};
-  return it->first;
+  if (balances_.size() >= 2) {
+    auto it = balances_.begin();
+    std::advance(it, static_cast<std::ptrdiff_t>(balances_.size() / 2));
+    // A split key equal to the range's own start produces an empty left half,
+    // which tiles the key space perfectly and breaks everything that assumes a
+    // range contains a key.
+    if (it != balances_.begin() && it->first > desc_.start) return it->first;
+  }
+  // P6: a range that only ever sees transactional commands has an empty
+  // balances_ forever (bootstrap seeds no accounts when the workload is a
+  // coordinator's, not a transfer's), so this is not a fallback for a
+  // near-empty range -- it is the only place a purely transactional range's
+  // median comes from.
+  const std::string txn_median = txn_.median_key();
+  if (!txn_median.empty() && txn_median > desc_.start) return txn_median;
+  return {};
 }
 
 std::vector<RangeId> RangeMachine::take_subsumed() {
@@ -354,16 +415,16 @@ void RangeMachine::apply(LogIndex index, std::string_view command) {
       split.replicas = cmd.replicas.empty() ? desc_.replicas : cmd.replicas;
       split.learners = cmd.learners.empty() ? desc_.learners : cmd.learners;
 
-      std::map<std::string, std::int64_t> moved;
+      // Everything in [split.start, old end) leaves, balances and versions and
+      // intents and the records whose primary key went with them. The decision
+      // ledger goes to *both* halves: it is the idempotence table, and a client
+      // retrying an operation decided before the split must get the recorded
+      // answer from whichever range now owns its keys.
+      split.payload = encode_span(split.start, split.end);
       for (auto it = balances_.lower_bound(split.start); it != balances_.end();) {
-        moved.emplace(it->first, it->second);
         it = balances_.erase(it);
       }
-      // The decision ledger goes to both halves. It is the idempotence table:
-      // a client retrying a transfer that was decided before the split must get
-      // the recorded answer from whichever range now owns its keys, and which
-      // one that is depends on the keys.
-      split.payload = encode_payload(moved, decided_);
+      txn_.erase_span(split.start, split.end);
 
       desc_.end = split.start;
       if (cmd.generation > desc_.generation) desc_.generation = cmd.generation;
@@ -374,11 +435,7 @@ void RangeMachine::apply(LogIndex index, std::string_view command) {
 
     case RangeOp::kInit: {
       if (initialised_) break;  // a second leader proposing the same thing
-      std::map<std::string, std::int64_t> balances;
-      std::map<std::uint64_t, ApplyOutcome> decided;
-      if (!decode_payload(cmd.payload, &balances, &decided)) break;
-      balances_ = std::move(balances);
-      decided_ = std::move(decided);
+      if (!load_span(cmd.payload, /*merge=*/false)) break;
       // The span comes from the log too, and this is not decoration.
       //
       // A replica added to an existing range later -- a rebalance, a learner --
@@ -407,16 +464,40 @@ void RangeMachine::apply(LogIndex index, std::string_view command) {
     case RangeOp::kMergeTrigger: {
       if (desc_.frozen) break;
       if (cmd.start != desc_.end) break;  // not our right-hand neighbour any more
-      std::map<std::string, std::int64_t> balances;
-      std::map<std::uint64_t, ApplyOutcome> decided;
-      if (!decode_payload(cmd.payload, &balances, &decided)) break;
-      for (auto& [key, value] : balances) balances_[key] += value;
-      for (const auto& [id, result] : decided) decided_.emplace(id, result);
+      if (!load_span(cmd.payload, /*merge=*/true)) break;
       desc_.end = cmd.end;
       if (cmd.generation > desc_.generation) desc_.generation = cmd.generation;
       subsumed_.push_back(cmd.other);
       ++counters_.merges_applied;
       break;
+    }
+
+    case RangeOp::kTxn: {
+      // The range checks two things and hands over the rest: that the key is
+      // one it owns, and that the client was looking at the descriptor it has
+      // now. Everything else about a prewrite belongs to the version store.
+      txn::TxnCommand command;
+      if (!decode_txn_command(cmd.txn_command, &command)) break;
+
+      txn::TxnResult result;
+      if (!initialised_) {
+        result.outcome = txn::WriteOutcome::kRejected;
+      } else if (desc_.frozen) {
+        result.outcome = txn::WriteOutcome::kRejected;
+      } else if (!desc_.contains(command.key)) {
+        ++counters_.transfers_rejected_wrong_range;
+        result.outcome = txn::WriteOutcome::kRejected;
+      } else if (options_.checks_generation && cmd.generation != 0 &&
+                 cmd.generation != desc_.generation) {
+        ++counters_.transfers_rejected_wrong_range;
+        ++counters_.transfers_rejected_generation;
+        result.outcome = txn::WriteOutcome::kRejected;
+      } else {
+        result = txn::apply_txn_command(&txn_, command);
+        ++counters_.txn_commands_applied;
+      }
+      if (on_txn_) on_txn_(index, command, result);
+      return;  // the transactional callback is the reply; there is no ApplyOutcome
     }
   }
 
@@ -427,7 +508,7 @@ std::string RangeMachine::snapshot() const {
   std::string out;
   lsm::put_length_prefixed(&out, encode_descriptor(desc_));
   out.push_back(initialised_ ? 1 : 0);
-  lsm::put_length_prefixed(&out, encode_payload(balances_, decided_));
+  lsm::put_length_prefixed(&out, encode_span(std::string_view{}, std::string_view{}));
   out.push_back(pending_split_.has_value() ? 1 : 0);
   if (pending_split_.has_value()) {
     lsm::put_varint64(&out, pending_split_->id.value());
@@ -453,15 +534,11 @@ void RangeMachine::restore(std::string_view data) {
   std::string_view payload;
   p = lsm::get_length_prefixed(p, limit, &payload);
   if (p == nullptr) return;
-  std::map<std::string, std::int64_t> balances;
-  std::map<std::uint64_t, ApplyOutcome> decided;
-  if (!decode_payload(payload, &balances, &decided)) return;
 
   desc_ = std::move(desc);
   initialised_ = initialised;
-  balances_ = std::move(balances);
-  decided_ = std::move(decided);
   pending_split_.reset();
+  if (!load_span(payload, /*merge=*/false)) return;
 
   if (p < limit && *p++ != 0) {
     PendingSplit split;

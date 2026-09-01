@@ -45,13 +45,14 @@ add_library(anvil_checker STATIC
   raft_invariants.cc
   mvcc_invariants.cc
   shard_invariants.cc
+  txn_invariants.cc
 )
 add_library(anvil::checker ALIAS anvil_checker)
 
 target_include_directories(anvil_checker PUBLIC "${PROJECT_SOURCE_DIR}")
 
 target_link_libraries(anvil_checker
-  PUBLIC anvil::core anvil::raft anvil::mvcc anvil::shard anvil::warnings
+  PUBLIC anvil::core anvil::raft anvil::mvcc anvil::shard anvil::txn anvil::warnings
   PRIVATE anvil::sanitizers)
 
 target_sources(anvil_checker PRIVATE
@@ -62,4 +63,5 @@ target_sources(anvil_checker PRIVATE
   raft_invariants.h
   mvcc_invariants.h
   shard_invariants.h
+  txn_invariants.h
 )

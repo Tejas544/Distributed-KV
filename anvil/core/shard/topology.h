@@ -134,7 +134,7 @@ struct TopologyState {
   std::map<std::uint64_t, std::string> by_id;     // range id -> start key
   std::map<std::uint64_t, NodeHealth> nodes;
   std::map<std::uint64_t, RangeStats> stats;      // range id -> what its leader reports
-  std::uint64_t next_range_id = 2;                // 1 is the placement group
+  std::uint64_t next_range_id = 3;  // 1 is placement, 2 is the timestamp oracle
 
   // The index of the last entry applied. Replicated by construction, so a
   // decision expressed as "N entries since" is the same decision on every

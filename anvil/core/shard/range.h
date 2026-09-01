@@ -34,6 +34,8 @@
 
 #include "anvil/core/raft/driver.h"
 #include "anvil/core/shard/descriptor.h"
+#include "anvil/core/txn/command.h"
+#include "anvil/core/txn/store.h"
 #include "anvil/core/types.h"
 
 namespace anvil::shard {
@@ -48,6 +50,7 @@ enum class RangeOp : std::uint8_t {
   kSplitConfirmed,  // the new range is durable; the payload may be dropped
   kFreeze,          // subsumed by a merge: no further writes
   kMergeTrigger,    // absorb a frozen neighbour's data
+  kTxn,             // P6: an opaque transactional command (txn/command.h)
 };
 
 const char* to_string(RangeOp op) noexcept;
@@ -72,6 +75,13 @@ struct RangeCommand {
   std::uint64_t time = 0;
   std::uint64_t expiry = 0;
   std::string payload;  // split or merge data
+
+  // P6. An encoded txn::TxnCommand. Opaque here on purpose: the range
+  // machine decodes exactly one field of it -- the key, which it needs for
+  // the span and generation checks -- and hands the rest to the version
+  // store. A range that knows what a prewrite is has learned something it
+  // has no use for.
+  std::string txn_command;
 
   std::string describe() const;
 };
@@ -116,6 +126,13 @@ struct RangeOptions {
   // a replica that is behind stops receiving the entries that would catch it
   // up. INV-SHARD-08.
   bool quiesce_requires_caught_up = true;
+
+  // P6. The deliberate-bug flags for this range's version store (first-
+  // committer-wins, intent blocking, the terminal-status lattice, and
+  // uncertainty handling -- see anvil/core/txn/store.h). Threaded through
+  // rather than left at the default so the fault-injected drill can reach
+  // them the same way it reaches every other layer's.
+  txn::StoreOptions txn;
 };
 
 struct RangeStatsCounters {
@@ -128,6 +145,7 @@ struct RangeStatsCounters {
   std::uint64_t transfers_rejected_generation = 0;
   std::uint64_t transfers_rejected_funds = 0;
   std::uint64_t transfers_duplicate = 0;
+  std::uint64_t txn_commands_applied = 0;
   std::uint64_t leases_granted = 0;
   std::uint64_t splits_applied = 0;
   std::uint64_t merges_applied = 0;
@@ -156,7 +174,12 @@ class RangeMachine : public raft::StateMachine {
   std::uint64_t revision() const noexcept { return revision_; }
 
   std::int64_t total() const;
-  std::size_t key_count() const noexcept { return balances_.size(); }
+  // Both halves of what this range holds: the bank's balances (P5) and the
+  // transactional keys (P6). A range that only ever sees one of the two --
+  // every range in practice, since a workload picks a mechanism, not both --
+  // still needs the sum, because a placement decision drawn from only one
+  // half of an empty-looking range never splits it.
+  std::size_t key_count() const noexcept { return balances_.size() + txn_.key_count(); }
 
   // The key that would divide this range's data in half. Empty when the range
   // is too small to split. Reported to the placement driver, because the driver
@@ -197,6 +220,19 @@ class RangeMachine : public raft::StateMachine {
   using ApplyCallback = std::function<void(LogIndex, const RangeCommand&, ApplyOutcome)>;
   void set_apply_callback(ApplyCallback callback) { on_apply_ = std::move(callback); }
 
+  // P6. What a transactional command decided, reported to whoever proposed
+  // it. Separate from the callback above because the answers are different
+  // shapes: a transfer succeeded or it did not, and a prewrite may have
+  // been blocked by a transaction the caller now has to go and push.
+  using TxnCallback =
+      std::function<void(LogIndex, const txn::TxnCommand&, const txn::TxnResult&)>;
+  void set_txn_callback(TxnCallback callback) { on_txn_ = std::move(callback); }
+
+  // The transactional state this range holds. Read directly by the lease
+  // holder to serve a snapshot read, and by the checker.
+  const txn::VersionStore& txn_store() const noexcept { return txn_; }
+  txn::VersionStore& txn_store() noexcept { return txn_; }
+
   // Builds the payload a newly split range needs. Used by the new range's
   // leader, reading its own node's copy of the parent.
   static std::string encode_payload(const std::map<std::string, std::int64_t>& balances,
@@ -204,11 +240,23 @@ class RangeMachine : public raft::StateMachine {
   static bool decode_payload(std::string_view in, std::map<std::string, std::int64_t>* balances,
                              std::map<std::uint64_t, ApplyOutcome>* decided);
 
-  // The whole of this range's data, for a merge trigger.
-  std::string payload() const { return encode_payload(balances_, decided_); }
+  // The whole of this range's state for [lo, hi) -- balances, the decision
+  // ledger, and the transactional half -- and the two ways of taking one back
+  // in. `merge` distinguishes absorbing a neighbour from being initialised.
+  // A merge trigger's payload is `encode_span({}, {})`, the whole range: the
+  // now-retired `payload()` gave callers only the bank half, encode_payload(
+  // balances_, decided_) with no txn_ section at all, and a merge that used it
+  // absorbed a neighbour's committed transactions, live intents, and records
+  // into nothing -- every one of them silently gone the moment the merge
+  // committed, with the coordinator that heard "committed" none the wiser.
+  std::string encode_span(std::string_view lo, std::string_view hi) const;
+  bool load_span(std::string_view in, bool merge);
 
  private:
   ApplyOutcome apply_transfer(const RangeCommand& cmd);
+  static const char* decode_bank(const char* p, const char* limit,
+                                 std::map<std::string, std::int64_t>* balances,
+                                 std::map<std::uint64_t, ApplyOutcome>* decided);
 
   RangeDescriptor desc_;
   RangeOptions options_;
@@ -223,6 +271,13 @@ class RangeMachine : public raft::StateMachine {
   std::map<std::uint64_t, ApplyOutcome> decided_;
 
   Lease previous_lease_;
+
+  // P6. Versions, intents and transaction records for the keys in this
+  // range. Empty for a range that only ever sees transfers, which is why
+  // adding it did not disturb anything in P5.
+  txn::VersionStore txn_;
+  TxnCallback on_txn_;
+
   std::optional<PendingSplit> pending_split_;
   std::vector<RangeId> subsumed_;
 

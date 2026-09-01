@@ -41,6 +41,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "anvil/core/raft/driver.h"
@@ -50,6 +51,8 @@
 #include "anvil/core/shard/range.h"
 #include "anvil/core/shard/router.h"
 #include "anvil/core/shard/topology.h"
+#include "anvil/core/txn/command.h"
+#include "anvil/core/txn/timestamp.h"
 #include "anvil/core/runtime/runtime.h"
 
 namespace anvil::shard {
@@ -200,6 +203,64 @@ class ShardStore {
     on_reply_ = std::move(handler);
   }
 
+  // ---- the transactional path (P6) ---------------------------------------
+  //
+  // A second client protocol beside the bank's, rather than an extension of
+  // it. The two ask different questions: a transfer is one round trip whose
+  // answer is yes or no, and a transactional operation is one step of a
+  // protocol whose answer may be "someone else holds this and here is who".
+  // Folding them together would mean a Reply struct with two disjoint halves
+  // and a flag saying which one is real.
+  struct TxnRequest {
+    bool read = false;
+    RangeId range{};
+    std::uint64_t generation = 0;
+    std::uint64_t client = 0;
+    std::uint64_t seq = 0;
+
+    // read
+    std::string key;
+    txn::Ts read_ts = 0;
+    txn::Ts uncertainty_limit = 0;
+    txn::TxnId reader = 0;
+
+    // write
+    txn::TxnCommand command;
+  };
+
+  struct TxnReply {
+    std::uint64_t client = 0;
+    std::uint64_t seq = 0;
+    std::uint8_t status = 0;
+    RangeId range{};
+    std::uint64_t generation = 0;
+    NodeId leader_hint{};
+    txn::TxnResult result;   // writes
+    txn::ReadResult read;    // reads
+    std::uint64_t applied_index = 0;
+  };
+
+  Task<Status> send_txn(TxnRequest request, NodeId to);
+
+  // Reserves `count` timestamps from the replicated oracle, returning the
+  // first. Asks the local replica when it leads the oracle group and
+  // forwards to the leader otherwise; either way the reservation is a
+  // committed Raft entry before a single number is handed out, which is the
+  // whole of INV-TXN-09.
+  Task<bool> reserve_timestamps(std::uint64_t count, txn::Ts* first);
+
+  const txn::OracleMachine& oracle() const noexcept { return *oracle_machine_; }
+  const raft::RaftDriver* oracle_driver() const noexcept { return oracle_driver_.get(); }
+  void set_oracle_options(txn::OracleOptions options) { oracle_options_ = options; }
+  void set_txn_reply_handler(std::function<void(const TxnReply&)> handler) {
+    on_txn_reply_ = std::move(handler);
+  }
+
+  // Where a key lives, by the cache and then the meta index. The
+  // transactional coordinator needs this directly: it addresses several
+  // ranges in one transaction and cannot express that as a single Route.
+  bool locate(std::string_view key, RangeDescriptor* out);
+
   // Status codes on the wire. Deliberately not StatusCode: this is a protocol
   // between two nodes and it has to survive one of them being older.
   static constexpr std::uint8_t kOk = 0;
@@ -226,7 +287,15 @@ class ShardStore {
   void handle_envelope(const Message& envelope);
   void handle_request(const Message& envelope);
   void handle_reply(const Message& envelope);
+  void handle_txn_request(const Message& envelope, std::string_view body);
+  void handle_txn_reply(std::string_view body);
+  void handle_ts_request(const Message& envelope, std::string_view body);
+  void handle_ts_reply(std::string_view body);
+  Task<void> ts_reply_to(NodeId to, std::uint64_t client, std::uint64_t seq,
+                         std::uint8_t status, txn::Ts first, std::uint64_t count,
+                         NodeId hint);
   Task<void> reply_to(NodeId to, Reply reply);
+  Task<void> txn_reply_to(NodeId to, TxnReply reply);
 
   bool is_placement_leader() const;
   const RangeDescriptor* topology_descriptor(RangeId id) const;
@@ -246,6 +315,32 @@ class ShardStore {
   std::unique_ptr<raft::RaftTransport> transport_;
   std::unique_ptr<TopologyMachine> topology_machine_;
   std::unique_ptr<raft::RaftDriver> placement_driver_;
+
+  txn::OracleOptions oracle_options_;
+  std::unique_ptr<txn::OracleMachine> oracle_machine_;
+  std::unique_ptr<raft::RaftDriver> oracle_driver_;
+
+  // Timestamp reservations proposed and waiting for their entry to apply,
+  // in proposal order. The oracle's log is a sequence of "take the next N",
+  // so the reservation that applies first belongs to the request that was
+  // proposed first.
+  struct PendingTs {
+    NodeId reply_to{};
+    std::uint64_t client = 0;
+    std::uint64_t seq = 0;
+    std::uint64_t count = 0;
+  };
+  std::vector<PendingTs> pending_ts_;
+
+  // A reservation this node is waiting for, as a client.
+  struct TsWaiter {
+    bool answered = false;
+    std::uint8_t status = 0;
+    txn::Ts first = 0;
+    std::uint64_t count = 0;
+  };
+  std::map<std::uint64_t, TsWaiter> ts_inbox_;
+  std::uint64_t next_ts_seq_ = 1;
 
   std::map<std::uint64_t, RangeReplica> ranges_;
   std::vector<RangeReplica> retired_;
@@ -272,6 +367,31 @@ class ShardStore {
   std::map<std::uint64_t, Pending> pending_;  // keyed by op id
 
   std::function<void(const Reply&)> on_reply_;
+  std::function<void(const TxnReply&)> on_txn_reply_;
+
+  // Transactional commands proposed and waiting for their entry to apply,
+  // keyed by (range, the log index this node's own propose() was assigned).
+  // That index is the one and only fact that ties a pending reply to the
+  // exact apply that decides it: a range's log can carry proposals from any
+  // number of concurrent client requests, possibly from different nodes
+  // entirely, and nothing about apply order is derivable from client or
+  // sequence number -- a client with a numerically larger id or a later
+  // sequence number is not guaranteed to have proposed later. Draining
+  // "whichever pending entry for this range sorts first" (the previous
+  // scheme, keyed by (client << 32) | seq) matched replies to applies by
+  // coincidence, and under two coordinators contending for one range the
+  // coincidence fails: an apply is paired with the wrong client's request,
+  // that client is told someone else's result, and the request whose result
+  // it stole waits out its RPC timeout having genuinely committed -- which is
+  // indistinguishable, from the coordinator's own reply cache, from having
+  // never happened at all.
+  struct PendingTxn {
+    NodeId reply_to{};
+    std::uint64_t client = 0;
+    std::uint64_t seq = 0;
+    RangeId range{};
+  };
+  std::map<std::pair<std::uint64_t, std::uint64_t>, PendingTxn> pending_txn_;
 
   bool started_ = false;
   bool bootstrap_ = false;

@@ -312,8 +312,9 @@ planting a bug.
 | **P2 LSM engine** | **done except benchmarks** | Benchmark criterion blocked on `ProdRuntime` |
 | **P3 Raft** | **done, one open finding** | 16 `INV-RAFT-*` armed; 9/10 drill + 1 targeted. ANV-0032 (a learner stops converging on seed 14) is open and the gate is red on it |
 | **P4 MVCC + transactions** | **done** | 8 `INV-MVCC-*` armed; snapshot isolation confirmed against the checker at two levels; whole sweep runs in <1s |
-| **P5 sharding** | **done** | MultiRaft, one Raft group per range; 9 `INV-SHARD-*` armed; 40/40 seeds clean; 17 ledger rows, 6 of them S0 |
-| P6+ | not started | Distributed transactions, verification, fleet, prod |
+| **P5 sharding** | **done, one new finding since** | MultiRaft, one Raft group per range; 9 `INV-SHARD-*` armed; 17 ledger rows, 6 of them S0. Re-running `shard_faults` while verifying an unrelated P6 fix found seed 19 -- the ANV-0048 corpus regression seed -- tripping `INV-SHARD-CLIENT` again on the current tree; not caused by anything in this pass (confirmed by A/B rebuild), not yet root-caused. See §14 |
+| **P6 distributed transactions** | **in progress, two root causes fixed, two-and-one-shared open** | Percolator/SSI/StrictSerializable behind one `Coordinator`; 7 `INV-TXN-*` armed (01-04, 09, 11, 12); `anvil_txn_test` (30 mechanism checks) green. `anvil_txn_faults`: the fault-free money-loss finding is fixed and confirmed by direct repro (two independent bugs, both fixed); the full fault-injected sweep still fails on what looks like a shared Raft-layer issue -- see §14. Never committed as of this pass |
+| P7+ | not started | Verification depth, the bug hunt at scale, prod runtime |
 
 ### Measured (see README results block)
 
@@ -996,6 +997,203 @@ table: MVCC crash recovery (still open from P4, and P6 cannot avoid it), moving
 a range's applied state into the LSM so that a split stops having to carry data
 in a log entry, and ANV-0032, which is open and holds the Raft gate red on one
 seed in sixteen. ANV-0033 remains the highest-value thing to do with a Linux box.
+
+---
+
+## 14. P6 (distributed transactions): where it stands, mid-phase
+
+The mechanism (`anvil/core/txn/`: `timestamp`, `record`, `store`, `command`,
+`coordinator`) and its instrumentation (`anvil/checker/txn_invariants.h/.cc`,
+`workloads/txn_bank.h/.cc`) were written in one pass, before any of it had been
+compiled or run. This section is the record of getting it from that state to a
+build that passes its own unit suite and mostly passes its own fault sweep --
+**mostly**, because one real finding is still open. None of this has been
+committed yet, which is why the fixes below are not BUGS.md rows: the ledger's
+own rule is that a row needs a commit to bisect against, and there is no parent
+commit that has this code without the fix. If this lands as-is, the open
+finding below should become the first P6 ledger row the moment it does, because
+at that point a real "before" exists.
+
+### What exists
+
+One `Coordinator` behind `begin`/`get`/`put`/`commit`/`rollback`, with the
+isolation level (`kSnapshot`/`kSerializable`/`kStrictSerializable`) as a
+`CoordinatorOptions` setting rather than three codebases. A replicated
+timestamp oracle (`kOracleGroup = 2`, sharing the range-per-group model P5
+built) and an `HybridClock` with a declared uncertainty interval are both
+wired through `ShardStore`. `test/txn_test.cc` (30 checks) covers the
+mechanism directly -- the version store, the record status lattice, the
+opaque command interface a range applies, the GC boundary, and both timestamp
+sources -- with nothing running. `test/txn_faults.cc` runs the coordinator
+over a sharded, chaos-admin cluster (topology churning the same way P5's did)
+at all three levels, confirms the checker's verdict against a hand-built
+history before trusting it live, and runs a nine-flag seeded-mutation drill.
+
+### Six real defects, found getting the fault sweep to run at all
+
+None of these needed an adversarial seed to reach; the first three were
+findings before the sweep produced a single clean run.
+
+1. **A committed tombstone was indistinguishable from a committed empty
+   string.** `VersionStore`'s version chain stored a delete as an empty
+   payload with nothing marking it as one, so a deleted key resurrected the
+   moment anyone wrote `""` to it, and `get()` had no way to say "found, but
+   deleted" at all. Fixed by giving each version entry its own tombstone flag
+   ([store.h](anvil/core/txn/store.h), [store.cc](anvil/core/txn/store.cc)).
+2. **INV-TXN-09 read a node's own recovery as a timestamp being reissued.**
+   The oracle's high-water observer compared a just-restarted node's fresh
+   `OracleMachine` (which starts at `kMinTs`) against what that same node
+   reported before it crashed, with no guard for "this replica has not
+   finished replaying its own log yet" -- gotcha 10.11's exact shape, on a new
+   subsystem. Fixed with the same test ANV-0048 established: not just
+   `ready()`, but `applied_index() >= commit_index()`
+   ([txn_invariants.cc](anvil/checker/txn_invariants.cc)).
+3. **A transaction record with an empty key list was invisible to every split
+   and merge.** `VersionStore::encode_span`/`erase_span` locate a record by
+   `keys.front()`, but the coordinator only populated `keys` when
+   `parallel_commit` was on -- the common, default configuration left every
+   record's key list empty, so it never migrated on a split and was silently
+   dropped from every merge payload. Fixed by always seeding `keys[0]` with
+   the primary, in the coordinator's `put_record` and in the version store's
+   own synthetic tombstone-abort path ([coordinator.cc](anvil/core/txn/coordinator.cc),
+   [store.cc](anvil/core/txn/store.cc)). The same gap meant a transactional-only
+   range's `key_count()`/`median_key()` only ever looked at the P5-era
+   `balances_` map, which a P6 workload never touches -- such a range could
+   never report growth and therefore could never trigger a split at all.
+   Fixed by summing both stores and falling back to the transactional median
+   when there is no bank data ([range.h](anvil/core/shard/range.h),
+   [range.cc](anvil/core/shard/range.cc)).
+4. **A transaction id was a per-`Coordinator` counter, and every restart
+   builds a fresh `Coordinator`.** Gotcha 10.25's exact shape: an in-memory
+   decision (`next_id_`, starting at 1) that has to survive a crash but is not
+   derived from anything that does. A node that crashed and rebooted mid-run
+   could reissue an id its previous incarnation already held a record or an
+   intent under. Fixed by using the transaction's own start timestamp as its
+   id -- already unique and already durable, because that is what INV-TXN-09
+   is for ([coordinator.cc](anvil/core/txn/coordinator.cc)).
+5. **A blocked reader that found a committed blocker never resolved the
+   intent in its way.** `resolve_blocker`'s aborted branch rolls back the
+   intent it found; the committed branch just returned, so the same intent
+   blocked every future reader forever unless the original owner's best-effort
+   cleanup happened to succeed. Fixed by proposing the missing
+   `kCommitIntent` there too ([coordinator.cc](anvil/core/txn/coordinator.cc)).
+6. **The checker's own record identity was keyed by node, not by (node,
+   range).** A record's primary key can move to a different range on the same
+   node via a split, and comparing what the new home reports against what the
+   old one last said reported a relocation as the record leaving a terminal
+   state -- INV-TXN-02 fired on a transaction that never actually changed its
+   mind. Fixed by resetting the tracked baseline when the reporting range
+   changes, while still ignoring a different *replica* of the same tracked
+   range (the trap INV-SHARD-04's first version fell into)
+   ([txn_invariants.cc](anvil/checker/txn_invariants.cc)).
+
+### Money and acknowledged writes going missing: two real causes found, fixed, and confirmed by direct experiment
+
+The minimal reproduction the previous pass recommended was built (bank
+workload only, `keys=4`, `neighbourhood=2`, three nodes, no fault injection)
+and found a failing seed in under half a second of wall-clock time instead of
+needing the full sweep. That, plus a debugger-style trace of the exact
+requests and applies around the loss (not committed to the tree; see gotcha
+10.17), found two independent, unrelated bugs, either one sufficient on its
+own to lose an acknowledged commit with zero faults:
+
+1. **A range's reply to a transactional command was matched to the wrong
+   waiter.** `ShardStore::pending_txn_` was keyed by `(client << 32) | seq`
+   and drained "oldest key first" on every applied `kTxn` command, on the
+   reasoning that a range applies commands in the order it received them. That
+   reasoning holds for one client; it does not hold for two. The key is the
+   *client's* identity, not an insertion order, so `std::map`'s iteration order
+   is client-id-major, not proposal-order -- under two coordinators contending
+   for one range, an apply got paired with a different client's pending
+   request, that client was told somebody else's result, and the request whose
+   result was stolen sat out its RPC timeout having genuinely committed. From
+   the coordinator's own reply cache that is indistinguishable from having
+   never happened, which is exactly the `TxnOutcome::kUnknown` this surfaced
+   as. Fixed by keying `pending_txn_` on `(range, the log index propose()
+   actually assigned)` -- the one fact that ties a reply to the exact apply
+   that decided it, with no ordering assumption at all
+   ([store.h](anvil/core/shard/store.h), [store.cc](anvil/core/shard/store.cc)).
+   Confirmed by direct experiment: a single-range repro (no splits at all)
+   that lost money on essentially every seed was clean across 3000 seeds after
+   this fix alone.
+2. **A merge trigger carried only the bank half of the subsumed range's
+   state.** `RangeMachine::payload()` -- documented, wrongly, as "the whole of
+   this range's data, for a merge trigger" -- was `encode_payload(balances_,
+   decided_)` with no `txn_` section at all, while the *split* path already
+   used `encode_span()`, which does include it. The receiving side's
+   `load_span(..., merge=true)` has an explicit backward-compatibility branch
+   for "a payload written before P6 existed" (no trailing txn section), and a
+   merge built from `payload()` hit that branch every time -- every version, live
+   intent, and record on the subsumed side was silently discarded the moment
+   the merge committed, with the coordinator that had been told those
+   transactions committed none the wiser. Fixed by using `encode_span({}, {})`
+   for the merge trigger too, and the now-dangerously-misleading `payload()`
+   accessor was removed rather than left as a trap for the next caller
+   ([range.h](anvil/core/shard/range.h), [store.cc](anvil/core/shard/store.cc)).
+   Confirmed the same way: the split/merge repro that still lost money after
+   fix 1 (with splits enabled) was clean across 3000 seeds after this fix too.
+
+A third change went in alongside these: `reserve_timestamps` and
+`handle_ts_request` only checked `oracle_driver_->ready()` before serving a
+reservation as leader, and `ready()` means booted, not caught up --
+`maintain_range` has always gated range leadership on `applied_index() >=
+commit_index()` for exactly this reason (ANV-0048's shape), and the oracle
+group never got the same guard. It is a real gap and the fix is correct, but
+**it did not change the one failure it was aimed at**: a full-sweep run
+(`txn_faults 30`) reproduces byte-for-byte identically, tick for tick, before
+and after this change, which means the guard's branch was not the one taken in
+that failure. That failure is now believed to be a different, deeper bug --
+see below.
+
+### Still open: an oracle high-water regression under crash + leadership change, and a topology gap under aggressive churn
+
+Two findings remain, found while confirming the two fixes above against the
+full `txn_faults` sweep (fault injection on, crashes allowed) rather than the
+fault-free minimal repro:
+
+- **`INV-TXN-09` fires for real, not as a checker false positive.** `txn_faults
+  30`, seed 4, snapshot-isolation and serializable both: "n1 had an oracle
+  high-water mark of 193 and now reports 65" at tick 9592. `OracleMachine::apply`
+  and `::restore` are both individually correct (verified by direct trace:
+  every replica applies each reservation exactly once, in order, with a
+  monotonic `high_water`), and the ready-but-not-caught-up guard above did not
+  change this failure at all. That leaves the log/commit-index bookkeeping
+  itself as the remaining suspect -- specifically whether `commit_index()` can
+  read back a smaller value after a leadership change than it read before, in
+  which case `applied_index() >= commit_index()` is satisfied by a node that
+  is genuinely behind rather than one that has caught up, and every guard
+  built on that comparison (this one, ANV-0048's, ANV-0041's) is checking the
+  wrong thing under this specific condition. Not yet confirmed; it is a
+  hypothesis, not a finding, until traced.
+- **`the audit could only reach N of M accounts`** (seeds 5, 6 in the same run)
+  is a genuine gap in the topology's key coverage under aggressive split/merge
+  churn combined with faults -- distinct from finding 2 above (which lost data
+  *within* an existing range's coverage; this loses the *coverage* itself).
+  Not yet traced past that description.
+- **A new, unrelated finding surfaced while sanity-checking fix 2 against pure
+  P5** (`shard_faults`, no transactions involved at all): seed 19 -- which is
+  the *exact* corpus regression seed already on file for ANV-0048 ("fixed",
+  P5) -- still trips `INV-SHARD-CLIENT` today ("a lease read of r3 came back
+  at index 17 after one at index 18", tick 4395). Confirmed by direct A/B
+  rebuild that this is unrelated to anything in this pass: it reproduces
+  identically whether the merge-trigger fix above is in or out. The code at
+  the read-serving site has both the ANV-0048 guard (`applied_index() >=
+  commit_index()`) and the ANV-0041 fix (log index, not machine index) present
+  and correct on inspection. Given it is the same seed on file for a
+  conceptually identical symptom, this is either a narrow gap the ANV-0048 fix
+  never actually closed, or the same `commit_index()` regression hypothesized
+  above wearing P5's clothes -- plausible, since a bug in shared Raft
+  bookkeeping would surface in both the oracle group and an ordinary range
+  group.
+
+All three point at the same place: something about `commit_index()` (or the
+log's view of it) after a leadership change, not anything specific to P6's new
+code. That makes this a Raft-layer question now, not a transactions-layer one,
+and it needs the same treatment already recommended and not yet done: a
+minimal repro (the P5-only `shard_faults` seed 19 is already smaller and
+faster than any P6 repro would be) and a debugger on `RaftNode`'s
+`commit_index`/`applied_index` transition across a term change, per gotcha
+10.17.
 
 ---
 

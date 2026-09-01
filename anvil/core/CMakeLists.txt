@@ -34,6 +34,10 @@ target_sources(anvil_core PRIVATE
 add_subdirectory(lsm)
 add_subdirectory(raft)
 add_subdirectory(mvcc)
+# txn_core before shard: a range holds transaction records, so the shard
+# layer depends on the transactional data types. The coordinator depends on
+# shard, which is why that half is a separate target (see txn/CMakeLists.txt).
+add_subdirectory(txn)
 add_subdirectory(shard)
 
 anvil_add_hermetic_check(anvil_core)

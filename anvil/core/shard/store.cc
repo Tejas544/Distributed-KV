@@ -96,7 +96,29 @@ void ShardStore::start(bool bootstrap) {
       DeterministicRandom{rng_.next_u64()});
   placement_driver_->set_external_ticks(true);
 
+  // The timestamp oracle. Its own group, replicated on every node, so that a
+  // reservation does not queue behind whatever the placement driver is doing
+  // and so that its failover story is Raft's rather than a special case.
+  oracle_machine_ = std::make_unique<txn::OracleMachine>();
+  oracle_machine_->set_reserved_callback([this](txn::Ts first, std::uint64_t count) {
+    // Every replica applies this; only the one that proposed it has anyone to
+    // answer. Reservations are answered in proposal order because the log is in
+    // proposal order -- there is nothing else to match them by, and nothing
+    // else needed.
+    if (pending_ts_.empty()) return;
+    const PendingTs pending = pending_ts_.front();
+    pending_ts_.erase(pending_ts_.begin());
+    runtime_->spawn(ts_reply_to(pending.reply_to, pending.client, pending.seq, kOk, first,
+                                count, NodeId{}));
+  });
+  oracle_driver_ = std::make_unique<raft::RaftDriver>(
+      runtime_, transport_.get(), GroupId{kOracleGroup}, self_, options_.raft,
+      options_.durability, raft::Config::from_conf_state(placement_conf),
+      oracle_machine_.get(), DeterministicRandom{rng_.next_u64()});
+  oracle_driver_->set_external_ticks(true);
+
   runtime_->spawn(placement_driver_->boot());
+  runtime_->spawn(oracle_driver_->boot());
   runtime_->spawn(tick_loop());
   runtime_->spawn(reconcile_loop());
   runtime_->spawn(maintain_loop());
@@ -145,6 +167,7 @@ Task<void> ShardStore::tick_loop() {
     // to be able to reach at any moment, and a topology that has to be woken up
     // before it can answer is a topology nobody can read during an incident.
     if (placement_driver_ != nullptr) co_await placement_driver_->tick_now();
+    if (oracle_driver_ != nullptr) co_await oracle_driver_->tick_now();
 
     // Snapshotted first: ticking a group can create or retire another one, and
     // mutating the map being iterated across a suspension is the coroutine form
@@ -389,6 +412,33 @@ void ShardStore::create_group(const RangeDescriptor& desc, bool initialised) {
         }
         runtime_->spawn(reply_to(pending.reply_to, reply));
       });
+
+  machine->set_txn_callback([this, id](LogIndex index, const txn::TxnCommand& command,
+                                      const txn::TxnResult& result) {
+    (void)command;
+    // Every replica applies this; only the one that proposed the entry at this
+    // exact log index has a pending reply for it. Matched by (range, index),
+    // not by draining whatever this node happens to have outstanding for the
+    // range -- see the comment on pending_txn_ in store.h for why apply order
+    // is not derivable from client id or sequence number.
+    const auto it = pending_txn_.find({id.value(), index.value()});
+    if (it == pending_txn_.end()) return;
+    const PendingTxn pending = it->second;
+    pending_txn_.erase(it);
+
+    TxnReply reply;
+    reply.client = pending.client;
+    reply.seq = pending.seq;
+    reply.status = kOk;
+    reply.range = id;
+    reply.result = result;
+    reply.applied_index = index.value();
+    const auto replica = ranges_.find(id.value());
+    if (replica != ranges_.end() && replica->second.machine != nullptr) {
+      reply.generation = replica->second.machine->descriptor().generation;
+    }
+    runtime_->spawn(txn_reply_to(pending.reply_to, reply));
+  });
 
   RangeReplica replica;
   replica.machine = std::move(machine);
@@ -668,7 +718,7 @@ void ShardStore::maintain_range(RangeId id) {
         cmd.start = right_desc.start;
         cmd.end = right_desc.end;
         cmd.generation = topo->generation + 1;
-        cmd.payload = right->second.machine->payload();
+        cmd.payload = right->second.machine->encode_span(std::string_view{}, std::string_view{});
         LogIndex assigned{};
         if (replica.driver->propose(encode_range_command(cmd), &assigned).is_ok()) {
           ++stats_.merges_executed;
@@ -882,6 +932,16 @@ void ShardStore::handle_request(const Message& envelope) {
   if (p >= limit) return;
   const auto type = static_cast<std::uint8_t>(*p++);
 
+  if (type == 5) {
+    handle_ts_request(envelope, std::string_view{p, static_cast<std::size_t>(limit - p)});
+    return;
+  }
+
+  if (type == 3 || type == 4) {
+    handle_txn_request(envelope, std::string_view{p, static_cast<std::size_t>(limit - p)});
+    return;
+  }
+
   if (type == 2) {
     // An admin proposal forwarded by another node. Accepted only here, on the
     // placement leader, and dropped otherwise: forwarding it again would build
@@ -1041,6 +1101,398 @@ void ShardStore::handle_request(const Message& envelope) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// the timestamp oracle
+// ---------------------------------------------------------------------------
+
+Task<bool> ShardStore::reserve_timestamps(std::uint64_t count, txn::Ts* first) {
+  if (oracle_driver_ == nullptr || !oracle_driver_->ready()) co_return false;
+  // A freshly-elected leader that has not finished replaying its own log does
+  // not yet know the true high-water mark -- ready() only means booted, not
+  // caught up. This is the same guard maintain_range() already applies before
+  // treating a range's leadership as usable (ANV-0048's shape); the oracle
+  // group needs it just as much, and serving a reservation from a stale
+  // state_.high_water hands out a timestamp the previous leader already gave
+  // to somebody else, which is exactly what INV-TXN-09 exists to catch.
+  const bool leader = oracle_driver_->node().role() == raft::Role::kLeader;
+  if (leader && oracle_driver_->node().log().applied_index() <
+                    oracle_driver_->node().log().commit_index()) {
+    co_return false;
+  }
+
+  const std::uint64_t seq = next_ts_seq_++;
+  ts_inbox_[seq] = TsWaiter{};
+
+  if (leader) {
+    PendingTs pending;
+    pending.reply_to = self_;
+    pending.client = self_.value();
+    pending.seq = seq;
+    pending.count = count;
+    pending_ts_.push_back(pending);
+    LogIndex assigned{};
+    if (!oracle_driver_->propose(txn::encode_reservation(count), &assigned).is_ok()) {
+      pending_ts_.pop_back();
+      ts_inbox_.erase(seq);
+      co_return false;
+    }
+  } else {
+    const NodeId leader = oracle_driver_->node().leader();
+    if (!leader.valid()) {
+      ts_inbox_.erase(seq);
+      co_return false;
+    }
+    std::string out;
+    out.push_back(5);
+    lsm::put_varint64(&out, self_.value());
+    lsm::put_varint64(&out, seq);
+    lsm::put_varint64(&out, count);
+    co_await transport_->send_envelope(
+        make_envelope(self_, leader, MessageKind::kClientRequest, out));
+  }
+
+  const Timestamp deadline = runtime_->now().advanced_by(Duration::millis(1500));
+  while (runtime_->now() < deadline) {
+    co_await runtime_->sleep_for(Duration::millis(5));
+    const auto it = ts_inbox_.find(seq);
+    if (it == ts_inbox_.end()) break;
+    if (!it->second.answered) continue;
+    const bool ok = it->second.status == kOk;
+    *first = it->second.first;
+    ts_inbox_.erase(it);
+    co_return ok;
+  }
+  ts_inbox_.erase(seq);
+  co_return false;
+}
+
+void ShardStore::handle_ts_request(const Message& envelope, std::string_view body) {
+  const char* p = body.data();
+  const char* limit = p + body.size();
+  std::uint64_t client = 0;
+  std::uint64_t seq = 0;
+  std::uint64_t count = 0;
+  p = lsm::get_varint64(p, limit, &client);
+  if (p == nullptr) return;
+  p = lsm::get_varint64(p, limit, &seq);
+  if (p == nullptr) return;
+  p = lsm::get_varint64(p, limit, &count);
+  if (p == nullptr) return;
+
+  if (oracle_driver_ == nullptr || !oracle_driver_->ready() ||
+      oracle_driver_->node().role() != raft::Role::kLeader ||
+      oracle_driver_->node().log().applied_index() <
+          oracle_driver_->node().log().commit_index()) {
+    const NodeId hint =
+        oracle_driver_ == nullptr ? NodeId{} : oracle_driver_->node().leader();
+    runtime_->spawn(ts_reply_to(envelope.from, client, seq, kNotLeader, 0, 0, hint));
+    return;
+  }
+
+  PendingTs pending;
+  pending.reply_to = envelope.from;
+  pending.client = client;
+  pending.seq = seq;
+  pending.count = count;
+  pending_ts_.push_back(pending);
+  LogIndex assigned{};
+  if (!oracle_driver_->propose(txn::encode_reservation(count), &assigned).is_ok()) {
+    pending_ts_.pop_back();
+    runtime_->spawn(ts_reply_to(envelope.from, client, seq, kNotLeader, 0, 0, NodeId{}));
+  }
+}
+
+Task<void> ShardStore::ts_reply_to(NodeId to, std::uint64_t client, std::uint64_t seq,
+                                   std::uint8_t status, txn::Ts first, std::uint64_t count,
+                                   NodeId hint) {
+  std::string out;
+  out.push_back(static_cast<char>(0xF7));
+  lsm::put_varint64(&out, client);
+  lsm::put_varint64(&out, seq);
+  out.push_back(static_cast<char>(status));
+  lsm::put_varint64(&out, first);
+  lsm::put_varint64(&out, count);
+  lsm::put_varint64(&out, hint.value());
+  if (to == self_) {
+    // The oracle leader asking itself. Delivering through the transport would
+    // work in the simulator and is a lie: a node does not send itself a packet,
+    // and pretending it does adds a network round trip to every timestamp on
+    // whichever node happens to be the leader.
+    handle_ts_reply(std::string_view{out.data() + 1, out.size() - 1});
+    co_return;
+  }
+  co_await transport_->send_envelope(make_envelope(self_, to, MessageKind::kClientReply, out));
+}
+
+void ShardStore::handle_ts_reply(std::string_view body) {
+  const char* p = body.data();
+  const char* limit = p + body.size();
+  std::uint64_t client = 0;
+  std::uint64_t seq = 0;
+  txn::Ts first = 0;
+  std::uint64_t count = 0;
+  std::uint64_t hint = 0;
+  p = lsm::get_varint64(p, limit, &client);
+  if (p == nullptr) return;
+  p = lsm::get_varint64(p, limit, &seq);
+  if (p == nullptr) return;
+  if (p >= limit) return;
+  const auto status = static_cast<std::uint8_t>(*p++);
+  p = lsm::get_varint64(p, limit, &first);
+  if (p == nullptr) return;
+  p = lsm::get_varint64(p, limit, &count);
+  if (p == nullptr) return;
+  p = lsm::get_varint64(p, limit, &hint);
+  if (p == nullptr) return;
+
+  const auto it = ts_inbox_.find(seq);
+  if (it == ts_inbox_.end()) return;
+  it->second.answered = true;
+  it->second.status = status;
+  it->second.first = first;
+  it->second.count = count;
+}
+
+// ---------------------------------------------------------------------------
+// the transactional path
+// ---------------------------------------------------------------------------
+
+bool ShardStore::locate(std::string_view key, RangeDescriptor* out) {
+  if (cache_.lookup(key, out)) return true;
+  return cache_.resolve(topology_machine_->state().meta, key, out);
+}
+
+Task<Status> ShardStore::send_txn(TxnRequest request, NodeId to) {
+  std::string out;
+  out.push_back(request.read ? 4 : 3);
+  lsm::put_varint64(&out, request.client);
+  lsm::put_varint64(&out, request.seq);
+  lsm::put_varint64(&out, request.range.value());
+  lsm::put_varint64(&out, request.generation);
+  if (request.read) {
+    lsm::put_length_prefixed(&out, request.key);
+    lsm::put_varint64(&out, request.read_ts);
+    lsm::put_varint64(&out, request.uncertainty_limit);
+    lsm::put_varint64(&out, request.reader);
+  } else {
+    lsm::put_length_prefixed(&out, txn::encode_txn_command(request.command));
+  }
+  co_return co_await transport_->send_envelope(
+      make_envelope(self_, to, MessageKind::kClientRequest, out));
+}
+
+void ShardStore::handle_txn_request(const Message& envelope, std::string_view body) {
+  const char* p = body.data();
+  const char* limit = p + body.size();
+  TxnReply reply;
+  std::uint64_t range_id = 0;
+  p = lsm::get_varint64(p, limit, &reply.client);
+  if (p == nullptr) return;
+  p = lsm::get_varint64(p, limit, &reply.seq);
+  if (p == nullptr) return;
+  p = lsm::get_varint64(p, limit, &range_id);
+  if (p == nullptr) return;
+  std::uint64_t generation = 0;
+  p = lsm::get_varint64(p, limit, &generation);
+  if (p == nullptr) return;
+  reply.range = RangeId{range_id};
+  ++stats_.client_requests;
+
+  // Which of the two shapes follows is in the type byte the dispatcher already
+  // consumed, so it is re-read from the original payload rather than guessed at
+  // from the length. Deciding by length works until the day a field grows.
+  const std::string_view whole = payload_view(envelope);
+  const bool is_read = !whole.empty() && static_cast<std::uint8_t>(whole.front()) == 4;
+
+  const auto it = ranges_.find(range_id);
+  if (it == ranges_.end() || it->second.driver == nullptr || !it->second.driver->ready()) {
+    reply.status = kWrongRange;
+    const RangeDescriptor* topo = topology_descriptor(RangeId{range_id});
+    if (topo != nullptr) {
+      reply.generation = topo->generation;
+      reply.leader_hint = topo->lease.holder;
+    }
+    ++stats_.client_wrong_range;
+    runtime_->spawn(txn_reply_to(envelope.from, reply));
+    return;
+  }
+
+  RangeReplica& replica = it->second;
+  RangeMachine& machine = *replica.machine;
+  reply.generation = machine.descriptor().generation;
+  if (replica.quiesced) {
+    replica.quiesced = false;
+    replica.idle_ticks = 0;
+    ++stats_.wakeups;
+  }
+
+  if (is_read) {
+    std::string_view key;
+    txn::Ts read_ts = 0;
+    txn::Ts uncertainty = 0;
+    txn::TxnId reader = 0;
+    p = lsm::get_length_prefixed(p, limit, &key);
+    if (p == nullptr) return;
+    p = lsm::get_varint64(p, limit, &read_ts);
+    if (p == nullptr) return;
+    p = lsm::get_varint64(p, limit, &uncertainty);
+    if (p == nullptr) return;
+    p = lsm::get_varint64(p, limit, &reader);
+    if (p == nullptr) return;
+
+    // A snapshot read is served locally, under the lease, by a replica that has
+    // applied everything it knows is committed. Both conditions, for the reason
+    // ANV-0048 records: the lease is durable and comes back with a restarted
+    // node while its state machine is still catching up.
+    const std::uint64_t now = runtime_->now().physical;
+    const bool caught_up = replica.driver->node().log().applied_index() >=
+                           replica.driver->node().log().commit_index();
+    if (!machine.lease_valid(self_, now) || !machine.initialised() || !caught_up) {
+      reply.status = kNotLeader;
+      reply.leader_hint = machine.descriptor().lease.holder;
+      ++stats_.client_not_leader;
+      runtime_->spawn(txn_reply_to(envelope.from, reply));
+      return;
+    }
+    if (!machine.descriptor().contains(key) ||
+        (generation != 0 && generation != machine.descriptor().generation)) {
+      reply.status = kWrongRange;
+      ++stats_.client_wrong_range;
+      runtime_->spawn(txn_reply_to(envelope.from, reply));
+      return;
+    }
+    reply.status = kOk;
+    reply.read = machine.txn_store().get(key, read_ts, reader, uncertainty);
+    reply.applied_index = replica.driver->node().log().applied_index().value();
+    ++stats_.reads_served;
+    runtime_->spawn(txn_reply_to(envelope.from, reply));
+    return;
+  }
+
+  std::string_view encoded;
+  p = lsm::get_length_prefixed(p, limit, &encoded);
+  if (p == nullptr) return;
+  txn::TxnCommand command;
+  if (!txn::decode_txn_command(encoded, &command)) return;
+
+  if (replica.driver->node().role() != raft::Role::kLeader) {
+    reply.status = kNotLeader;
+    reply.leader_hint = replica.driver->node().leader();
+    ++stats_.client_not_leader;
+    runtime_->spawn(txn_reply_to(envelope.from, reply));
+    return;
+  }
+  if (machine.frozen() || !machine.initialised()) {
+    reply.status = kUnavailable;
+    runtime_->spawn(txn_reply_to(envelope.from, reply));
+    return;
+  }
+
+  RangeCommand entry;
+  entry.op = RangeOp::kTxn;
+  entry.from = command.key;
+  entry.generation = generation;
+  entry.txn_command = std::string{encoded};
+
+  LogIndex assigned{};
+  if (!replica.driver->propose(encode_range_command(entry), &assigned).is_ok()) {
+    reply.status = kNotLeader;
+    reply.leader_hint = replica.driver->node().leader();
+    ++stats_.client_not_leader;
+    runtime_->spawn(txn_reply_to(envelope.from, reply));
+    return;
+  }
+
+  // Keyed by the index this exact proposal was assigned, known only now that
+  // propose() has returned it -- see the comment on pending_txn_ in store.h.
+  PendingTxn pending;
+  pending.reply_to = envelope.from;
+  pending.client = reply.client;
+  pending.seq = reply.seq;
+  pending.range = RangeId{range_id};
+  pending_txn_[{range_id, assigned.value()}] = pending;
+}
+
+Task<void> ShardStore::txn_reply_to(NodeId to, TxnReply reply) {
+  std::string out;
+  out.push_back(static_cast<char>(0xF6));
+  lsm::put_varint64(&out, reply.client);
+  lsm::put_varint64(&out, reply.seq);
+  out.push_back(static_cast<char>(reply.status));
+  lsm::put_varint64(&out, reply.range.value());
+  lsm::put_varint64(&out, reply.generation);
+  lsm::put_varint64(&out, reply.leader_hint.value());
+  lsm::put_varint64(&out, reply.applied_index);
+  lsm::put_length_prefixed(&out, txn::encode_txn_result(reply.result));
+  out.push_back(static_cast<char>(reply.read.status));
+  out.push_back(reply.read.found ? 1 : 0);
+  lsm::put_length_prefixed(&out, reply.read.value);
+  lsm::put_varint64(&out, reply.read.commit_ts);
+  lsm::put_varint64(&out, reply.read.blocker);
+  lsm::put_varint32(&out, reply.read.blocker_epoch);
+  lsm::put_varint64(&out, reply.read.blocker_start);
+  lsm::put_length_prefixed(&out, reply.read.blocker_primary);
+  lsm::put_varint64(&out, reply.read.uncertain_at);
+  co_await transport_->send_envelope(make_envelope(self_, to, MessageKind::kClientReply, out));
+}
+
+void ShardStore::handle_txn_reply(std::string_view body) {
+  const char* p = body.data();
+  const char* limit = p + body.size();
+  TxnReply reply;
+  p = lsm::get_varint64(p, limit, &reply.client);
+  if (p == nullptr) return;
+  p = lsm::get_varint64(p, limit, &reply.seq);
+  if (p == nullptr) return;
+  if (p >= limit) return;
+  reply.status = static_cast<std::uint8_t>(*p++);
+  std::uint64_t range_id = 0;
+  p = lsm::get_varint64(p, limit, &range_id);
+  if (p == nullptr) return;
+  reply.range = RangeId{range_id};
+  p = lsm::get_varint64(p, limit, &reply.generation);
+  if (p == nullptr) return;
+  std::uint64_t hint = 0;
+  p = lsm::get_varint64(p, limit, &hint);
+  if (p == nullptr) return;
+  reply.leader_hint = NodeId{hint};
+  p = lsm::get_varint64(p, limit, &reply.applied_index);
+  if (p == nullptr) return;
+  std::string_view result;
+  p = lsm::get_length_prefixed(p, limit, &result);
+  if (p == nullptr) return;
+  if (!txn::decode_txn_result(result, &reply.result)) return;
+  if (p + 2 > limit) return;
+  const auto read_status = static_cast<std::uint8_t>(*p++);
+  if (read_status > static_cast<std::uint8_t>(txn::ReadStatus::kUnavailable)) return;
+  reply.read.status = static_cast<txn::ReadStatus>(read_status);
+  reply.read.found = *p++ != 0;
+  std::string_view value;
+  p = lsm::get_length_prefixed(p, limit, &value);
+  if (p == nullptr) return;
+  reply.read.value.assign(value);
+  p = lsm::get_varint64(p, limit, &reply.read.commit_ts);
+  if (p == nullptr) return;
+  p = lsm::get_varint64(p, limit, &reply.read.blocker);
+  if (p == nullptr) return;
+  p = lsm::get_varint32(p, limit, &reply.read.blocker_epoch);
+  if (p == nullptr) return;
+  p = lsm::get_varint64(p, limit, &reply.read.blocker_start);
+  if (p == nullptr) return;
+  std::string_view primary;
+  p = lsm::get_length_prefixed(p, limit, &primary);
+  if (p == nullptr) return;
+  reply.read.blocker_primary.assign(primary);
+  p = lsm::get_varint64(p, limit, &reply.read.uncertain_at);
+  if (p == nullptr) return;
+
+  if (reply.status == kWrongRange) {
+    cache_.note_stale_rejection();
+    cache_.invalidate(reply.range);
+  }
+  if (on_txn_reply_) on_txn_reply_(reply);
+}
+
 Task<void> ShardStore::reply_to(NodeId to, Reply reply) {
   std::string out;
   lsm::put_varint64(&out, reply.client);
@@ -1058,6 +1510,17 @@ void ShardStore::handle_reply(const Message& envelope) {
   const std::string_view view = payload_view(envelope);
   const char* p = view.data();
   const char* limit = p + view.size();
+  if (p < limit && static_cast<std::uint8_t>(*p) == 0xF7) {
+    handle_ts_reply(std::string_view{p + 1, static_cast<std::size_t>(limit - p - 1)});
+    return;
+  }
+  if (p < limit && static_cast<std::uint8_t>(*p) == 0xF6) {
+    // A transactional reply. Tagged rather than inferred from length, because
+    // "whatever does not parse as the other one" is a decoder that silently
+    // hands a client somebody else's answer the first time a field grows.
+    handle_txn_reply(std::string_view{p + 1, static_cast<std::size_t>(limit - p - 1)});
+    return;
+  }
   Reply reply;
   p = lsm::get_varint64(p, limit, &reply.client);
   if (p == nullptr) return;
