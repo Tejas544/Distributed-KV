@@ -172,6 +172,28 @@ class RaftNode {
   Timestamp lease_expiry() const noexcept { return lease_expiry_; }
   bool lease_valid(Timestamp now) const;
 
+  // Whether this node's local state is authoritative enough to answer from
+  // without a round trip.
+  //
+  // The condition every caller reached for before this existed -- `applied >=
+  // commit` -- is not sufficient on its own, and the reason survived two
+  // fixes already (ANV-0041, ANV-0048). The commit index *is* durable, but
+  // only as far as the last hard-state fsync: a node can crash having
+  // committed and applied index 4 in memory while the disk still says
+  // commit = 2. It recovers with commit = 2, replays to applied = 2, and
+  // reports `applied >= commit` -- perfectly true, and perfectly useless,
+  // because entries 3 and 4 are committed on the cluster and this node has
+  // not heard of them yet. Every guard built on that comparison alone is
+  // satisfied by a node that is genuinely behind.
+  //
+  // What closes it is Raft's own leader-completeness property: a candidate
+  // can only win with a log at least as up to date as a quorum, so a
+  // *leader* that has committed an entry in its own term necessarily holds
+  // every entry committed before it. That is the standard read-index
+  // precondition, and establishing it is exactly what the no-op appended in
+  // become_leader is for.
+  bool can_serve_local_reads() const;
+
   // Monotonic, bumped by every state mutation. The checker uses it to skip
   // nodes that cannot have changed, which is what keeps a tick-class predicate
   // over the whole cluster affordable.

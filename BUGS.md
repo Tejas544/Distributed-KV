@@ -675,6 +675,50 @@ lesson: |
 ```
 </details>
 
+<details>
+<summary><b>ANV-0051</b> · S2 · shard · <b>the client's read-freshness check compared concurrent reads as if they were sequential, and hid a real bug behind the false one</b></summary>
+
+```yaml
+id:              ANV-0051
+title:           INV-SHARD-CLIENT measured a read against the high-water mark at completion time, not at invocation
+status:          fixed
+severity:        S2
+class:           test-infra
+layer:           shard
+invariant:       INV-SHARD-CLIENT
+found_by:        dst-random
+api_visible:     no -- the finding itself was not real
+seed:            19, with faults (reproduces on the committed tree at de8f445)
+root_cause: |
+  The workload kept one high-water mark per range in shared state, updated when
+  a reply was processed, and asserted every read came back at or above it. That
+  is a real-time property and the comparison was not: two clients read the same
+  range, one is served at index 17 and the other at 18, the 18 completes first
+  because its reply took a shorter path, and the 17 is then reported as a read
+  going backwards. Neither client ever saw an inversion -- the 17 was served
+  before the 18 existed. Under fault injection that reordering is not an edge
+  case, it is the point of the harness.
+fix_commit:      P6
+regression:      test/corpus/ANV-0051.seed
+lesson: |
+  Two lessons, and the second is the expensive one.
+
+  The check now captures the bar when the read is *invoked* and compares
+  against that; a read that overlaps another is unconstrained, which is what
+  linearizability actually says. "Never returns state older than one already
+  returned" is a property of reads ordered in real time, and the code said
+  "already returned to anyone, ever".
+
+  The second: the simulator stops at the first invariant violation, so for the
+  whole of P5 seed 19 stopped at tick 4395 and nothing after it ever ran. The
+  false positive was not merely noise, it was a lid. Removing it exposed a
+  genuine convergence failure on the same seed that had been sitting there,
+  unreachable, since the phase was called done. ANV-0040 said a manufactured
+  finding costs a day and teaches nothing -- this one also cost every bug
+  downstream of it.
+```
+</details>
+
 <details open>
 <summary><b>ANV-0001</b> · S4 · sim · <b>the scheduler silently discarded one event at every deadline</b></summary>
 

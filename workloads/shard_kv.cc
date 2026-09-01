@@ -145,6 +145,24 @@ Task<void> client_loop(Runtime& rt, ShardKvConfig cfg, ShardKvState* state, Node
     }
 
     current->reply_pending = false;
+
+    // The freshness bar this read has to clear, read *now* rather than when the
+    // reply is processed. The property INV-SHARD-CLIENT states is a real-time
+    // one -- a read invoked after another completed may not come back from
+    // further behind -- and it says nothing whatsoever about two reads that
+    // overlap. Comparing against the mark at completion time silently treats
+    // concurrent reads as sequential: two clients read the same range, one is
+    // served at index 17 and the other at 18, the 18 completes first because
+    // its reply took a shorter path, and the 17 is then reported as a read
+    // going backwards when in fact it was issued before the 18 was served and
+    // no client ever saw an inversion. Under fault injection that reordering
+    // is not an edge case, it is the point. Capturing the bar at invocation is
+    // what makes the comparison a statement about real time again (ANV-0040's
+    // lesson, in the workload rather than the checker: a manufactured finding
+    // costs a day and teaches nothing).
+    const std::uint64_t read_bar = state->read_high_water[route.range.value()];
+    const RangeId read_range = route.range;
+
     co_await current->store->send_request(current->pending, route);
 
     const Timestamp deadline = rt.now().advanced_by(cfg.client_timeout);
@@ -179,15 +197,17 @@ Task<void> client_loop(Runtime& rt, ShardKvConfig cfg, ShardKvState* state, Node
         // the whole point of the lease is that its holder has applied
         // everything any previous holder served.
         auto& mark = state->read_high_water[reply.range.value()];
-        if (reply.applied_index < mark) {
+        // Only against the bar captured when this read was invoked, and only
+        // when the reply came from the range it was sent to -- a redirect
+        // answers for a different range and the two bars are not comparable.
+        if (reply.range == read_range && reply.applied_index < read_bar) {
           ++state->stale_lease_reads;
           state->violations.push_back(
               "a lease read of r" + std::to_string(reply.range.value()) + " came back at index " +
               std::to_string(reply.applied_index) + " after one at index " +
-              std::to_string(mark));
-        } else {
-          mark = reply.applied_index;
+              std::to_string(read_bar) + " had already completed");
         }
+        if (reply.applied_index > mark) mark = reply.applied_index;
       } else {
         AckedOp op;
         op.op_id = n->pending.op_id;

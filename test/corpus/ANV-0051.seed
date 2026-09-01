@@ -1,0 +1,17 @@
+# ANV-0051 -- the read-freshness check compared concurrent reads as sequential
+# two clients read r3; one is served at applied=17 and the other at 18, the 18
+# completes first, and the 17 is then reported as a read going backwards
+seed        = 19
+workload    = shard_kv
+nodes       = 5
+faults      = drawn from seed; requires reply reordering between two clients
+invariant   = INV-SHARD-CLIENT
+reproduce   = anvil_shard_faults 20
+note        = the same seed as ANV-0048, and the same invariant, which is why
+              this survived a phase: the failure looked like the bug that was
+              already fixed. It is not. The fix captures the high-water bar at
+              invocation rather than at completion, so overlapping reads are
+              unconstrained -- which is what the real-time property actually
+              says. Removing this false positive is what let seed 19 run past
+              tick 4395 for the first time, exposing a genuine convergence
+              failure underneath it (see CONTEXT.md section 14).

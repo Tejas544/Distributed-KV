@@ -1023,15 +1023,28 @@ void ShardStore::handle_request(const Message& envelope) {
     // Served locally under the lease, which is the only reason the lease exists.
     // Without a valid one this node cannot know that a newer leader has not
     // already served a write it has not seen.
-    // A valid lease is not enough. The holder must also have applied everything
-    // it knows is committed, and the case that makes this necessary is a
-    // restart: the lease is in the durable log, so it comes back with the node,
-    // and the node comes back with its state machine at the last snapshot and
-    // its applied index climbing again. Serving in that window returns state
-    // from before entries the *previous* holder had already served, which is a
-    // read going backwards in real time with a perfectly valid lease behind it
-    // (ANV-0048). The same condition covers a leader that has just been elected
-    // and has committed entries it has not yet applied.
+    // A valid lease is not enough. The holder must also actually hold the
+    // state the lease entitles it to serve, and the case that makes this
+    // necessary is a restart: the lease is in the durable log, so it comes
+    // back with the node, and the node comes back with its state machine at
+    // the last snapshot and its applied index climbing again. Serving in that
+    // window returns state from before entries the *previous* holder had
+    // already served, which is a read going backwards in real time with a
+    // perfectly valid lease behind it (ANV-0048). The same condition covers a
+    // leader that has just been elected and has committed entries it has not
+    // yet applied.
+    //
+    // Note that `applied >= commit` is weaker than it looks -- a node whose
+    // durable commit index lagged its in-memory one at the moment of the crash
+    // recovers with a smaller commit index, replays to meet it, and reports
+    // itself caught up while entries committed on the cluster are still
+    // unknown to it. RaftNode::can_serve_local_reads() is the condition that
+    // closes that gap, and it is deliberately NOT used here: the lease grant
+    // is itself a log entry, so a holder has applied the entry that made it
+    // holder, which already orders it after everything the previous holder
+    // could have served. The stronger condition was measured against this path
+    // and bought no finding, at the cost of refusing reads on any leaseholder
+    // that is not also the Raft leader.
     const bool caught_up = replica.driver->node().log().applied_index() >=
                            replica.driver->node().log().commit_index();
     if (!machine.lease_valid(self_, now) || !machine.initialised() || !caught_up) {
@@ -1107,18 +1120,17 @@ void ShardStore::handle_request(const Message& envelope) {
 
 Task<bool> ShardStore::reserve_timestamps(std::uint64_t count, txn::Ts* first) {
   if (oracle_driver_ == nullptr || !oracle_driver_->ready()) co_return false;
-  // A freshly-elected leader that has not finished replaying its own log does
-  // not yet know the true high-water mark -- ready() only means booted, not
-  // caught up. This is the same guard maintain_range() already applies before
-  // treating a range's leadership as usable (ANV-0048's shape); the oracle
-  // group needs it just as much, and serving a reservation from a stale
-  // state_.high_water hands out a timestamp the previous leader already gave
-  // to somebody else, which is exactly what INV-TXN-09 exists to catch.
+  // No catch-up guard here, deliberately, and the reasoning is worth keeping
+  // because the guard looks obviously necessary and is not. A reservation is
+  // not answered from local state: it is *proposed*, and the number it yields
+  // is computed in OracleMachine::apply from whatever the log says at the
+  // moment that entry applies. A leader that is behind cannot apply its own
+  // proposal before catching up -- Raft will not commit it until the leader
+  // holds everything committed before it -- so a stale high-water mark cannot
+  // reach a client through this path however far behind the proposer is.
+  // Adding the guard costs availability (a whole reservation round trip
+  // refused) to buy nothing, which is how a system ends up slow *and* no safer.
   const bool leader = oracle_driver_->node().role() == raft::Role::kLeader;
-  if (leader && oracle_driver_->node().log().applied_index() <
-                    oracle_driver_->node().log().commit_index()) {
-    co_return false;
-  }
 
   const std::uint64_t seq = next_ts_seq_++;
   ts_inbox_[seq] = TsWaiter{};
@@ -1180,9 +1192,7 @@ void ShardStore::handle_ts_request(const Message& envelope, std::string_view bod
   if (p == nullptr) return;
 
   if (oracle_driver_ == nullptr || !oracle_driver_->ready() ||
-      oracle_driver_->node().role() != raft::Role::kLeader ||
-      oracle_driver_->node().log().applied_index() <
-          oracle_driver_->node().log().commit_index()) {
+      oracle_driver_->node().role() != raft::Role::kLeader) {
     const NodeId hint =
         oracle_driver_ == nullptr ? NodeId{} : oracle_driver_->node().leader();
     runtime_->spawn(ts_reply_to(envelope.from, client, seq, kNotLeader, 0, 0, hint));

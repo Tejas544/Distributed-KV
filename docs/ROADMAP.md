@@ -276,13 +276,26 @@ it (money went missing under contention from two coordinators, no fault
 needed), and a merge trigger that carried only the bank half of the subsumed
 range's state, discarding every transaction the merged-away range was holding.
 The fault-free money-loss finding this section used to describe as open is
-now fixed and confirmed by direct minimal-repro experiment. What remains under
-full fault injection looks like a single shared Raft-layer issue -- an oracle
-high-water mark that goes backwards after a crash and leadership change, and
-(found while sanity-checking the fixes against plain P5) the exact ANV-0048
-corpus regression seed still failing the same way in `shard_faults`, with no
-P6 code involved at all. See [CONTEXT.md §14](../CONTEXT.md) for the full
-account. None of this is committed yet.
+now fixed and confirmed by direct minimal-repro experiment.
+
+Since then both remaining "Raft-layer" suspicions turned out to be checkers
+measuring the wrong thing, and fixing them is what moved the phase. INV-TXN-09
+compared a replica's oracle high-water mark across a crash in a window where
+`applied >= commit` is true of a node that is genuinely behind; INV-SHARD-CLIENT
+([ANV-0051](../BUGS.md), the first ledger row of this pass) compared concurrent
+reads as though they were sequential. The second mattered far beyond its own
+false positive: the simulator halts at the first violation, so that check had
+been capping every run of P5 seed 19 at tick 4395 since the phase was called
+done. With it gone the seed runs on and exposes a real convergence failure --
+a range no replica ever initialises, whose accounts the audit cannot reach.
+
+That convergence bug is now the top blocker, and it is a P5 bug, not a P6 one:
+every remaining `txn_faults` seed that reports missing money also reports
+`converged=no`, and the shortfall is whole unreachable accounts rather than
+partial transfers. Green today: mechanism suite 30/30, determinism 3/3,
+serializable and strict-serializable 4/4 checker-clean, INV-TXN-02 and
+INV-TXN-09 silent. See [CONTEXT.md §14](../CONTEXT.md) for the full account.
+None of this is committed yet.
 
 **Goal.** The guarantee matrix from [SCOPE.md §2](SCOPE.md#2-guarantee-matrix), all three levels, one interface.
 

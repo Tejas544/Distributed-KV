@@ -312,8 +312,8 @@ planting a bug.
 | **P2 LSM engine** | **done except benchmarks** | Benchmark criterion blocked on `ProdRuntime` |
 | **P3 Raft** | **done, one open finding** | 16 `INV-RAFT-*` armed; 9/10 drill + 1 targeted. ANV-0032 (a learner stops converging on seed 14) is open and the gate is red on it |
 | **P4 MVCC + transactions** | **done** | 8 `INV-MVCC-*` armed; snapshot isolation confirmed against the checker at two levels; whole sweep runs in <1s |
-| **P5 sharding** | **done, one new finding since** | MultiRaft, one Raft group per range; 9 `INV-SHARD-*` armed; 17 ledger rows, 6 of them S0. Re-running `shard_faults` while verifying an unrelated P6 fix found seed 19 -- the ANV-0048 corpus regression seed -- tripping `INV-SHARD-CLIENT` again on the current tree; not caused by anything in this pass (confirmed by A/B rebuild), not yet root-caused. See §14 |
-| **P6 distributed transactions** | **in progress, two root causes fixed, two-and-one-shared open** | Percolator/SSI/StrictSerializable behind one `Coordinator`; 7 `INV-TXN-*` armed (01-04, 09, 11, 12); `anvil_txn_test` (30 mechanism checks) green. `anvil_txn_faults`: the fault-free money-loss finding is fixed and confirmed by direct repro (two independent bugs, both fixed); the full fault-injected sweep still fails on what looks like a shared Raft-layer issue -- see §14. Never committed as of this pass |
+| **P5 sharding** | **reopened: convergence bug, was hidden behind a checker bug** | MultiRaft, one Raft group per range; 9 `INV-SHARD-*` armed; 18 ledger rows, 6 of them S0. ANV-0051 (this pass) found INV-SHARD-CLIENT comparing concurrent reads as sequential -- and since the simulator halts on first violation, that false positive had been capping seed 19 at tick 4395 for the whole phase. With it gone the seed runs on and does not converge: a range no replica ever initialises, five accounts unreachable. See §14 |
+| **P6 distributed transactions** | **in progress, blocked on P5 convergence** | Percolator/SSI/StrictSerializable behind one `Coordinator`; 7 `INV-TXN-*` armed (01-04, 09, 11, 12). Green: `anvil_txn_test` 30/30, determinism 3/3, serializable and strict-serializable 4/4 checker-clean, INV-TXN-02 and INV-TXN-09 silent. The fault-free money-loss finding is fixed (two independent root causes, confirmed by minimal repro). What remains in the sweep is the P5 convergence bug above wearing P6's clothes -- money reported missing is money in an unreachable range. See §14. Never committed as of this pass |
 | P7+ | not started | Verification depth, the bug hunt at scale, prod runtime |
 
 ### Measured (see README results block)
@@ -1133,67 +1133,97 @@ own to lose an acknowledged commit with zero faults:
    Confirmed the same way: the split/merge repro that still lost money after
    fix 1 (with splits enabled) was clean across 3000 seeds after this fix too.
 
-A third change went in alongside these: `reserve_timestamps` and
-`handle_ts_request` only checked `oracle_driver_->ready()` before serving a
-reservation as leader, and `ready()` means booted, not caught up --
-`maintain_range` has always gated range leadership on `applied_index() >=
-commit_index()` for exactly this reason (ANV-0048's shape), and the oracle
-group never got the same guard. It is a real gap and the fix is correct, but
-**it did not change the one failure it was aimed at**: a full-sweep run
-(`txn_faults 30`) reproduces byte-for-byte identically, tick for tick, before
-and after this change, which means the guard's branch was not the one taken in
-that failure. That failure is now believed to be a different, deeper bug --
-see below.
+### Two checkers were measuring the wrong thing, and one of them was a lid
 
-### Still open: an oracle high-water regression under crash + leadership change, and a topology gap under aggressive churn
+The `commit_index()`-goes-backwards hypothesis recorded here previously was
+**wrong**, and disproving it produced the two findings that actually mattered.
+`RaftLog::commit_to` is monotonic and `restore()` re-establishes the commit
+index from the durable hard state, so the index never regresses within an
+incarnation. What *does* happen is subtler and is the shared cause of both
+findings below: the hard state is only as current as the last fsync, so a node
+that had committed and applied index 4 in memory can crash and recover with the
+disk saying commit = 2. It replays to exactly there and reports `applied >=
+commit` -- true, and meaningless, because entries 3 and 4 are committed on the
+cluster and it has not heard of them. **Every guard written as `applied >=
+commit` is satisfied by a node that is genuinely behind.**
 
-Two findings remain, found while confirming the two fixes above against the
-full `txn_faults` sweep (fault injection on, crashes allowed) rather than the
-fault-free minimal repro:
+`RaftNode::can_serve_local_reads()` ([raft.h](anvil/core/raft/raft.h)) is the
+condition that actually closes it -- leader, an entry from its own term
+committed, and everything committed applied -- resting on Raft's leader
+completeness rather than on an index comparison. Its header carries the full
+argument.
 
-- **`INV-TXN-09` fires for real, not as a checker false positive.** `txn_faults
-  30`, seed 4, snapshot-isolation and serializable both: "n1 had an oracle
-  high-water mark of 193 and now reports 65" at tick 9592. `OracleMachine::apply`
-  and `::restore` are both individually correct (verified by direct trace:
-  every replica applies each reservation exactly once, in order, with a
-  monotonic `high_water`), and the ready-but-not-caught-up guard above did not
-  change this failure at all. That leaves the log/commit-index bookkeeping
-  itself as the remaining suspect -- specifically whether `commit_index()` can
-  read back a smaller value after a leadership change than it read before, in
-  which case `applied_index() >= commit_index()` is satisfied by a node that
-  is genuinely behind rather than one that has caught up, and every guard
-  built on that comparison (this one, ANV-0048's, ANV-0041's) is checking the
-  wrong thing under this specific condition. Not yet confirmed; it is a
-  hypothesis, not a finding, until traced.
-- **`the audit could only reach N of M accounts`** (seeds 5, 6 in the same run)
-  is a genuine gap in the topology's key coverage under aggressive split/merge
-  churn combined with faults -- distinct from finding 2 above (which lost data
-  *within* an existing range's coverage; this loses the *coverage* itself).
-  Not yet traced past that description.
-- **A new, unrelated finding surfaced while sanity-checking fix 2 against pure
-  P5** (`shard_faults`, no transactions involved at all): seed 19 -- which is
-  the *exact* corpus regression seed already on file for ANV-0048 ("fixed",
-  P5) -- still trips `INV-SHARD-CLIENT` today ("a lease read of r3 came back
-  at index 17 after one at index 18", tick 4395). Confirmed by direct A/B
-  rebuild that this is unrelated to anything in this pass: it reproduces
-  identically whether the merge-trigger fix above is in or out. The code at
-  the read-serving site has both the ANV-0048 guard (`applied_index() >=
-  commit_index()`) and the ANV-0041 fix (log index, not machine index) present
-  and correct on inspection. Given it is the same seed on file for a
-  conceptually identical symptom, this is either a narrow gap the ANV-0048 fix
-  never actually closed, or the same `commit_index()` regression hypothesized
-  above wearing P5's clothes -- plausible, since a bug in shared Raft
-  bookkeeping would surface in both the oracle group and an ordinary range
-  group.
+3. **`INV-TXN-09` was a false positive, and the guard added for it in the
+   previous pass was the wrong guard.** The observer compared each replica's
+   oracle high-water mark against that replica's own past, skipping nodes that
+   failed `applied >= commit` -- which, per the above, skips nothing on exactly
+   the node that needs skipping. A replica's mark legitimately moves backwards
+   across a crash in that window, and it is safe precisely because Raft will
+   not elect a node missing committed entries, so it can never serve a
+   reservation from the stale mark. Gating the comparison on
+   `can_serve_local_reads()` keeps the property the invariant is named for and
+   drops the reading that was never a violation
+   ([txn_invariants.cc](anvil/checker/txn_invariants.cc)). INV-TXN-09 has been
+   silent across the sweep since.
+4. **`INV-SHARD-CLIENT` was a false positive too -- and it had been capping
+   every P5 run on its seed since the phase was called done.** This is
+   [ANV-0051](BUGS.md), the first ledger row of this pass, and it is bisectable
+   because it reproduces on the committed tree at `de8f445`. The workload kept
+   one high-water mark per range in *shared* state and asserted every read came
+   back at or above it, comparing against the mark **at completion time**. Two
+   clients read the same range, one is served at index 17 and the other at 18,
+   the 18's reply arrives first, and the 17 is reported as a read going
+   backwards -- though it was served before the 18 existed and no client ever
+   saw an inversion. Real-time freshness constrains reads that are *ordered* in
+   real time and says nothing about overlapping ones; the fix captures the bar
+   at invocation ([shard_kv.cc](workloads/shard_kv.cc)).
 
-All three point at the same place: something about `commit_index()` (or the
-log's view of it) after a leadership change, not anything specific to P6's new
-code. That makes this a Raft-layer question now, not a transactions-layer one,
-and it needs the same treatment already recommended and not yet done: a
-minimal repro (the P5-only `shard_faults` seed 19 is already smaller and
-faster than any P6 repro would be) and a debugger on `RaftNode`'s
-`commit_index`/`applied_index` transition across a term change, per gotcha
-10.17.
+   The expensive part is the second half. **The simulator stops at the first
+   invariant violation** (`scheduler.cc`, `break` on fired). Seed 19 had been
+   stopping at tick 4395 for the whole of P5, so nothing after that tick had
+   ever run on that seed. The false positive was not noise, it was a lid.
+   Confirmed by building the pristine tree at `de8f445` in a scratch worktree:
+   it reproduces the violation exactly (985 acked, tick 4395), and the same
+   tree with only the workload fix applied runs on and fails differently --
+   see below.
+
+### Open: the topology does not always converge, and that is now the top blocker
+
+With both false positives gone, the remaining failures in *both* sweeps have
+one shape, and it is a P5 shape rather than a P6 one:
+
+- `shard_faults` seed 19, which had never run past tick 4395 before:
+  `converged=no`, and the audit reaches 19 of 24 accounts. The five missing
+  accounts are not lost data -- they are a range the audit cannot reach,
+  because no replica of it ever became initialised. This is the ANV-0049
+  family (a split's right-hand side that cannot be initialised), which was
+  fixed once for the case where the new range's leader does not host the
+  parent; this is a residual case that fix does not cover.
+- `txn_faults` 30 seeds: the surviving bank failures are dominated by the same
+  thing. Every seed reporting money "missing" also reports `converged=no`, and
+  the shortfall matches whole accounts rather than partial transfers -- the
+  money is unreachable, not gone. `after healing: 5-6/8 seeds reached a
+  topology where every range has an initialised replica` says the same thing
+  from the other side, and that line predates P6.
+
+So the P6 exit criteria are now blocked on a P5 convergence bug rather than on
+anything transactional. What is genuinely clean: `serializable` and
+`strict-serializable` are 4/4 checker-clean, determinism is 3/3, INV-TXN-02 and
+INV-TXN-09 are silent, and the mechanism suite is 30/30.
+
+Still open beyond convergence, and smaller:
+- Two drill *controls* (`parallel commit`, `no commit-wait`) still fire. Both
+  are configuration changes rather than bugs, so a control that fires means the
+  harness is attributing a convergence failure to the mutation. Expected to
+  fall out with the convergence fix; worth re-checking rather than assuming.
+- `INV-TXN-02` fires on seed 8 in one of the two schedules tried (a record
+  going committed -> pending). It did not reproduce under the other, so it is
+  one seed deep and not yet characterised.
+
+Next step: `shard_faults 20`, seed 19, is now the smallest and fastest
+reproduction of the convergence bug -- pure P5, no transactions, and it fails
+in under two seconds. Trace which range never initialises and why its
+`kInit` proposal never lands, per gotcha 10.17.
 
 ---
 

@@ -69,23 +69,7 @@ void TxnObserver::refresh() {
     const shard::ShardStore* s = store(id);
     if (s == nullptr || s->oracle_driver() == nullptr) continue;
 
-    // A node that is alive but still recovering is *unknown*, not empty
-    // (gotcha 10.11 / ANV-0048's rule, applied to the oracle group). A crash
-    // destroys the OracleMachine along with the rest of the store; the
-    // replacement built on restart starts at high_water == kMinTs and only
-    // reaches its old value once the driver has replayed its own durable log
-    // back into it. `ready()` alone is not enough to say that has finished --
-    // it means "booted", and boot leaves entries for the driver's ordinary
-    // apply loop to catch up on afterwards -- so this also requires the
-    // applied index to have reached the commit index, the same condition
-    // ANV-0048 needed before trusting a just-restarted lease holder's state.
-    // Comparing a node that has not cleared that bar reports its own
-    // recovery as a timestamp being handed out twice, on every crash.
     if (!s->oracle_driver()->ready()) continue;
-    if (s->oracle_driver()->node().log().applied_index() <
-        s->oracle_driver()->node().log().commit_index()) {
-      continue;
-    }
 
     const txn::Ts high = s->oracle().high_water();
     if (high > oracle_high_water_) oracle_high_water_ = high;
@@ -99,10 +83,26 @@ void TxnObserver::refresh() {
     // reports replication lag as a timestamp regression, on every seed, in the
     // first second of every run.
     //
-    // The property that matters is that no replica's own view ever moves
-    // backwards -- which is what a re-issued timestamp after failover would
-    // look like, and what a snapshot restoring an older high-water mark would
-    // look like.
+    // And per node only while that node is *authoritative*, which is the half
+    // that took a second pass to get right. A replica's own high-water mark
+    // legitimately moves backwards across a crash: the commit index is durable
+    // only as far as the last hard-state fsync, so a node that had applied
+    // reservation 4 in memory can come back with the disk saying commit = 2,
+    // replay to exactly there, and sit at the older mark until the leader
+    // tells it the rest. `applied >= commit` is *true* on that node and means
+    // nothing -- it was the guard here before, and it let precisely this
+    // through (INV-TXN-09 fired on it, on a healthy cluster, every time a
+    // crash landed in that window).
+    //
+    // Raft is what makes the regression safe: leader completeness says a node
+    // missing a committed entry cannot win an election, so it can never serve
+    // a reservation from the stale mark -- and can_serve_local_reads() is the
+    // predicate for exactly that. Gating on it keeps the property this
+    // invariant is named for (a mark that goes backwards on a node that *can*
+    // hand out timestamps is a re-issued timestamp) and drops the reading that
+    // was never a violation at all.
+    if (!s->oracle_driver()->node().can_serve_local_reads()) continue;
+
     txn::Ts& seen = oracle_seen_[id.value()];
     if (high < seen) {
       record("INV-TXN-09", "n" + std::to_string(id.value()) +

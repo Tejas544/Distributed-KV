@@ -883,6 +883,18 @@ void RaftNode::update_lease(Timestamp now) {
   if (expiry > lease_expiry_) lease_expiry_ = expiry;
 }
 
+bool RaftNode::can_serve_local_reads() const {
+  if (role_ != Role::kLeader) return false;
+  if (log_.applied_index() < log_.commit_index()) return false;
+  // An entry from *this* term, committed. Below that the leader has not yet
+  // proved it holds everything its predecessors committed, whatever its own
+  // commit index happens to say -- see the header for why that index alone is
+  // not the fact it looks like.
+  Term at_commit{};
+  if (!log_.term_at(log_.commit_index(), &at_commit)) return false;
+  return at_commit == term_;
+}
+
 bool RaftNode::lease_valid(Timestamp now) const {
   if (role_ != Role::kLeader) return false;
 
