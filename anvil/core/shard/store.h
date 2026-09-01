@@ -130,8 +130,22 @@ struct RangeReplica {
   bool reported_catchup = false;
   std::uint64_t reported_keys = ~0ULL;
   std::uint64_t published_generation = 0;
+  // The kInit and kFreeze this node has proposed for this range, and the log
+  // indices they were assigned.
+  //
+  // The indices are the whole point: a bare "already proposed" flag never comes
+  // off. A proposal that is accepted into the leader's log and then truncated
+  // by a leadership change is gone, and the flag says otherwise forever -- so
+  // the range is never initialised again by this node, and if it stays leader,
+  // never at all. That is a range permanently stuck at applied index 0 with its
+  // data sitting in the parent's pending-split payload, uninitialised, while
+  // the topology routes clients to it. Re-armed once the log has *applied* past
+  // the recorded index without the thing happening, which is the point at which
+  // the entry is definitively gone rather than merely slow.
   bool init_proposed = false;
+  LogIndex init_index{};
   bool freeze_proposed = false;
+  LogIndex freeze_index{};
 };
 
 class ShardStore {

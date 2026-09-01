@@ -519,7 +519,8 @@ void test_a_transfer_across_the_split_point_is_refused_whole() {
   split.generation = 2;
   machine.apply(LogIndex{2}, shard::encode_range_command(split));
   check(machine.key_count() == 4, "the upper half leaves the range");
-  check(machine.pending_split().has_value(), "and is held for the range that will receive it");
+  check(machine.pending_splits().count(3) == 1,
+        "and is held for the range that will receive it");
   check(machine.total() == 400, "the survivor holds exactly its own half");
 
   shard::RangeCommand transfer;

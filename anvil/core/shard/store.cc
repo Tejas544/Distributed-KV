@@ -547,7 +547,14 @@ void ShardStore::maintain_range(RangeId id) {
 
   // ---- initialisation ------------------------------------------------------
   if (!machine.initialised()) {
-    if (replica.init_proposed) return;
+    if (replica.init_proposed) {
+      // Still in flight, or definitively gone? Applying past the index it was
+      // assigned without this range coming up means the entry is not there --
+      // a leadership change discarded it -- so propose again rather than
+      // waiting on something that will never arrive.
+      if (replica.driver->node().log().applied_index() < replica.init_index) return;
+      replica.init_proposed = false;
+    }
     RangeCommand cmd;
     cmd.op = RangeOp::kInit;
 
@@ -555,11 +562,12 @@ void ShardStore::maintain_range(RangeId id) {
     bool have_payload = false;
     for (const auto& [other_id, other] : ranges_) {
       if (other.machine == nullptr) continue;
-      const auto& pending = other.machine->pending_split();
-      if (pending.has_value() && pending->id == id) {
-        cmd.payload = pending->payload;
-        cmd.start = pending->start;
-        cmd.end = pending->end;
+      const auto& pending = other.machine->pending_splits();
+      const auto owed = pending.find(id.value());
+      if (owed != pending.end()) {
+        cmd.payload = owed->second.payload;
+        cmd.start = owed->second.start;
+        cmd.end = owed->second.end;
         cmd.generation = 1;
         have_payload = true;
         break;
@@ -608,6 +616,7 @@ void ShardStore::maintain_range(RangeId id) {
     LogIndex assigned{};
     if (replica.driver->propose(encode_range_command(cmd), &assigned).is_ok()) {
       replica.init_proposed = true;
+      replica.init_index = assigned;
     }
     return;
   }
@@ -647,12 +656,20 @@ void ShardStore::maintain_range(RangeId id) {
 
   // ---- freeze, when the topology says this range is being subsumed ---------
   if (topo->frozen && !machine.frozen()) {
+    // Re-armed on the same rule as kInit above, for the same reason: a freeze
+    // truncated by a leadership change leaves the latch set and the range
+    // never freezes, so the merge waiting on it never completes.
+    if (replica.freeze_proposed &&
+        replica.driver->node().log().applied_index() >= replica.freeze_index) {
+      replica.freeze_proposed = false;
+    }
     if (!replica.freeze_proposed) {
       RangeCommand cmd;
       cmd.op = RangeOp::kFreeze;
       LogIndex assigned{};
       if (replica.driver->propose(encode_range_command(cmd), &assigned).is_ok()) {
         replica.freeze_proposed = true;
+        replica.freeze_index = assigned;
       }
     }
     return;
@@ -867,18 +884,20 @@ void ShardStore::maintain_range(RangeId id) {
     propose_admin(report);
   }
 
-  // ---- confirm a split -----------------------------------------------------
-  const auto& pending = machine.pending_split();
-  if (pending.has_value()) {
-    const auto child = ranges_.find(pending->id.value());
-    if (child != ranges_.end() && child->second.machine != nullptr &&
-        child->second.machine->initialised()) {
-      RangeCommand cmd;
-      cmd.op = RangeOp::kSplitConfirmed;
-      cmd.other = pending->id;
-      LogIndex assigned{};
-      replica.driver->propose(encode_range_command(cmd), &assigned);
-    }
+  // ---- confirm every split whose child has collected -----------------------
+  //
+  // Every one, not the first: a range can owe data to several children at
+  // once, and confirming only one leaves the rest held forever behind a debt
+  // that has already been paid.
+  for (const auto& [child_id, pending] : machine.pending_splits()) {
+    const auto child = ranges_.find(child_id);
+    if (child == ranges_.end() || child->second.machine == nullptr) continue;
+    if (!child->second.machine->initialised()) continue;
+    RangeCommand cmd;
+    cmd.op = RangeOp::kSplitConfirmed;
+    cmd.other = pending.id;
+    LogIndex assigned{};
+    replica.driver->propose(encode_range_command(cmd), &assigned);
   }
 }
 

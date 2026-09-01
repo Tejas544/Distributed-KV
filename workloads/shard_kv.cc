@@ -452,24 +452,24 @@ std::int64_t audit_conservation(sim::Simulation& simulation, ShardKvState* state
     if (!simulation.process().alive(NodeId{id})) continue;
     for (const auto& [range_id, replica] : node.store->ranges()) {
       if (replica.machine == nullptr) continue;
-      const auto& pending = replica.machine->pending_split();
-      if (!pending.has_value()) continue;
-      // Only when the child genuinely has no data anywhere, or it would be
-      // counted twice. The parent keeps the payload until the split is
-      // confirmed, which is deliberately later than the child having it.
-      if (best_replica(simulation, *state, pending->id) != nullptr) continue;
-      std::map<std::string, std::int64_t> balances;
-      std::map<std::uint64_t, shard::ApplyOutcome> decided;
-      if (!shard::RangeMachine::decode_payload(pending->payload, &balances, &decided)) continue;
-      for (const auto& [key, value] : balances) {
-        if (owners.count(key) != 0) continue;  // already counted from a replica
-        total += value;
-        ++owners[key];
+      // Every debt this range still owes, not just one: a range can be the
+      // parent of more than one unhanded-over split at a time, and stopping at
+      // the first silently drops the rest. The owners map is what stops the
+      // same payload being counted twice when several replicas hold it.
+      for (const auto& [child_id, pending] : replica.machine->pending_splits()) {
+        // Only when the child genuinely has no data anywhere, or it would be
+        // counted twice. The parent keeps the payload until the split is
+        // confirmed, which is deliberately later than the child having it.
+        if (best_replica(simulation, *state, pending.id) != nullptr) continue;
+        std::map<std::string, std::int64_t> balances;
+        std::map<std::uint64_t, shard::ApplyOutcome> decided;
+        if (!shard::RangeMachine::decode_payload(pending.payload, &balances, &decided)) continue;
+        for (const auto& [key, value] : balances) {
+          if (owners.count(key) != 0) continue;  // already counted from a replica
+          total += value;
+          ++owners[key];
+        }
       }
-      // No break: a node can be the parent of more than one unhanded-over
-      // split at a time, and stopping at the first one silently drops the rest.
-      // The owners map is what stops the same payload being counted twice when
-      // several replicas of the parent hold it.
     }
   }
 

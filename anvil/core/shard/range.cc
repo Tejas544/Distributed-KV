@@ -223,9 +223,30 @@ bool RangeMachine::decode_payload(std::string_view in,
   return decode_bank(in.data(), in.data() + in.size(), balances, decided) != nullptr;
 }
 
+bool RangeMachine::decode_txn_section(std::string_view in, std::string_view* out) {
+  std::map<std::string, std::int64_t> balances;
+  std::map<std::uint64_t, ApplyOutcome> decided;
+  const char* limit = in.data() + in.size();
+  const char* p = decode_bank(in.data(), limit, &balances, &decided);
+  if (p == nullptr) return false;
+  if (p >= limit) return false;  // written before the transactional half existed
+  return lsm::get_length_prefixed(p, limit, out) != nullptr;
+}
+
 // The whole of this range's state for [lo, hi): balances, the decision ledger,
-// and the transactional half. The transactional section is length-prefixed and
-// may be absent, which is what makes a P5 payload readable here.
+// the transactional half, and any splits this range still owes a child whose
+// keys fall in the span. Each trailing section is length-prefixed and may be
+// absent, which is what makes an older payload readable here.
+//
+// The pending splits travel because they are data that exists nowhere else.
+// A range that has applied a split trigger has already erased the right-hand
+// half from itself and holds the only copy, waiting for the child's leader to
+// pick it up. If that range is then merged away, the payload goes with it and
+// the child can never be initialised: nothing holds its span, no leader can
+// propose its kInit, and its keys are gone while the topology still routes
+// clients to it. Filtering by the child's start key is what makes this correct
+// for a split as well as a merge -- a child whose keys are leaving with this
+// span is now the *new* owner's debt to pay, not ours.
 std::string RangeMachine::encode_span(std::string_view lo, std::string_view hi) const {
   std::map<std::string, std::int64_t> slice;
   for (const auto& [key, value] : balances_) {
@@ -235,6 +256,24 @@ std::string RangeMachine::encode_span(std::string_view lo, std::string_view hi) 
   }
   std::string out = encode_payload(slice, decided_);
   lsm::put_length_prefixed(&out, txn_.encode_span(lo, hi));
+
+  std::vector<const PendingSplit*> owed;
+  for (const auto& [id, split] : pending_splits_) {
+    if (split.start < lo) continue;
+    if (!hi.empty() && split.start >= hi) continue;
+    owed.push_back(&split);
+  }
+  std::string splits;
+  lsm::put_varint32(&splits, static_cast<std::uint32_t>(owed.size()));
+  for (const PendingSplit* split : owed) {
+    lsm::put_varint64(&splits, split->id.value());
+    lsm::put_length_prefixed(&splits, split->start);
+    lsm::put_length_prefixed(&splits, split->end);
+    put_nodes(&splits, split->replicas);
+    put_nodes(&splits, split->learners);
+    lsm::put_length_prefixed(&splits, split->payload);
+  }
+  lsm::put_length_prefixed(&out, splits);
   return out;
 }
 
@@ -257,7 +296,46 @@ bool RangeMachine::load_span(std::string_view in, bool merge) {
   std::string_view txn_part;
   p = lsm::get_length_prefixed(p, limit, &txn_part);
   if (p == nullptr) return false;
-  return merge ? txn_.absorb(txn_part) : txn_.load(txn_part);
+  if (!(merge ? txn_.absorb(txn_part) : txn_.load(txn_part))) return false;
+
+  // The debts owed to children that have not collected yet. On a merge these
+  // are added to whatever this range already owes; on an init they replace,
+  // because the range is being built from nothing.
+  if (!merge) pending_splits_.clear();
+  if (p >= limit) return true;  // a payload written before pending splits moved
+  std::string_view splits;
+  p = lsm::get_length_prefixed(p, limit, &splits);
+  if (p == nullptr) return false;
+  const char* q = splits.data();
+  const char* qlimit = q + splits.size();
+  std::uint32_t count = 0;
+  q = lsm::get_varint32(q, qlimit, &count);
+  if (q == nullptr) return false;
+  for (std::uint32_t i = 0; i < count; ++i) {
+    PendingSplit split;
+    std::uint64_t id = 0;
+    std::string_view start;
+    std::string_view end;
+    std::string_view payload;
+    q = lsm::get_varint64(q, qlimit, &id);
+    if (q == nullptr) return false;
+    q = lsm::get_length_prefixed(q, qlimit, &start);
+    if (q == nullptr) return false;
+    q = lsm::get_length_prefixed(q, qlimit, &end);
+    if (q == nullptr) return false;
+    q = get_nodes(q, qlimit, &split.replicas);
+    if (q == nullptr) return false;
+    q = get_nodes(q, qlimit, &split.learners);
+    if (q == nullptr) return false;
+    q = lsm::get_length_prefixed(q, qlimit, &payload);
+    if (q == nullptr) return false;
+    split.id = RangeId{id};
+    split.start.assign(start);
+    split.end.assign(end);
+    split.payload.assign(payload);
+    pending_splits_.emplace(id, std::move(split));
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -428,7 +506,7 @@ void RangeMachine::apply(LogIndex index, std::string_view command) {
 
       desc_.end = split.start;
       if (cmd.generation > desc_.generation) desc_.generation = cmd.generation;
-      pending_split_ = std::move(split);
+      pending_splits_[split.id.value()] = std::move(split);
       ++counters_.splits_applied;
       break;
     }
@@ -454,7 +532,7 @@ void RangeMachine::apply(LogIndex index, std::string_view command) {
     }
 
     case RangeOp::kSplitConfirmed:
-      if (pending_split_.has_value() && pending_split_->id == cmd.other) pending_split_.reset();
+      pending_splits_.erase(cmd.other.value());
       break;
 
     case RangeOp::kFreeze:
@@ -508,16 +586,10 @@ std::string RangeMachine::snapshot() const {
   std::string out;
   lsm::put_length_prefixed(&out, encode_descriptor(desc_));
   out.push_back(initialised_ ? 1 : 0);
+  // The whole span, which now carries the pending splits with it -- they used
+  // to be written again here, separately, and a second copy of a fact is a
+  // second place for it to be wrong.
   lsm::put_length_prefixed(&out, encode_span(std::string_view{}, std::string_view{}));
-  out.push_back(pending_split_.has_value() ? 1 : 0);
-  if (pending_split_.has_value()) {
-    lsm::put_varint64(&out, pending_split_->id.value());
-    lsm::put_length_prefixed(&out, pending_split_->start);
-    lsm::put_length_prefixed(&out, pending_split_->end);
-    put_nodes(&out, pending_split_->replicas);
-    put_nodes(&out, pending_split_->learners);
-    lsm::put_length_prefixed(&out, pending_split_->payload);
-  }
   return out;
 }
 
@@ -537,33 +609,9 @@ void RangeMachine::restore(std::string_view data) {
 
   desc_ = std::move(desc);
   initialised_ = initialised;
-  pending_split_.reset();
+  // load_span(merge=false) clears and repopulates pending_splits_ from the
+  // payload, so there is nothing to reset here and nothing to read afterwards.
   if (!load_span(payload, /*merge=*/false)) return;
-
-  if (p < limit && *p++ != 0) {
-    PendingSplit split;
-    std::uint64_t id = 0;
-    p = lsm::get_varint64(p, limit, &id);
-    if (p == nullptr) return;
-    std::string_view start;
-    std::string_view end;
-    p = lsm::get_length_prefixed(p, limit, &start);
-    if (p == nullptr) return;
-    p = lsm::get_length_prefixed(p, limit, &end);
-    if (p == nullptr) return;
-    p = get_nodes(p, limit, &split.replicas);
-    if (p == nullptr) return;
-    p = get_nodes(p, limit, &split.learners);
-    if (p == nullptr) return;
-    std::string_view split_payload;
-    p = lsm::get_length_prefixed(p, limit, &split_payload);
-    if (p == nullptr) return;
-    split.id = RangeId{id};
-    split.start.assign(start);
-    split.end.assign(end);
-    split.payload.assign(split_payload);
-    pending_split_ = std::move(split);
-  }
   ++revision_;
 }
 

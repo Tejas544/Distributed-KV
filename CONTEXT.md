@@ -312,8 +312,8 @@ planting a bug.
 | **P2 LSM engine** | **done except benchmarks** | Benchmark criterion blocked on `ProdRuntime` |
 | **P3 Raft** | **done, one open finding** | 16 `INV-RAFT-*` armed; 9/10 drill + 1 targeted. ANV-0032 (a learner stops converging on seed 14) is open and the gate is red on it |
 | **P4 MVCC + transactions** | **done** | 8 `INV-MVCC-*` armed; snapshot isolation confirmed against the checker at two levels; whole sweep runs in <1s |
-| **P5 sharding** | **reopened: convergence bug, was hidden behind a checker bug** | MultiRaft, one Raft group per range; 9 `INV-SHARD-*` armed; 18 ledger rows, 6 of them S0. ANV-0051 (this pass) found INV-SHARD-CLIENT comparing concurrent reads as sequential -- and since the simulator halts on first violation, that false positive had been capping seed 19 at tick 4395 for the whole phase. With it gone the seed runs on and does not converge: a range no replica ever initialises, five accounts unreachable. See §14 |
-| **P6 distributed transactions** | **in progress, blocked on P5 convergence** | Percolator/SSI/StrictSerializable behind one `Coordinator`; 7 `INV-TXN-*` armed (01-04, 09, 11, 12). Green: `anvil_txn_test` 30/30, determinism 3/3, serializable and strict-serializable 4/4 checker-clean, INV-TXN-02 and INV-TXN-09 silent. The fault-free money-loss finding is fixed (two independent root causes, confirmed by minimal repro). What remains in the sweep is the P5 convergence bug above wearing P6's clothes -- money reported missing is money in an unreachable range. See §14. Never committed as of this pass |
+| **P5 sharding** | **done again, and for a better reason** | MultiRaft, one Raft group per range; 9 `INV-SHARD-*` armed; 20 ledger rows, 7 of them S0. `shard_faults` 20/20 green. ANV-0051 found INV-SHARD-CLIENT comparing concurrent reads as sequential; because the simulator halts on first violation that false positive had been capping seed 19 at tick 4395 for the whole phase, hiding ANV-0052 (S0) -- a range merged away while holding the only copy of a child's data. Both fixed. See §14 |
+| **P6 distributed transactions** | **in progress, four findings open** | Percolator/SSI/StrictSerializable behind one `Coordinator`; 7 `INV-TXN-*` armed (01-04, 09, 11, 12). Green: `anvil_txn_test` 30/30, determinism 3/3, serializable and strict-serializable 4/4 checker-clean, INV-TXN-09 silent. The fault-free money-loss finding is fixed (two root causes), as are the two that turned out to be checkers looking in too few places. What remains: two small conservation shortfalls, one INV-TXN-02, one list-append loss. See §14 |
 | P7+ | not started | Verification depth, the bug hunt at scale, prod runtime |
 
 ### Measured (see README results block)
@@ -1187,43 +1187,72 @@ argument.
    tree with only the workload fix applied runs on and fails differently --
    see below.
 
-### Open: the topology does not always converge, and that is now the top blocker
+### The convergence failures, and the S0 underneath them
 
-With both false positives gone, the remaining failures in *both* sweeps have
-one shape, and it is a P5 shape rather than a P6 one:
+Removing the two false positives exposed a real data-loss bug and a second
+checker gap. **`shard_faults` is now fully green (20/20 seeds).**
 
-- `shard_faults` seed 19, which had never run past tick 4395 before:
-  `converged=no`, and the audit reaches 19 of 24 accounts. The five missing
-  accounts are not lost data -- they are a range the audit cannot reach,
-  because no replica of it ever became initialised. This is the ANV-0049
-  family (a split's right-hand side that cannot be initialised), which was
-  fixed once for the case where the new range's leader does not host the
-  parent; this is a residual case that fix does not cover.
-- `txn_faults` 30 seeds: the surviving bank failures are dominated by the same
-  thing. Every seed reporting money "missing" also reports `converged=no`, and
-  the shortfall matches whole accounts rather than partial transfers -- the
-  money is unreachable, not gone. `after healing: 5-6/8 seeds reached a
-  topology where every range has an initialised replica` says the same thing
-  from the other side, and that line predates P6.
+5. **[ANV-0052](BUGS.md), S0: a range merged away while owing a child its
+   data.** A range that applies a split trigger erases the right-hand half from
+   itself and holds the only copy in `pending_split_`, waiting for the child's
+   leader to collect it. That slot was a single `std::optional` (so a second
+   split silently overwrote the first child's payload) and was not part of
+   `encode_span()` (so it did not travel with a merge). When the parent was
+   itself subsumed, the payload went with it and the child became permanently
+   uninitialisable -- nothing held its span, no leader could propose its
+   `kInit`, and its keys were gone while the topology still routed clients to
+   it. On seed 19 that was r7 `[acct0010,acct0015)` at applied index 0 on all
+   three replicas, five accounts short.
 
-So the P6 exit criteria are now blocked on a P5 convergence bug rather than on
-anything transactional. What is genuinely clean: `serializable` and
-`strict-serializable` are 4/4 checker-clean, determinism is 3/3, INV-TXN-02 and
-INV-TXN-09 are silent, and the mechanism suite is 30/30.
+   Fixed by making it a map keyed by child id and carrying the entries whose
+   keys fall in the span, which is correct for a split as well as a merge.
+   Worth recording that **blocking the merge instead was tried first and
+   livelocks**: the child cannot initialise, so the split never confirms, so
+   the merge never unblocks. Two related latches were fixed alongside it --
+   `init_proposed` and `freeze_proposed` were set once and never cleared, so a
+   proposal truncated by a leadership change left the range waiting forever on
+   an entry that no longer existed; both now re-arm once the log has applied
+   past the index they were assigned.
 
-Still open beyond convergence, and smaller:
-- Two drill *controls* (`parallel commit`, `no commit-wait`) still fire. Both
-  are configuration changes rather than bugs, so a control that fires means the
-  harness is attributing a convergence failure to the mutation. Expected to
-  fall out with the convergence fix; worth re-checking rather than assuming.
-- `INV-TXN-02` fires on seed 8 in one of the two schedules tried (a record
-  going committed -> pending). It did not reproduce under the other, so it is
-  one seed deep and not yet characterised.
+6. **[ANV-0053](BUGS.md): the P6 audit could not see a split in flight.** The
+   transactional audit read only live range machines, so a key sitting in a
+   parent's pending-split payload counted as unreachable and as missing money.
+   P5's `audit_conservation` has always walked pending splits; the P6 audit was
+   written without that half, and this phase's topology churns continuously by
+   design, so there is essentially always a split in flight when the audit
+   runs. Disproved as an engine bug by measurement rather than argument: the
+   same seed with a longer settle reported `total=1600/1600` at 40s, 60s, 90s
+   and 200s while the range count kept moving. Money that reappears when you
+   look later was never missing.
 
-Next step: `shard_faults 20`, seed 19, is now the smallest and fastest
-reproduction of the convergence bug -- pure P5, no transactions, and it fails
-in under two seconds. Trace which range never initialises and why its
-`kInit` proposal never lands, per gotcha 10.17.
+### Where P6 actually stands
+
+Green: `shard_faults` 20/20, mechanism suite 30/30, shard units, determinism
+3/3, `serializable` and `strict-serializable` 4/4 checker-clean, INV-TXN-09
+silent.
+
+Open, and now a short list of genuine findings rather than a fog:
+
+- **Small conservation shortfalls on converged runs.** Seeds 1 and 7 at
+  snapshot isolation finish `converged=yes` and short by 17 and 15 out of
+  1600. Both are far smaller than an account, so this is a partial transfer
+  rather than an unreachable range -- a different bug from the two above, and
+  the first one to chase.
+- **Seed 5 (serializable), 710/1600 with `converged=no`.** Much larger, and
+  still correlated with convergence, so likely a third variant of a range not
+  reachable at audit time rather than a transactional fault.
+- **`INV-TXN-02` on seed 8**, both at serializable and strict serializable: a
+  record leaving a terminal state (committed -> pending). Reproduces at the
+  same tick under both levels, which makes it the most tractable of the three.
+- **Two drill controls still fire** (`parallel commit`, `no commit-wait`).
+  Both are configuration changes rather than bugs, so a firing control means
+  the harness is attributing one of the above failures to the mutation. Expect
+  these to go quiet as the findings above are fixed; re-check rather than
+  assume.
+- **The list-append workload loses acknowledged elements** on seed 1 at
+  snapshot isolation (14 of them). Not yet looked at, and it is the one
+  remaining finding with no convergence correlation at all, which makes it the
+  most likely to be a genuine transactional bug.
 
 ---
 

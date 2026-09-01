@@ -1,0 +1,16 @@
+# ANV-0053 -- the P6 audit could not see a split that had left its parent
+# keys in a parent's pending-split payload have no live replica holding them,
+# so the audit counted them unreachable and the bank short
+seed        = 4 (serializable), 6 (snapshot-isolation)
+workload    = txn_bank, kind = bank
+nodes       = 5
+faults      = drawn from seed; needs a split in flight when the audit runs,
+              which this phase's churn profile makes near-certain
+invariant   = conservation (the bank total)
+reproduce   = anvil_txn_faults 30
+note        = disproved as an engine bug by measurement: the same seed with a
+              longer settle window reported total=1600/1600 at 40s, 60s, 90s
+              and 200s, while the topology kept churning underneath. Money that
+              reappears when you look later was never missing. Fixed by giving
+              the transactional audit the same pending-split walk P5's
+              audit_conservation has always had.

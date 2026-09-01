@@ -719,6 +719,89 @@ lesson: |
 ```
 </details>
 
+<details>
+<summary><b>ANV-0052</b> · S0 · shard · <b>a range merged away while owing a child its data destroyed the only copy</b></summary>
+
+```yaml
+id:              ANV-0052
+title:           pending_split_ was a single slot and did not travel with a merge, so a split caught mid-handover lost its keys
+status:          fixed
+severity:        S0
+class:           safety
+layer:           shard
+invariant:       INV-SHARD-02 (conservation), via the client-visible audit
+found_by:        dst-random
+api_visible:     yes -- five accounts unreachable, the bank short by their balances
+seed:            19, with faults (shard_faults 20)
+root_cause: |
+  A range that applies a split trigger erases the right-hand half from itself
+  and holds the only copy in pending_split_, waiting for the child's leader to
+  collect it and propose it as the child's kInit. Two things were wrong with
+  that slot.
+
+  It was a single std::optional, so a second split before the first child
+  collected silently overwrote the first child's payload.
+
+  And it was not part of encode_span(), so it did not travel with a merge. When
+  the parent was itself subsumed -- frozen, absorbed, group retired -- the
+  payload went with it. The child was then permanently uninitialisable: nothing
+  in the cluster held its span, no leader could propose its kInit, and its keys
+  were gone while the topology still routed clients to it. Observed on seed 19
+  as r7 [acct0010,acct0015) sitting at applied index 0 on all three replicas
+  with the five accounts it owned missing from the audit.
+fix_commit:      P6
+regression:      test/corpus/ANV-0052.seed
+lesson: |
+  The audit had believed the right thing for longer than the state could
+  express it -- "a node can be the parent of more than one unhanded-over split
+  at a time" has been a comment in shard_kv.cc since P5, while the field it
+  describes could hold exactly one. A comment that contradicts a data structure
+  is a bug that has already been noticed and not written down.
+
+  pending_split_ is now a map keyed by child id, and encode_span() carries the
+  entries whose keys fall in the span -- which is correct for a split as well as
+  a merge, because a child whose data is leaving with this span becomes the new
+  owner's debt rather than ours. Blocking the merge instead was tried first and
+  livelocks: the child could not initialise, so the split never confirmed, so
+  the merge never unblocked.
+```
+</details>
+
+<details>
+<summary><b>ANV-0053</b> · S3 · txn · <b>the P6 audit could not see a split that had left its parent, and called it lost money</b></summary>
+
+```yaml
+id:              ANV-0053
+title:           txn_bank's audit read only live range machines, never the pending-split payloads P5's audit already walked
+status:          fixed
+severity:        S3
+class:           test-infra
+layer:           txn
+invariant:       conservation (the bank total), INV-TXN convergence reporting
+found_by:        dst-random
+api_visible:     no -- the finding itself was not real
+seed:            4 (serializable) and 6 (snapshot), txn_faults 30
+root_cause: |
+  The transactional audit walked the topology, found the best replica of each
+  range, and read its version store. A key sitting in a parent's pending-split
+  payload has no live replica holding it, so the audit counted it as
+  unreachable and reported both "could only reach 10 of 16 accounts" and a
+  cluster short by their balances. P5's audit_conservation has always walked
+  pending splits for exactly this reason; the P6 audit was written without that
+  half. This phase's topology churns continuously by design, so there is
+  essentially always a split in flight when the audit runs.
+fix_commit:      P6
+regression:      test/corpus/ANV-0053.seed
+lesson: |
+  Proved by measurement rather than argument: running the same seed with a
+  longer settle window reported total=1600/1600 every time, at 40s, 60s, 90s
+  and 200s, while the topology kept churning and the range count kept moving.
+  Money that reappears when you look later was never missing -- the checker was
+  looking in too few places. Two audits over the same cluster should share the
+  list of places data can legally be, and these two did not.
+```
+</details>
+
 <details open>
 <summary><b>ANV-0001</b> · S4 · sim · <b>the scheduler silently discarded one event at every deadline</b></summary>
 

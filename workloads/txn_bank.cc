@@ -135,6 +135,38 @@ bool audited_value(const txn::VersionStore& store, std::string_view key, txn::Ts
   return store.committed_value(key, at, out, version_at);
 }
 
+// A key that lives in a split payload which has left its parent and not yet
+// reached its child. Returns false when no parent anywhere is holding it.
+//
+// Read from a throwaway VersionStore built out of the payload's transactional
+// section, because that is the only form the data exists in at this moment --
+// no range machine has it, and the child that will is not initialised yet.
+bool pending_split_value(sim::Simulation& simulation, const TxnBankState& state,
+                         std::string_view key, txn::Ts at, std::string* out) {
+  for (const auto& [id, node] : state.nodes) {
+    if (node.store == nullptr) continue;
+    if (!simulation.process().alive(NodeId{id})) continue;
+    for (const auto& [range_id, replica] : node.store->ranges()) {
+      if (replica.machine == nullptr) continue;
+      for (const auto& [child_id, pending] : replica.machine->pending_splits()) {
+        if (key < pending.start) continue;
+        if (!pending.end.empty() && key >= pending.end) continue;
+        std::string_view section;
+        if (!shard::RangeMachine::decode_txn_section(pending.payload, &section)) continue;
+        txn::VersionStore store;
+        if (!store.load(section)) continue;
+        txn::Ts version_at = 0;
+        // Absent from the payload is still "reached": the child owns the key
+        // and nobody has written to it, so its balance is the initial one.
+        out->clear();
+        store.committed_value(key, at, out, &version_at);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // one transaction
 // ---------------------------------------------------------------------------
@@ -481,18 +513,34 @@ void audit(sim::Simulation& simulation, TxnBankState* state) {
     std::uint32_t seen = 0;
     for (std::uint32_t i = 0; i < state->config.keys; ++i) {
       const std::string key = data_key(i);
-      const shard::RangeDescriptor* desc = topology->find_by_key(key);
-      if (desc == nullptr) continue;
-      const shard::RangeMachine* machine = best_replica(simulation, *state, desc->id);
-      if (machine == nullptr) continue;
-      // audited_value resolves a committed-but-not-yet-materialised intent the
-      // same way a live reader would, rather than reading straight past it.
       std::string value;
       txn::Ts version_at = 0;
       std::int64_t balance = state->config.initial_balance;
-      if (audited_value(machine->txn_store(), key, at, &value, &version_at) && !value.empty()) {
-        if (!decode_balance(value, &balance)) continue;
+      bool reached = false;
+
+      const shard::RangeDescriptor* desc = topology->find_by_key(key);
+      const shard::RangeMachine* machine =
+          desc == nullptr ? nullptr : best_replica(simulation, *state, desc->id);
+      if (machine != nullptr) {
+        // audited_value resolves a committed-but-not-yet-materialised intent the
+        // same way a live reader would, rather than reading straight past it.
+        reached = true;
+        if (audited_value(machine->txn_store(), key, at, &value, &version_at) && !value.empty()) {
+          if (!decode_balance(value, &balance)) continue;
+        }
+      } else if (pending_split_value(simulation, *state, key, at, &value)) {
+        // The half of a split that has left its parent and not yet reached its
+        // child. The keys are not lost and they are not unreachable -- they are
+        // in the parent's pending payload, which is exactly where the protocol
+        // says they should be until the child collects them. P5's audit has
+        // always walked these (shard_kv.cc); this one did not, and every split
+        // caught mid-handover was reported as an unreachable account and a
+        // cluster that had lost money. The topology in this phase churns
+        // continuously by design, so there is essentially always one in flight.
+        reached = true;
+        if (!value.empty() && !decode_balance(value, &balance)) continue;
       }
+      if (!reached) continue;
       total += balance;
       ++seen;
     }

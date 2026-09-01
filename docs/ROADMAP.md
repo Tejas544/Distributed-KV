@@ -289,13 +289,21 @@ been capping every run of P5 seed 19 at tick 4395 since the phase was called
 done. With it gone the seed runs on and exposes a real convergence failure --
 a range no replica ever initialises, whose accounts the audit cannot reach.
 
-That convergence bug is now the top blocker, and it is a P5 bug, not a P6 one:
-every remaining `txn_faults` seed that reports missing money also reports
-`converged=no`, and the shortfall is whole unreachable accounts rather than
-partial transfers. Green today: mechanism suite 30/30, determinism 3/3,
-serializable and strict-serializable 4/4 checker-clean, INV-TXN-02 and
-INV-TXN-09 silent. See [CONTEXT.md §14](../CONTEXT.md) for the full account.
-None of this is committed yet.
+Underneath that lid was a real S0: [ANV-0052](../BUGS.md), a range merged away
+while holding the only copy of a child range's data, leaving the child
+permanently uninitialisable and its accounts gone. `pending_split_` was a
+single slot that neither survived a second split nor travelled with a merge;
+it is now a map carried in `encode_span`. **`shard_faults` is 20/20 green
+again.** A second checker gap ([ANV-0053](../BUGS.md)) accounted for the rest
+of the noise: the P6 audit never walked pending-split payloads the way P5's
+always had, so every split caught in flight read as missing money.
+
+What is left in P6 is a short list of real findings rather than a fog: two
+small conservation shortfalls on converged runs, one seed where a record
+leaves a terminal state (INV-TXN-02), and a list-append seed that loses
+acknowledged elements. Green today: `shard_faults` 20/20, mechanism suite
+30/30, determinism 3/3, serializable and strict-serializable 4/4
+checker-clean, INV-TXN-09 silent. See [CONTEXT.md §14](../CONTEXT.md).
 
 **Goal.** The guarantee matrix from [SCOPE.md §2](SCOPE.md#2-guarantee-matrix), all three levels, one interface.
 

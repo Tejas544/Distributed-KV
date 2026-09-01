@@ -197,10 +197,19 @@ class RangeMachine : public raft::StateMachine {
     return desc_.lease.holder == self && desc_.lease.valid_at(now);
   }
 
-  // The split this range has performed and whose right-hand side has not yet
-  // been given its data. Held until a kSplitConfirmed arrives, because the new
+  // The splits this range has performed whose right-hand sides have not yet
+  // been given their data. Held until a kSplitConfirmed arrives, because the new
   // range's data exists nowhere else until then: it is not in any log, and a
   // crash that loses it loses half a range.
+  //
+  // A map rather than a single slot, keyed by the child's id, and both halves
+  // of that matter. A range can owe data to more than one child at a time --
+  // split off a right-hand side, then split again before the first child's
+  // leader has picked its payload up -- and a single slot silently overwrote
+  // the first, destroying the only copy of those keys. The audit has always
+  // assumed several ("a node can be the parent of more than one unhanded-over
+  // split at a time", store.cc); the state it audits just could not represent
+  // it.
   struct PendingSplit {
     RangeId id{};
     std::string start;
@@ -209,7 +218,9 @@ class RangeMachine : public raft::StateMachine {
     std::vector<NodeId> learners;
     std::string payload;
   };
-  const std::optional<PendingSplit>& pending_split() const noexcept { return pending_split_; }
+  const std::map<std::uint64_t, PendingSplit>& pending_splits() const noexcept {
+    return pending_splits_;
+  }
 
   // A merge this range has absorbed; the subsumed group must now be destroyed
   // on this node. Drained by the store, which is the only thing that can.
@@ -239,6 +250,14 @@ class RangeMachine : public raft::StateMachine {
                                     const std::map<std::uint64_t, ApplyOutcome>& decided);
   static bool decode_payload(std::string_view in, std::map<std::string, std::int64_t>* balances,
                              std::map<std::uint64_t, ApplyOutcome>* decided);
+
+  // The transactional section of a span payload, for a reader that has the
+  // bytes but no RangeMachine to load them into. The audit needs it: a split
+  // that has left its parent and not yet reached its child holds the only copy
+  // of those keys in a payload, and a checker that cannot read it reports every
+  // in-flight split as missing money (which is what P5's audit already walks
+  // pending splits to avoid, one layer down).
+  static bool decode_txn_section(std::string_view in, std::string_view* out);
 
   // The whole of this range's state for [lo, hi) -- balances, the decision
   // ledger, and the transactional half -- and the two ways of taking one back
@@ -278,7 +297,7 @@ class RangeMachine : public raft::StateMachine {
   txn::VersionStore txn_;
   TxnCallback on_txn_;
 
-  std::optional<PendingSplit> pending_split_;
+  std::map<std::uint64_t, PendingSplit> pending_splits_;  // child range id -> its data
   std::vector<RangeId> subsumed_;
 
   LogIndex applied_{};

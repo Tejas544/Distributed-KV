@@ -1,0 +1,17 @@
+# ANV-0052 -- a range merged away while owing a child its data
+# r5 split off r7 [acct0010,acct0015) and held the only copy in pending_split_;
+# r5 was then subsumed by a merge into r3, and the payload went with it
+seed        = 19
+workload    = shard_kv
+nodes       = 5
+faults      = drawn from seed; requires a merge to land inside the window
+              between a split trigger applying and the child collecting
+invariant   = conservation (audit), surfaced as "the cluster holds 19 accounts"
+reproduce   = anvil_shard_faults 20
+note        = only reachable once ANV-0051 was fixed: the seed had been halting
+              at tick 4395 on a false INV-SHARD-CLIENT positive and never ran
+              far enough to reach this. Fixed by making pending_split_ a map
+              keyed by child id and carrying the entries in encode_span(), so a
+              merge hands the debt to the survivor. Blocking the merge instead
+              livelocks -- the child cannot initialise, so the split never
+              confirms, so the merge never unblocks.
