@@ -104,6 +104,42 @@ const shard::RangeMachine* best_replica(sim::Simulation& simulation, const TxnBa
   return best;
 }
 
+// The replica that actually holds a key, by its own applied descriptor rather
+// than by the topology's opinion of who should.
+//
+// The two disagree for a whole merge. A survivor absorbs its neighbour's data
+// and widens its own span in its own log; the topology drops the subsumed
+// descriptor one round trip later. In that window the topology still routes
+// the key to a range that has been retired on every node -- best_replica finds
+// nothing, the audit skips the key, and every element ever written to it is
+// reported as an acknowledged write the cluster lost. It is the same
+// two-halves-of-one-fact trap ANV-0042 records on the serving path, and P5's
+// audit_conservation already walks around it; this one did not.
+//
+// Asking the machines is the fix rather than a workaround: a range's own
+// descriptor is what it will and will not serve, so "who claims this key" is
+// exactly the question, and the highest applied index among the claimants is
+// the freshest answer.
+const shard::RangeMachine* holder_of(sim::Simulation& simulation, const TxnBankState& state,
+                                     std::string_view key) {
+  const shard::RangeMachine* best = nullptr;
+  LogIndex best_at{};
+  for (const auto& [id, node] : state.nodes) {
+    if (node.store == nullptr) continue;
+    if (!simulation.process().alive(NodeId{id})) continue;
+    for (const auto& [range_id, replica] : node.store->ranges()) {
+      if (replica.machine == nullptr || !replica.machine->initialised()) continue;
+      if (!replica.machine->descriptor().contains(key)) continue;
+      const LogIndex applied = replica.machine->applied_index();
+      if (best == nullptr || applied > best_at) {
+        best = replica.machine.get();
+        best_at = applied;
+      }
+    }
+  }
+  return best;
+}
+
 // The value a client would see if it asked right now, accounting for a live
 // intent whose transaction has already committed.
 //
@@ -518,9 +554,7 @@ void audit(sim::Simulation& simulation, TxnBankState* state) {
       std::int64_t balance = state->config.initial_balance;
       bool reached = false;
 
-      const shard::RangeDescriptor* desc = topology->find_by_key(key);
-      const shard::RangeMachine* machine =
-          desc == nullptr ? nullptr : best_replica(simulation, *state, desc->id);
+      const shard::RangeMachine* machine = holder_of(simulation, *state, key);
       if (machine != nullptr) {
         // audited_value resolves a committed-but-not-yet-materialised intent the
         // same way a live reader would, rather than reading straight past it.
@@ -561,13 +595,24 @@ void audit(sim::Simulation& simulation, TxnBankState* state) {
   std::map<checker::Element, std::uint32_t> found;
   for (std::uint32_t i = 0; i < state->config.keys; ++i) {
     const std::string key = data_key(i);
-    const shard::RangeDescriptor* desc = topology->find_by_key(key);
-    if (desc == nullptr) continue;
-    const shard::RangeMachine* machine = best_replica(simulation, *state, desc->id);
-    if (machine == nullptr) continue;
     std::string value;
     txn::Ts version_at = 0;
-    if (!audited_value(machine->txn_store(), key, at, &value, &version_at)) continue;
+    bool have = false;
+
+    const shard::RangeMachine* machine = holder_of(simulation, *state, key);
+    if (machine != nullptr) {
+      have = audited_value(machine->txn_store(), key, at, &value, &version_at);
+    } else {
+      // The same half-migrated split the bank audit accounts for, in the
+      // workload that measures elements rather than money. Without it every
+      // element written to a key whose range happens to be mid-handover when
+      // the run ends is reported as an acknowledged write the cluster lost --
+      // which is the loudest failure this suite can produce, and it was the
+      // checker looking in one fewer place than the protocol allows the data
+      // to be.
+      have = pending_split_value(simulation, *state, key, at, &value);
+    }
+    if (!have) continue;
     std::vector<checker::Element> list;
     if (!decode_list(value, &list)) {
       state->violations.push_back("a final list did not decode; key " + key);
@@ -602,6 +647,31 @@ bool converged(sim::Simulation& simulation, const TxnBankState& state) {
 }
 
 std::uint64_t orphaned_intents(sim::Simulation& simulation, const TxnBankState& state) {
+  // A record lives on the range that owns its transaction's *primary* key, and
+  // a cross-range transaction has its intents on other ranges entirely. Asking
+  // only the range the intent sits on finds nothing for exactly the
+  // transactions this phase exists to exercise, so every one of them counted
+  // as an intent nobody will ever release -- 111 phantom orphans on a run with
+  // nothing wrong with it. A number that large and that wrong is worse than no
+  // number: it is why this was reported and never asserted on, which in turn
+  // is why the drill had no detector for `secondaries before primary`, whose
+  // entire signature is intents with no record to resolve them against.
+  const auto record_anywhere = [&](txn::TxnId txn) -> const txn::TxnRecord* {
+    const txn::TxnRecord* best = nullptr;
+    for (const auto& [node_id, node] : state.nodes) {
+      if (node.store == nullptr) continue;
+      if (!simulation.process().alive(NodeId{node_id})) continue;
+      for (const auto& [range_id, replica] : node.store->ranges()) {
+        if (replica.machine == nullptr) continue;
+        const txn::TxnRecord* found = replica.machine->txn_store().find_record(txn);
+        if (found == nullptr) continue;
+        if (terminal(found->status)) return found;  // a verdict beats a guess
+        if (best == nullptr) best = found;
+      }
+    }
+    return best;
+  };
+
   std::uint64_t orphans = 0;
   for (const auto& [id, node] : state.nodes) {
     if (node.store == nullptr) continue;
@@ -611,7 +681,7 @@ std::uint64_t orphaned_intents(sim::Simulation& simulation, const TxnBankState& 
       const txn::VersionStore& store = replica.machine->txn_store();
       for (const auto& [key, intent] : store.intents()) {
         (void)key;
-        const txn::TxnRecord* record = store.find_record(intent.txn);
+        const txn::TxnRecord* record = record_anywhere(intent.txn);
         // An intent whose record is terminal is simply uncleaned, which is the
         // mechanism working. One whose record is still pending after everything
         // has settled is a lock nobody will ever release.

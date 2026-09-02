@@ -235,6 +235,23 @@ struct Summary {
     if (!client_safe()) return false;
     if (!checker_safe()) return false;
     if (elle.has_value() && !elle->valid) return false;
+    // Deliberately NOT asserting on orphaned_intents, and the reason is worth
+    // keeping because the failure message above promises otherwise.
+    //
+    // The count is now accurate -- it used to look for a transaction's record
+    // on the range its intent sits on, which finds nothing for every
+    // cross-range transaction, so a healthy run reported ~111 phantom orphans.
+    // With that fixed the number is real, and asserting it to be zero still
+    // fails broadly on runs whose bank total is perfect. That is not a bug:
+    // resolution is lazy by design, the settle phase has no clients left to
+    // read anything, and an intent whose owner died before writing its record
+    // is cleaned by the next reader that meets it -- of which there are none.
+    // "Nobody has tidied up yet" and "nobody ever will" are different claims
+    // and only the second is a violation.
+    //
+    // The cost of leaving it unasserted is that the drill has no detector for
+    // `secondaries before primary`, whose entire signature is intents with no
+    // record. See CONTEXT.md section 14.
     return true;
   }
 

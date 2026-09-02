@@ -314,7 +314,8 @@ planting a bug.
 | **P4 MVCC + transactions** | **done** | 8 `INV-MVCC-*` armed; snapshot isolation confirmed against the checker at two levels; whole sweep runs in <1s |
 | **P5 sharding** | **done again, and for a better reason** | MultiRaft, one Raft group per range; 9 `INV-SHARD-*` armed; 20 ledger rows, 7 of them S0. `shard_faults` 20/20 green. ANV-0051 found INV-SHARD-CLIENT comparing concurrent reads as sequential; because the simulator halts on first violation that false positive had been capping seed 19 at tick 4395 for the whole phase, hiding ANV-0052 (S0) -- a range merged away while holding the only copy of a child's data. Both fixed. See §14 |
 | **P6 distributed transactions** | **in progress, four findings open** | Percolator/SSI/StrictSerializable behind one `Coordinator`; 7 `INV-TXN-*` armed (01-04, 09, 11, 12). Green: `anvil_txn_test` 30/30, determinism 3/3, serializable and strict-serializable 4/4 checker-clean, INV-TXN-09 silent. The fault-free money-loss finding is fixed (two root causes), as are the two that turned out to be checkers looking in too few places. What remains: two small conservation shortfalls, one INV-TXN-02, one list-append loss. See §14 |
-| P7+ | not started | Verification depth, the bug hunt at scale, prod runtime |
+| **P7 verification depth** | **started, exit criterion 1 met** | `checker.mutation`: 100% mutation score (200/200 detected, 200/200 correctly named across 9 anomaly classes), zero false positives over 10,000 reference-model histories at all 5 levels, 120/120 discrimination pairs. Taken first because the three findings before it were all checker bugs. TLA+, trace validation, DPOR and the minimiser are untouched |
+| P8+ | not started | The bug hunt at scale, prod runtime |
 
 ### Measured (see README results block)
 
@@ -1282,10 +1283,55 @@ Open, and now a short list of genuine findings rather than a fog:
   the harness is attributing one of the above failures to the mutation. Expect
   these to go quiet as the findings above are fixed; re-check rather than
   assume.
-- **The list-append workload loses acknowledged elements** on seed 1 at
-  snapshot isolation (14 of them). Not yet looked at, and it is the one
-  remaining finding with no convergence correlation at all, which makes it the
-  most likely to be a genuine transactional bug.
+7. **The list-append element loss was the audit again -- routing by a stale
+   descriptor.** Seed 1 lost 14 acknowledged elements. The keys were all in
+   two ranges the topology still listed as `FROZEN` with no replica anywhere,
+   while the survivor's machine held eleven keys -- well beyond its own
+   topology span. The merges had happened; only the descriptor removal had
+   not. The audit asked the topology who owned each key, got a range that had
+   been retired on every node, and reported everything ever written to it as
+   lost. `holder_of` now asks the *machines* which one claims the key, by its
+   own applied descriptor, which is the same two-halves-of-one-fact trap
+   ANV-0042 records on the serving path and which P5's audit already walks
+   around. That fixed seed 1's element loss, seed 5's 710/1600, and silenced
+   the `no commit-wait` control.
+
+   It also **surfaced a real anomaly that the loss had been masking**: three
+   duplicated elements on the same seed, which the Elle checker names
+   precisely (`element ... on key 11 appended by both T6 and T24`). An element
+   appended twice is an idempotence failure in the retry path, and it is now
+   the sharpest open transactional finding.
+
+### Where P6 stands after all of that
+
+Green: `shard_faults` 20/20, mechanism 30/30, shard and checker units,
+`checker.mutation` (P7's gate) 100%, determinism 3/3, serializable and
+strict-serializable 4/4 checker-clean, INV-TXN-02/09 silent.
+
+Open, and all four are now named rather than vague:
+
+- **Duplicated elements** (seed 1, snapshot isolation, 3 of them). The retry
+  path applying an append twice. Sharpest lead in the phase.
+- **Two conservation shortfalls** (seeds 1 and 7, 17 and 15 of 1600). The
+  audit's cross-range intent blind spot described above -- real, with a fix
+  that is known and rejected for blinding the drill. Needs a different fix.
+- **`secondaries before primary` is no longer detected by the drill** (0/15).
+  This is a cost of finding 7, and it is honest to state it that way: the
+  mutation was previously "caught" through the stale-descriptor blind spot,
+  which is detection by accident rather than by design. Its real signature is
+  intents with no record to resolve them against. `orphaned_intents` now
+  counts those accurately -- it was looking for the record on the intent's own
+  range, so every cross-range transaction counted as an orphan and a healthy
+  run reported ~111 of them; it now reports 86 real ones. Asserting that count
+  to be zero was tried and is wrong: resolution is lazy, the settle phase has
+  no clients left to read anything, and an intent whose owner died before
+  writing its record is cleaned by the next reader that meets it -- of which
+  there are none. "Nobody has tidied up yet" and "nobody ever will" are
+  different claims. A detector for this mutation needs to distinguish them,
+  probably by driving a reader over every key during settle.
+- **The `parallel commit` control still fires** through the conserved total,
+  which is the second bullet leaking into the drill rather than a bug in
+  parallel commit.
 
 ---
 

@@ -329,6 +329,17 @@ checker-clean, INV-TXN-09 silent. See [CONTEXT.md §14](../CONTEXT.md).
 
 ## P7 — Verification depth: checker, TLA+, trace validation, DPOR · Weeks 26–29
 
+**Status: started. Exit criterion 1 is met.** `anvil_checker_mutation`
+(`test/checker_mutation.cc`, ctest name `checker.mutation`) reports a **100%
+mutation score — 200/200 anomalous histories detected and 200/200 correctly
+named** across nine anomaly classes, and **zero false positives over 10,000
+reference-model histories** (200,000 transactions) checked at all five
+isolation levels, plus 120/120 discrimination pairs clean where the level
+permits the anomaly. This was taken first on purpose: the three findings
+immediately before it were all checker bugs, two of which
+([ANV-0051](../BUGS.md), [ANV-0053](../BUGS.md)) returned confidently wrong
+verdicts for a whole phase. Remaining deliverables below are untouched.
+
 **Goal.** Prove the tests themselves are worth trusting. This phase is what separates the project from "I injected some faults."
 
 **Deliverables**
