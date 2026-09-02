@@ -802,6 +802,51 @@ lesson: |
 ```
 </details>
 
+<details>
+<summary><b>ANV-0054</b> · S3 · txn · <b>the audit routed by the topology's descriptor, and called a completed merge a data loss</b></summary>
+
+```yaml
+id:              ANV-0054
+title:           the P6 audit asked the topology who owned a key instead of asking the machines who claims it
+status:          fixed
+severity:        S3
+class:           test-infra
+layer:           txn
+invariant:       lost_elements (list-append), conservation (bank)
+found_by:        dst-random
+api_visible:     no -- the finding itself was not real
+seed:            1 (list-append, snapshot isolation) and 5 (bank, serializable)
+root_cause: |
+  A survivor absorbs its neighbour's data and widens its own span in its own
+  log; the topology drops the subsumed descriptor one round trip later. In that
+  window the topology still routes a key to a range that has been retired on
+  every node. The audit looked the key up in the topology, found that range,
+  found no replica of it, skipped the key, and reported every element ever
+  written to it as an acknowledged write the cluster had lost -- fourteen of
+  them on seed 1, while the survivor sat there holding all of the data with a
+  span that plainly covered it.
+
+  The same routing error cost the bank audit 890 of 1600 on seed 5.
+fix_commit:      P6
+regression:      test/corpus/ANV-0054.seed
+lesson: |
+  Third instance of one mistake in this phase, after ANV-0053 and the
+  orphaned-intent counter: the audit kept asking a *directory* where the data
+  should be instead of asking the *holders* what they have. A range's own
+  applied descriptor is what it will and will not serve, so "who claims this
+  key" is the question; the topology is a cache of that answer and lags it by
+  design (ANV-0042 records the same trap on the serving path).
+
+  Two things came out of fixing it, and the second is the point. It surfaced a
+  real anomaly the loss had been masking -- three duplicated elements the Elle
+  checker names exactly -- and it *cost* the drill its detection of
+  `secondaries before primary`, which had been catching that mutation through
+  this very blind spot. Detection by accident is not detection, but losing it
+  is still a regression and is recorded as one in CONTEXT.md rather than
+  buried in a 6/7.
+```
+</details>
+
 <details open>
 <summary><b>ANV-0001</b> · S4 · sim · <b>the scheduler silently discarded one event at every deadline</b></summary>
 

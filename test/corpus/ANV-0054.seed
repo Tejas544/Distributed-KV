@@ -1,0 +1,16 @@
+# ANV-0054 -- the audit routed by the topology's descriptor, not by the holder
+# two ranges were still listed FROZEN with no replica anywhere while the
+# survivor's machine held their keys; every element in them read as lost
+seed        = 1 (list-append, snapshot isolation), 5 (bank, serializable)
+workload    = txn_bank
+nodes       = 5
+faults      = drawn from seed; needs a merge whose descriptor removal has not
+              landed when the audit runs, which this phase's churn makes common
+invariant   = lost_elements (list-append), conservation (bank)
+reproduce   = anvil_txn_faults 30
+note        = fixed by holder_of(), which asks each live machine whether its own
+              applied descriptor contains the key rather than trusting the
+              topology's stale opinion. Surfaced a real duplicated-element
+              anomaly the loss had been hiding, and cost the drill its
+              (accidental) detection of `secondaries before primary` -- both
+              recorded in CONTEXT.md section 14.
