@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -110,6 +111,14 @@ struct TxnBankState {
   // kListAppend: every element the client was told was committed. Every one of
   // them must be present in the final state exactly once.
   std::map<checker::Element, std::string> acked_elements;  // element -> key
+
+  // Every element id the workload has handed out, across every client and every
+  // incarnation of every node. The checker's central precondition is that
+  // `element -> writer` is a function; this is the harness holding itself to it,
+  // because a generator that reissues an id produces a history the checker must
+  // call a duplicate-element anomaly and there is no way to tell that apart from
+  // a real one after the fact. See [ANV-0055].
+  std::set<checker::Element> issued_elements;
   std::uint64_t lost_elements = 0;
   std::uint64_t duplicated_elements = 0;
 

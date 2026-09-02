@@ -1,0 +1,19 @@
+# ANV-0055 -- the generator reissued element ids across a crash
+# element_counter was a local of the client_loop coroutine; ProcessModel::crash
+# destroys every frame on the node, so the next incarnation started at zero and
+# reissued ids the previous one had already committed
+seed        = 1 (list-append, snapshot isolation)
+workload    = txn_bank, kListAppend
+nodes       = 5
+faults      = drawn from seed; needs only a crash on a node running a client,
+              which this phase's profile produces on essentially every run
+invariant   = duplicated_elements (workload) and Anomaly::kDuplicateElement (Elle)
+reproduce   = anvil_txn_faults 30
+expect      = before the fix, seed 1 reports 3 duplicated elements and the Elle
+              checker names them (`element 5497558138885 on key 11 appended by
+              both T6 and T24`), leaving snapshot-isolation at 3/4 checker-clean;
+              after it, 4/4 and no duplicates at any level
+note        = a harness bug, not an engine bug: the checker was correctly
+              reporting a broken precondition. The workload now asserts that
+              precondition itself, so the next occurrence reports as the
+              generator's fault rather than the database's.

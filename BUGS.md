@@ -847,6 +847,65 @@ lesson: |
 ```
 </details>
 
+<details>
+<summary><b>ANV-0055</b> · S4 · checker · <b>the list-append generator reissued element ids after a crash, and the checker was obliged to call it a duplicate</b></summary>
+
+```yaml
+id:              ANV-0055
+title:           the element counter was a coroutine local, and a crash destroys every frame on the node
+status:          fixed
+severity:        S4
+class:           test-infra
+layer:           checker
+invariant:       duplicated_elements (workload) and Anomaly::kDuplicateElement (Elle)
+found_by:        dst-random
+api_visible:     no -- the anomaly was manufactured by the harness
+seed:            1 (list-append, snapshot isolation)
+config:          workloads/txn_bank.cc, kListAppend, 5 nodes, faults on
+commit_found:    f473107
+runs_to_first_hit: 1 in 1 -- it needs only a crash on a client node, which this phase produces constantly
+root_cause: |
+  An element id was `(node << 40) | ++element_counter`, and `element_counter`
+  is a local of the `client_loop` coroutine. `boot_node` spawns that coroutine,
+  and `ProcessModel::crash` calls `destroy_tasks_for(node)` -- so a crash
+  destroys the counter and the next incarnation's loop starts again at zero and
+  hands out ids the previous incarnation had already appended and had already
+  been told were committed.
+
+  Confirmed directly rather than inferred. Instrumenting the draw site on the
+  failing seed:
+
+      TRACE draw node=5 hid=6  boots=1 first=5497558138885
+      TRACE draw node=5 hid=24 boots=2 first=5497558138885
+
+  T6 and T24 are two unrelated transactions, one per incarnation, that drew the
+  same id -- which is exactly what the checker reported: `element 5497558138885
+  on key 11 appended by both T6 and T24`.
+
+  The checker was right to report it. `history.h` states the precondition and
+  its two readings: "either the generator is broken or the database applied a
+  write twice", and from a history alone those are indistinguishable. This one
+  was the generator.
+fix_commit:      P6
+regression:      test/corpus/ANV-0055.seed
+invariant_added: none -- but the workload now asserts its own precondition
+lesson: |
+  Third appearance of gotcha 10.25 in this phase, after the transaction id that
+  was a per-Coordinator counter and the `init_proposed` latch: an in-memory
+  decision that has to outlive a crash but is not derived from anything that
+  does. The tell is always the same -- a counter starting at zero next to a
+  reboot path.
+
+  A client's identity has to survive the process it runs in, so the id now
+  carries the incarnation `ProcessModel` already tracks. The more durable half
+  of the fix is that the workload now records every id it hands out and reports
+  a collision *as a harness failure*, in the harness's own words. A generator
+  bug that reaches the checker arrives wearing a database bug's clothes, and
+  this phase has already spent three findings on false positives that looked
+  exactly like real ones.
+```
+</details>
+
 <details open>
 <summary><b>ANV-0001</b> · S4 · sim · <b>the scheduler silently discarded one event at every deadline</b></summary>
 

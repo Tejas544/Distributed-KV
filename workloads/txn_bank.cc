@@ -16,6 +16,13 @@ std::string data_key(std::uint32_t index) {
   return out;
 }
 
+// An element id, in three fields: which node issued it, which incarnation of
+// that node, and the counter within that incarnation. The middle field is the
+// load-bearing one -- see the draw site in client_loop.
+constexpr checker::Element element_id(NodeId node, std::uint64_t epoch, std::uint64_t counter) {
+  return (node.value() << 48) | ((epoch & 0xffff) << 32) | (counter & 0xffff'ffff);
+}
+
 // A list value is a length-prefixed sequence of elements. Explicit rather than
 // a delimiter, because an element is a 64-bit integer and any delimiter is a
 // value some element can take.
@@ -258,7 +265,12 @@ Plan draw_plan(DeterministicRandom& rng, const TxnBankConfig& cfg) {
   return plan;
 }
 
-Task<void> client_loop(Runtime& rt, TxnBankConfig cfg, TxnBankState* state, NodeId self) {
+// `epoch` is the incarnation of the process this loop was spawned into. It has
+// to be a parameter rather than something the loop reads for itself, because it
+// identifies *this* client, and the whole point of it is that the number
+// outlives the frame it is used in.
+Task<void> client_loop(Runtime& rt, TxnBankConfig cfg, TxnBankState* state, NodeId self,
+                       std::uint64_t epoch) {
   co_await rt.sleep_for(cfg.settle_before_start);
 
   std::uint64_t element_counter = 0;
@@ -279,9 +291,30 @@ Task<void> client_loop(Runtime& rt, TxnBankConfig cfg, TxnBankState* state, Node
     // restart appends the same elements. Globally unique by construction:
     // element -> writer has to be a function or the checker cannot recover the
     // version order at all.
+    //
+    // The incarnation is in the id because `element_counter` is a local of this
+    // coroutine, the coroutine is spawned by boot_node, and a crash destroys
+    // every frame on the node -- so the next incarnation's loop starts counting
+    // from zero again and hands out ids the previous one already used. That is
+    // [ANV-0055]: two unrelated transactions appending the same number, which
+    // the checker is obliged to call a duplicate element because a broken
+    // generator and a doubly-applied write are indistinguishable from the
+    // history alone. A client's identity has to survive the process it runs in.
     std::vector<checker::Element> elements;
     for (std::size_t i = 0; i < plan.steps.size(); ++i) {
-      elements.push_back((self.value() << 40) | (++element_counter));
+      elements.push_back(element_id(self, epoch, ++element_counter));
+    }
+
+    // The precondition, enforced rather than assumed. If it is ever broken
+    // again this reports as what it is -- the workload's fault -- instead of
+    // arriving at the checker disguised as a database anomaly.
+    for (const checker::Element e : elements) {
+      if (!state->issued_elements.insert(e).second) {
+        state->violations.push_back(
+            "the workload issued element " + std::to_string(e) +
+            " twice; element -> writer is not a function and every list-append "
+            "verdict on this run is void");
+      }
     }
 
     const checker::TxnId history_id = state->history.begin(self.value(), rt.now());
@@ -473,7 +506,7 @@ void boot_node(sim::Simulation& simulation, TxnBankConfig cfg, TxnBankState* sta
   }
 
   store_ptr->start(/*bootstrap=*/true);
-  rt.spawn(client_loop(rt, cfg, state, self));
+  rt.spawn(client_loop(rt, cfg, state, self, simulation.process().incarnation(self)));
   rt.spawn(heartbeat_loop(rt, cfg, state, self));
 }
 

@@ -1296,22 +1296,53 @@ Open, and now a short list of genuine findings rather than a fog:
    around. That fixed seed 1's element loss, seed 5's 710/1600, and silenced
    the `no commit-wait` control.
 
-   It also **surfaced a real anomaly that the loss had been masking**: three
+   It also **surfaced an anomaly that the loss had been masking**: three
    duplicated elements on the same seed, which the Elle checker names
-   precisely (`element ... on key 11 appended by both T6 and T24`). An element
-   appended twice is an idempotence failure in the retry path, and it is now
-   the sharpest open transactional finding.
+   precisely (`element ... on key 11 appended by both T6 and T24`). That became
+   finding 8.
+
+8. **The duplicated elements were the generator, not the engine — and gotcha
+   10.25 for the third time this phase.** This is [ANV-0055](BUGS.md). An
+   element id was `(node << 40) | ++element_counter`, and `element_counter` is
+   a local of the `client_loop` coroutine. `boot_node` spawns that coroutine
+   and `ProcessModel::crash` calls `destroy_tasks_for(node)`, so a crash
+   destroys the counter and the next incarnation starts at zero and reissues
+   ids the previous one had already had acknowledged.
+
+   Confirmed by instrumenting the draw site rather than by reasoning about it:
+
+   ```
+   TRACE draw node=5 hid=6  boots=1 first=5497558138885
+   TRACE draw node=5 hid=24 boots=2 first=5497558138885
+   ```
+
+   T6 and T24 are two unrelated transactions, one per incarnation, drawing the
+   same number — precisely what the checker reported. And the checker was
+   right to report it: [history.h](anvil/checker/history.h) states the
+   precondition and both of its readings, "either the generator is broken or
+   the database applied a write twice", which from a history alone are
+   indistinguishable. Note this cuts the other way too — an element id that is
+   unique cannot *hide* a double apply, because a doubly-applied append still
+   puts the same element in the list twice under a single transaction. So the
+   fix removes the collision without removing any detection.
+
+   The id now carries the incarnation `ProcessModel` already tracks, and — the
+   half that will matter next time — the workload records every id it hands out
+   and reports a collision **as a harness failure in the harness's own words**.
+   A generator bug that reaches the checker arrives wearing a database bug's
+   clothes, and this phase has now spent four findings on false positives that
+   looked exactly like real ones. Snapshot isolation went 3/4 → **4/4
+   checker-clean**, with the drill unchanged mutation-for-mutation, which is
+   what says the fix is orthogonal rather than a blinding.
 
 ### Where P6 stands after all of that
 
 Green: `shard_faults` 20/20, mechanism 30/30, shard and checker units,
-`checker.mutation` (P7's gate) 100%, determinism 3/3, serializable and
-strict-serializable 4/4 checker-clean, INV-TXN-02/09 silent.
+`checker.mutation` (P7's gate) 100%, determinism 3/3, **all three levels 4/4
+checker-clean**, INV-TXN-02/09 silent.
 
-Open, and all four are now named rather than vague:
+Open, and all three are named rather than vague:
 
-- **Duplicated elements** (seed 1, snapshot isolation, 3 of them). The retry
-  path applying an append twice. Sharpest lead in the phase.
 - **Two conservation shortfalls** (seeds 1 and 7, 17 and 15 of 1600). The
   audit's cross-range intent blind spot described above -- real, with a fix
   that is known and rejected for blinding the drill. Needs a different fix.
