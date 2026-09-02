@@ -54,6 +54,16 @@ target_link_libraries(anvil_checker_test PRIVATE anvil::checker anvil::sanitizer
 add_test(NAME checker.elle COMMAND anvil_checker_test)
 set_tests_properties(checker.elle PROPERTIES LABELS "checker;gate" TIMEOUT 300)
 
+# P7 exit criterion 1, at the size the criterion states rather than the size
+# that belongs in a unit suite: a reported mutation score over ~200 anomalous
+# histories, and zero false positives over 10,000 serial ones. checker.elle
+# above asserts the same two properties small and fast; this is the gate that
+# produces the number the rest of the suite's credibility rests on.
+add_executable(anvil_checker_mutation checker_mutation.cc)
+target_link_libraries(anvil_checker_mutation PRIVATE anvil::checker anvil::sanitizers)
+add_test(NAME checker.mutation COMMAND anvil_checker_mutation 200 10000)
+set_tests_properties(checker.mutation PROPERTIES LABELS "checker;verification;gate" TIMEOUT 1800)
+
 add_executable(anvil_sim_faults sim_faults.cc)
 target_link_libraries(anvil_sim_faults PRIVATE anvil::workloads anvil::sanitizers)
 add_test(NAME sim.faults COMMAND anvil_sim_faults 150)
