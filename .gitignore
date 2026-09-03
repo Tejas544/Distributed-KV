@@ -44,3 +44,7 @@ spec/states/
 # whole point -- the seed goes in the ledger, the JSONL does not go in git.
 fleet/
 *.fleet.jsonl
+
+# Python bytecode from the report tools.
+__pycache__/
+*.pyc
