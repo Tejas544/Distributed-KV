@@ -39,3 +39,8 @@ tools/elle/target/
 # TLC's own scratch: a states/ directory per run, holding the fingerprint set
 # and any counterexample dump. Regenerable by tools/tlc.sh.
 spec/states/
+
+# Seed-fleet output. Regenerable by tools/fleet.sh from the seeds, which is the
+# whole point -- the seed goes in the ledger, the JSONL does not go in git.
+fleet/
+*.fleet.jsonl

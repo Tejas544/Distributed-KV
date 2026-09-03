@@ -388,6 +388,26 @@ parallel-commit divergence P6 predicted and no seed had ever reached).
 
 ## P8 — The bug hunt at scale · Weeks 30–32
 
+**Status: in progress. Two of six deliverables built, one exit criterion met and
+one partly.**
+
+| Deliverable | State |
+|---|---|
+| Nightly seed fleet: distribute seeds, collect artifacts, deduplicate by invariant + minimised fault signature, file candidate rows | **built** — `test/fleet.cc`, `tools/fleet.sh`, `tools/fleet_report.py` |
+| Coverage-guided seed selection | not started — the highest-leverage item left |
+| Swarm testing across the configuration space | not started |
+| Mixed-version testing | not started — the largest single item |
+| Full seeded-mutation suite as one report | **built** — `test/drill_report.h`, `tools/mutation_report.py`: **23/23 must-detect caught, 8 of 23 invisible from the client API** |
+| Metrics automation (`tools/report.py`) | not started |
+
+The fleet's first run, twenty-four seeds, produced two distinct failure classes:
+one already understood (a single-replica log cannot survive bit rot, and the
+checksum's job is to notice) and one new — [ANV-0066](../BUGS.md), a stale
+linearizable read minimised from the eleven fault features its seed drew down to
+exactly two, `partition + disk.slow_io`, with 1-minimality verified. The row is
+filed open and *unclassified*: this project has produced that symptom from the
+harness twice and from the engine never, so guessing would be the wrong move.
+
 **Goal.** Turn compute into ledger rows.
 
 **Deliverables**

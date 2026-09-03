@@ -8,7 +8,7 @@ If you change architecture, add a layer, hit a non-obvious trap, or finish a
 phase — **update this file in the same commit**. A context document that lags the
 code is worse than none, because it is trusted.
 
-- Last updated: end of **P7** (verification depth), branch `main`
+- Last updated: **P8 in progress** (the bug hunt at scale), branch `main`
 - Repo: `https://github.com/Tejas544/Distributed-KV.git`, branch `main`
 - ~32,300 lines C++20 + Python tooling, 118 source files
 
@@ -315,7 +315,7 @@ planting a bug.
 | **P5 sharding** | **done again, and for a better reason** | MultiRaft, one Raft group per range; 9 `INV-SHARD-*` armed; 20 ledger rows, 7 of them S0. `shard_faults` 20/20 green. ANV-0051 found INV-SHARD-CLIENT comparing concurrent reads as sequential; because the simulator halts on first violation that false positive had been capping seed 19 at tick 4395 for the whole phase, hiding ANV-0052 (S0) -- a range merged away while holding the only copy of a child's data. Both fixed. See §14 |
 | **P6 distributed transactions** | **in progress, four findings open** | Percolator/SSI/StrictSerializable behind one `Coordinator`; 7 `INV-TXN-*` armed (01-04, 09, 11, 12). Green: `anvil_txn_test` 30/30, determinism 3/3, serializable and strict-serializable 4/4 checker-clean, INV-TXN-09 silent. The fault-free money-loss finding is fixed (two root causes), as are the two that turned out to be checkers looking in too few places. What remains: two small conservation shortfalls, one INV-TXN-02, one list-append loss. See §14 |
 | **P7 verification depth** | **done** | All 5 exit criteria met: checker mutation (200/200, 0 FPs), Elle cross-validation (10,000/10,000 verdicts identical), TLA+ (9/9 configurations as specified) and trace validation (16/16 runs conform, 12/16 mutated rejected), state-space search (2.2M states complete, 0 violations, 3/3 drill), minimiser (11 features → 1, verified 1-minimal). Three ledger findings — ANV-0063, ANV-0064 (both S4, both from two instruments disagreeing) and ANV-0065 (S1, TLC produced the parallel-commit divergence P6 predicted and no seed reached) — plus seven discrepancies found by trace validation, three of them in the specification itself. See §15 |
-| P8+ | not started | The bug hunt at scale, prod runtime |
+| **P8 the bug hunt at scale** | **in progress** | The seed fleet and the unified seeded-mutation report are built; 1 of 6 exit criteria met, 1 partly. First run filed [ANV-0066] -- a stale linearizable read minimised from eleven fault features to two. See §16 |
 
 ### Measured (see README results block)
 
@@ -1783,6 +1783,181 @@ Long-standing blockers are unchanged: `anvil/prod/` is still an empty target,
 the cross-toolchain digest gate has still never run, and **ANV-0033** — a run's
 outcome depending on sixteen bytes of environment variable — is still the single
 highest-value thing to do with a Linux box.
+
+---
+
+## 16. P8 (the bug hunt at scale): started, and what it has produced
+
+**Status: in progress.** Two of six deliverables are built and one exit
+criterion is partly met. This section says which, and what the rest would take,
+because a phase claimed complete on a third of its deliverables is worth less
+than a phase honestly reported as a third done.
+
+P8's goal is one sentence: **turn compute into ledger rows.** Every phase before
+it built an instrument. This one runs them, at volume, and does the three things
+that decide whether a large fleet is useful or merely expensive.
+
+### What is built
+
+**The seed fleet** (`test/fleet.cc`, `tools/fleet.sh`, `tools/fleet_report.py`).
+One process per core, each taking `seed % shards`, each writing its own JSONL: no
+locking, no scheduler, and a shard that dies takes nothing with it. Five
+workloads per seed — counter, raft_kv, mvcc, shard_kv, txn_bank.
+
+Three properties, and the second is the one that makes the output usable:
+
+1. It reports **simulated node-hours**, not wall clock. A fleet that has run for
+   eight hours has said nothing until you know how much cluster-time that bought.
+2. It **minimises the fault set of every failure** before recording it, through
+   `anvil/sim/minimiser.h`. This is what P7's criterion 5 was for.
+3. It **deduplicates by (workload, invariant, minimised signature)** and
+   separates failures that are already classified from ones that are not. The
+   first thing a fleet produces at volume is four hundred copies of one bug.
+
+The fleet *records*; it does not assert. A seed that violates an invariant is a
+candidate, and roughly a third of this project's candidates have been the harness
+rather than the engine. The one thing it does assert is its own premise: a
+workload failing on essentially every seed is a broken harness, not a discovery,
+and the report says so rather than filing two thousand rows.
+
+**The unified seeded-mutation report** (`test/drill_report.h`,
+`tools/mutation_report.py`). Every phase's drill, in one table, with detection
+rate, the by-invariant column and — the one that matters — **API visibility**.
+Each suite keeps its own drill and its own human-readable table and gains one
+machine-readable `DRILL|` line per row. Moving the drills into a single binary
+would have meant six harnesses reimplemented in a seventh, which is how a report
+ends up measuring something other than what ships.
+
+### What it found
+
+**240 seeds, 982 runs, 177.8 simulated node-hours**, at roughly 250x simulated
+node-time per core. Nine distinct failure classes: two already understood, seven
+new candidates. Per workload, the failure rates are worth reading as a group --
+mvcc, shard_kv and txn_bank at 0%, counter at 7.0% and raft_kv at 4.1% -- because
+a fleet where everything fails is a broken harness and a fleet where nothing does
+is a fleet that is not looking hard enough.
+
+The two understood classes, each with its argument in
+`tools/fleet_report.py`'s table:
+
+- **counter / INV-CTR-01 under `disk.bit_rot + process.crash`** (14 seeds, all
+  1-minimality verified). A single-replica write-ahead log cannot survive a
+  flipped bit in a record it already wrote -- there is nowhere to recover it
+  from -- and what it must do is *notice*, which the checksum does.
+- **raft_kv / INV-RAFT-13 under a signature containing a clock fault.** A lease
+  is an optimisation licensed by a clock bound, and the fault profile can
+  deliberately exceed the bound it declares. `raft_faults.cc` classifies these
+  the same way.
+
+The seven new classes are all raft_kv: four `INV-RAFT-09` (leader completeness)
+and three `INV-RAFT-14` (a stale linearizable read), with minimal sets as sharp
+as `process.crash` alone -- 1-minimality verified on six of the seven.
+
+**One is filed in detail; the other six are a triage queue, not six ledger
+rows.** [ANV-0066](../BUGS.md) is the one with the most information in it, and
+the reason it is the one written up is that its minimal set *rules out* the
+standard explanations. Filing six more unclassified rows would be filing noise
+into the artifact whose whole value is that every row has been thought about; the
+fleet's own output is the queue, and it is regenerable by one command.
+
+Worth stating plainly: **the fleet's classification is deliberately narrower than
+each suite's.** `raft_faults.cc` knows things the fleet does not, because the
+fleet runs the workloads rather than the suites. So "seven new" is an
+over-approximation -- which is the right direction for a fleet to be wrong in,
+and reconciling the two is the next task in this phase.
+
+### What the very first run found, twenty-four seeds in
+
+Two distinct failure classes, one of them already understood and one not:
+
+- **Understood**: the counter workload's `INV-CTR-01` under
+  `disk.bit_rot + process.crash`. A single-replica write-ahead log cannot survive
+  a flipped bit in a record it already wrote — there is nowhere to recover it
+  from — and what it must do is *notice*, which the checksum does. The
+  classification table in `tools/fleet_report.py` carries that argument next to
+  the entry, and the rule for adding to it is that an entry needs an argument
+  which would convince somebody who wanted to believe it was a bug.
+
+- **New**: [ANV-0066](../BUGS.md). `INV-RAFT-14` on raft_kv seed 21 —
+  a linearizable read returned index 12 after a write acknowledged at index 31.
+  The minimiser reduced the eleven fault features that seed draws to exactly
+  **two**, `partition + disk.slow_io`, and verified 1-minimality: each of the
+  other nine was individually shown not to be needed, at a cost of 45 simulation
+  runs. Deterministic — two invocations produce identical event counts, detail
+  and signature.
+
+  The *absence* from the minimal set is the informative half. No clock skew and
+  no clock-bound violation, so the standing classification for stale lease reads
+  does not apply. No crash and no bit rot, so the corruption bucket does not
+  either. Partition plus slow I/O is a configuration a production cluster is in
+  on an ordinary afternoon.
+
+  It is filed **open and unclassified**, because this project has produced this
+  exact symptom from the harness twice (ANV-0022, ANV-0041) and from the engine
+  never. Guessing would be the wrong move; the row names both readings and the
+  reproduction is one command.
+
+That is the argument for wiring the minimiser into the fleet rather than filing
+raw seeds, and it is worth stating as a number: eleven features to two, for 45
+runs. "Reproduces under seed 21 with everything on" is a row nobody picks up.
+
+### The merged report immediately over-claimed, on the one column where that is fatal
+
+Three P6 rows came back listed as caught-but-invisible-from-the-API. They were
+caught by the Elle-style consistency checker, which analyses the **client's own
+history** and nothing else -- so an anomaly it names is by construction something
+an outside-in checker could have found. `client_safe()` in the txn drill covered
+the bank's conserved total and the list's element accounting and left the
+checker's verdict out.
+
+That column is the entire evidence for the protocol-aware argument, and the
+README says overstating it is the fastest way to lose credibility. Merging six
+drills into one table is what made the mistake visible: in the P6 suite alone,
+"caught by G2-item" sat next to a table full of internal invariant names and
+looked like one of them.
+
+### One mistake worth recording, because it would recur
+
+The fleet's first version handed the minimiser a *fresh* schedule seed for its
+first attempt, on the reasoning that varying the schedule is exactly what the
+minimiser's own header asks for. It is — for attempts *after* the first.
+Starting anywhere other than the schedule that actually failed throws away the
+only run known to reproduce, and ANV-0066 came back as eleven features with
+1-minimality unverified, which is precisely what a predicate that never
+reproduces anything looks like. Attempt 0 is now the original run.
+
+And a smaller one: a fleet's runs are bounded in *simulated* time, which says
+nothing about how long they take. One seed spent seven wall-minutes inside a
+single raft_kv simulation — legitimate, just expensive — while eleven cores sat
+finished. Shards now have a wall-clock budget and keep everything they flushed.
+
+### The exit criteria, honestly
+
+| # | Criterion | State |
+|---|---|---|
+| 1 | ≥ 20,000 simulated node-hours, reported honestly | **partly** — the fleet reports node-hours and the speedup that bought them (~250x per core). 20,000 needs roughly seven wall-hours on twelve cores; what has actually been accumulated is reported in the README and it is far less |
+| 2 | BUGGIFY site activation coverage ≥ 95% | **not started** — and the honest note is that the core has *one* BUGGIFY site, so this criterion currently measures almost nothing. More sites is the real work, and each needs an argument for why it cannot make correct code wrong |
+| 3 | Branch coverage under simulation ≥ 85% for `core/` | **not started** — needs gcov instrumentation wired into the build |
+| 4 | Every ledger bug has a pinned seed that reproduces before its fix and passes after | **not started** — the seeds exist; the before/after CI check does not |
+| 5 | Mixed-version cluster survives 200 node-hours of rolling upgrade | **not started** — needs two versions of the engine in one process, which is the largest single item in the phase |
+| 6 | Full mutation report: detection rate, MTTD, API visibility | **met** — `tools/mutation_report.py` |
+
+### What the remaining four need, so the next session does not re-derive it
+
+- **Coverage-guided seed selection** is the deliverable that would change the
+  fleet from linear to super-linear, and it is the one with the most leverage
+  left. It needs `--coverage` builds, per-seed branch-coverage collection, and a
+  corpus that retains a seed when it reaches new coverage. Without it, most
+  simulated hours re-explore the same interleavings — which is the roadmap's own
+  phrasing and is correct.
+- **Mixed-version testing** is the largest item and the least like the others: it
+  needs the engine compiled twice into one binary under different namespaces, or
+  a process boundary the simulator can drive. Worth scoping properly before
+  starting.
+- **`tools/report.py`** would generate the README results block. The parts that
+  are already machine-readable are the fleet's JSONL, the `DRILL|` lines, and
+  the TLA+ runner's table; the rest of the block is hand-transcribed and the
+  README now says so rather than claiming otherwise.
 
 ---
 

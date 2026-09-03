@@ -1,0 +1,37 @@
+# ANV-0066 -- a linearizable read returned an index nineteen behind a write that
+# had completed before it was invoked, needing only a partition and slow I/O
+#
+# OPEN, and open in the specific sense that it is not yet known whether this is
+# the engine or the harness. Both have produced this exact symptom before
+# (ANV-0022, ANV-0041), which is why the row does not guess.
+seed        = 21
+workload    = raft_kv, RaftKvConfig{}
+binary      = anvil_fleet
+reproduce   = anvil_fleet --seeds 21 --shard 21 --shards 22 --workload raft_kv \
+                          --out /tmp/probe.jsonl
+              (or the whole fleet: tools/fleet.sh 24 12)
+expect      = {"violated":true,"invariant":"INV-RAFT-14",
+               "signature":"partition + disk.slow_io","one_minimal":true,
+               "minimiser_runs":45,"events":144083}
+              detail: n4 read k2 at index 12 after a write acknowledged at
+                      index 31 (stale)
+determinism = two invocations produce identical event counts, identical detail
+              and an identical minimised signature. Verified.
+faults      = seed 21 draws ELEVEN fault features; the minimiser reduces them to
+              TWO and verifies 1-minimality -- every other nine was individually
+              shown not to be needed, at a cost of 45 simulation runs.
+              minimal set: partition + disk.slow_io
+              NOT in the minimal set, and this is the informative half:
+                clock.skew, clock.bound_violation -- so the standing
+                  classification for stale lease reads does not apply
+                process.crash, disk.bit_rot -- so the corruption bucket
+                  (stale_reads_after_corruption) does not apply either
+next        = read the trace, do not theorise (gotcha 10.17). The two candidate
+              mechanisms are in the ledger row: a ReadIndex reply generated
+              before the apply it waited on completed (engine, S0), or a
+              freshness measure that is not the log's applied index (harness,
+              which is ANV-0041 returning).
+note        = filed by the P8 seed fleet on its first run, 24 seeds. The row
+              exists as much to record what a minimised fault signature is worth
+              as to record the finding: "reproduces under seed 21 with
+              everything on" is a row nobody picks up.

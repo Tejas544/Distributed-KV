@@ -262,6 +262,21 @@ add_test(NAME verification.minimiser COMMAND anvil_minimiser_test 400)
 set_tests_properties(verification.minimiser PROPERTIES LABELS "verification;gate" TIMEOUT 900)
 
 # ---------------------------------------------------------------------------
+# P8: one shard of the seed fleet.
+#
+# Not a ctest gate -- it *records* rather than asserts, which is the whole point
+# (a seed that violates an invariant is a candidate, and roughly a third of this
+# project's candidates have been the harness rather than the engine). The ctest
+# entry is a smoke test that the driver runs and writes its JSONL; the fleet
+# proper is tools/fleet.sh, one process per core.
+# ---------------------------------------------------------------------------
+add_executable(anvil_fleet fleet.cc)
+target_link_libraries(anvil_fleet PRIVATE anvil::workloads anvil::checker anvil::sanitizers)
+add_test(NAME fleet.smoke COMMAND anvil_fleet --seeds 2 --workload counter
+                                  --out /tmp/anvil-fleet-smoke.jsonl)
+set_tests_properties(fleet.smoke PROPERTIES LABELS "fleet" TIMEOUT 600)
+
+# ---------------------------------------------------------------------------
 # The gate's negative test.
 #
 # This archive is deliberately full of forbidden symbols. The test passes only

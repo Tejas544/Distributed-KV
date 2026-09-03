@@ -47,6 +47,7 @@
 #include "anvil/checker/shard_invariants.h"
 #include "anvil/sim/simulation.h"
 #include "workloads/shard_kv.h"
+#include "test/drill_report.h"
 
 namespace {
 
@@ -581,6 +582,19 @@ void test_seeded_mutation_drill(std::uint64_t seeds) {
                                    : std::to_string(result.api_visible) + "/" +
                                          std::to_string(result.detected);
     std::cout << row << "\n";
+    {
+      std::string ids;
+      for (const std::string& id : result.fired) {
+        if (!ids.empty()) ids += " ";
+        ids += id;
+      }
+      anvil::testing::emit_drill(
+          "P5", "shard_kv", mutation.name, result.detected, result.seeds,
+          result.invariant_fired, result.api_visible, 0, ids,
+          mutation.expectation == Expectation::kMustDetect    ? "must-detect"
+          : mutation.expectation == Expectation::kEquivalent  ? "equivalent"
+                                                              : "control");
+    }
 
     if (mutation.expectation == Expectation::kMustDetect) {
       ++must_detect;

@@ -49,6 +49,7 @@
 #include "anvil/checker/txn_invariants.h"
 #include "anvil/sim/simulation.h"
 #include "workloads/txn_bank.h"
+#include "test/drill_report.h"
 
 namespace {
 
@@ -261,7 +262,21 @@ struct Summary {
   // What a black-box client could have seen: money that does not add up, an
   // acknowledged element the cluster lost or duplicated. The checker's own
   // verdict is deliberately excluded -- that is the internal half.
-  bool api_visible() const { return !client_safe(); }
+  // The Elle verdict counts, and leaving it out was over-claiming.
+  //
+  // `client_safe()` is the bank's conserved total and the list's element
+  // accounting -- things a client computes from its own acknowledgements. The
+  // consistency checker's verdict belongs in the same bucket: it is derived
+  // from the *client's history* and nothing else, so an anomaly it names is by
+  // construction something an outside-in checker could have found. Excluding it
+  // made three rows of the merged seeded-mutation report claim a bug was
+  // invisible from the API when a client-side checker is exactly what caught
+  // it, and the API-visibility column is the one place in this project where
+  // over-claiming is fatal -- it is the whole evidence for the protocol-aware
+  // argument.
+  bool api_visible() const {
+    return !client_safe() || (elle.has_value() && !elle->valid);
+  }
 
   std::set<std::string> fired_ids() const {
     std::set<std::string> out;
@@ -880,6 +895,17 @@ void test_seeded_mutation_drill(std::uint64_t seeds) {
                                    : std::to_string(result.api_visible) + "/" +
                                          std::to_string(result.detected);
     std::cout << row << "\n";
+    {
+      std::string ids;
+      for (const std::string& id : result.fired) {
+        if (!ids.empty()) ids += " ";
+        ids += id;
+      }
+      anvil::testing::emit_drill(
+          "P6", "txn_bank", mutation.name, result.detected, result.seeds, result.detected,
+          result.api_visible, 0, ids,
+          mutation.expectation == Expectation::kMustDetect ? "must-detect" : "control");
+    }
 
     if (mutation.expectation == Expectation::kMustDetect) {
       ++must_detect;

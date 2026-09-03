@@ -14,9 +14,9 @@
 
 | | |
 |---|---|
-| Phase | `P7 — verification depth: checker, TLA+, trace validation, DPOR, minimiser`, **complete** (see [docs/ROADMAP.md](docs/ROADMAP.md)) |
+| Phase | `P8 — the bug hunt at scale`, **in progress**; P7 complete (see [docs/ROADMAP.md](docs/ROADMAP.md)) |
 | Working | Runtime seam · hermeticity gate + negative control · deterministic scheduler on virtual time · **19 fault kinds** across network, disk, clock and process · invariant framework with cost classes · Elle-style consistency checker · serial reference model · **LSM engine: WAL, skiplist memtable, block-based SSTables with Bloom filters, MANIFEST/VersionSet, leveled compaction, block cache, crash recovery** · **Raft: pre-vote, CheckQuorum, pipelined replication, joint consensus, learners, log compaction, chunked snapshot install, leases, ReadIndex, leadership transfer** · **MVCC: inverted-timestamp versions, snapshot reads, write intents, wound-wait, deadlock detection, safepoint-driven GC, single-node transactions at snapshot isolation** · **sharding: MultiRaft with one Raft group per range, a Raft-replicated placement driver, atomic split and merge, range leases, a two-level meta index, a client range cache with generation invalidation, replica rebalancing and range quiescence** · **distributed transactions: one coordinator over three engines (Percolator/SI, SSI with read refresh, Spanner-style commit-wait), write intents and transaction records, parallel commit, cross-range transactions over a topology that splits and merges underneath them, distributed deadlock detection** · **verification: a state-space model checker over the real Raft state machine with sleep-set partial-order reduction, TLA+ specifications of Raft-with-joint-consensus and the SSI commit protocol model-checked by TLC with graded negative controls, trace validation replaying real implementation runs against those specifications, delta-debugging fault minimisation, and cross-validation against Jepsen's Elle** · execution digest · causal trace |
-| Next | P8: the bug hunt at scale — a nightly seed fleet that turns compute into ledger rows, deduplicating failures by invariant and minimised fault signature |
+| Next | P8's remaining four deliverables: coverage-guided seed selection, swarm testing, mixed-version clusters, and metrics automation |
 | Language | C++20 (coroutines, concepts, ranges) + Python 3 tooling + TLA+ specs |
 | Platforms | Linux x86-64 (primary), macOS arm64 (determinism cross-check), Windows via WSL2 |
 | Bug ledger | [BUGS.md](BUGS.md) |
@@ -379,7 +379,41 @@ commit-wait vs uncertainty restart ... shown redundant with each other by direct
                                        3/20 seeds
 sweep runtime ........................ ~100s for 30 seeds
 
-bugs found (S0/S1/S2/S3/S4) .......... 20/13/10/2/20   (see BUGS.md; three open)
+-- P8, the bug hunt at scale (in progress) --
+seeded-mutation report ............... every deliberate bug in the tree, one
+                                       table (tools/mutation_report.py)
+  must-detect caught ................. 23/23
+  invisible from the client API ...... 8/23
+                                       Eight bugs that were caught and that no
+                                       client could have observed. Each is a
+                                       defect an outside-in checker
+                                       structurally cannot find, and this is
+                                       the whole empirical case for
+                                       protocol-aware simulation testing.
+  controls silent .................... 10/10
+  equivalent-in-class ................ 2, each with a written argument
+  covered by a named test ............ 1
+
+seed fleet ........................... 5 workloads/seed, one shard per core,
+                                       every failure's fault set minimised and
+                                       deduplicated by (workload, invariant,
+                                       signature)
+  throughput ......................... ~250x simulated node-time per core
+  240 seeds .......................... 982 runs, 177.8 simulated node-hours
+  failure rate by workload ........... mvcc 0.0%, shard_kv 0.0%, txn_bank 0.0%,
+                                       raft_kv 4.1%, counter 7.0%
+  distinct failure classes ........... 9 -- 2 already classified with a written
+                                       argument, 7 new candidates
+  sharpest new one ................... ANV-0066, minimised from the 11 fault
+                                       features its seed drew to 2 (partition +
+                                       disk.slow_io), 1-minimality verified in
+                                       45 runs, deterministic
+  honest caveat ...................... the fleet classifies more narrowly than
+                                       each suite does, so "7 new" is an
+                                       over-approximation and a triage queue
+
+bugs found (S0/S1/S2/S3/S4) .......... 20/13/10/2/20 + 1 unclassified
+                                       (see BUGS.md; four open)
 BUGGIFY site activation coverage ..... 1 site in the core (raft/send_append);
                                        makes the Figure-8 window reachable in
                                        tens of seeds instead of thousands

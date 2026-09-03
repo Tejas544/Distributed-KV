@@ -88,6 +88,19 @@ tools/trace_validate.sh 16 250              # P7 criterion 3, conformance: ~1 mi
 tools/elle_cross.sh                         # P7 criterion 2: ~9 min, first run longer
 ```
 
+### P8's two tools
+
+```bash
+tools/fleet.sh 240 12                       # the seed fleet, one shard per core
+tools/mutation_report.py                    # every phase's drill, one table: ~25 min
+```
+
+`tools/fleet.sh` runs five workloads per seed, minimises the fault set of every
+failure, deduplicates by (workload, invariant, minimised signature), and files
+candidate ledger rows for anything not already classified in
+`tools/fleet_report.py`'s table. `FLEET_SHARD_TIMEOUT` bounds a shard: runs are
+bounded in *simulated* time, which says nothing about how long they take.
+
 `tools/tlc.sh` grades every configuration against a stated expectation, and
 **four of the nine are required to FAIL, on a named property**. A control that
 fails on the wrong property is reported as a failure, not as a pass.
@@ -158,7 +171,28 @@ something fires, the first question is which of the two it is.
 | P5 sharding | done |
 | P6 distributed transactions | **done** — `txn_faults 30` green end to end |
 | **P7 verification depth** | **done** — all 5 exit criteria met |
-| P8+ | not started — next |
+| **P8 the bug hunt at scale** | **in progress** — seed fleet and unified mutation report built; 1 of 6 exit criteria met |
+| P9+ | not started |
+
+### P8 so far
+
+| # | Criterion | State |
+|---|---|---|
+| 1 | ≥ 20,000 simulated node-hours | **partly** — the fleet reports them, at ~250x per core. 20,000 needs roughly seven wall-hours on twelve cores |
+| 2 | BUGGIFY activation ≥ 95% | not started — and the core has *one* BUGGIFY site, so the criterion currently measures almost nothing |
+| 3 | Branch coverage ≥ 85% for `core/` | not started — needs gcov in the build |
+| 4 | Every ledger bug's seed reproduces before its fix, passes after | not started — the seeds exist, the CI check does not |
+| 5 | Mixed-version cluster, 200 node-hours | not started — the largest single item in the phase |
+| 6 | Full mutation report: detection, MTTD, API visibility | **met** — 23/23 must-detect caught; **8 of 23 were invisible from the client API** |
+
+That last number is the one to quote. Eight bugs that were caught, and that no
+client could have observed — each one a defect an outside-in checker
+structurally cannot find. It is the whole empirical case for protocol-aware
+simulation testing, and `tools/mutation_report.py` produces it.
+
+**Do not overstate that column.** Merging the six drills immediately exposed
+three rows claiming a bug was API-invisible when the Elle checker — which reads
+only the client's own history — is what caught it. Fixed; see CONTEXT.md §16.
 
 ### P7 exit criteria and their state
 

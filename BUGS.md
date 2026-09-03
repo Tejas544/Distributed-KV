@@ -907,6 +907,95 @@ lesson: |
 </details>
 
 <details open>
+<summary><b>ANV-0066</b> · S? · raft · <b>a linearizable read returned an index nineteen behind a write that completed before it was invoked, needing only a partition and slow I/O</b></summary>
+
+```yaml
+id:              ANV-0066
+title:           INV-RAFT-14 fires on raft_kv seed 21 with a minimised fault set of {partition, disk.slow_io} -- no clock skew, no crash, no corruption
+status:          open -- and open in the specific sense that it is not yet known
+                 whether this is the engine or the harness
+severity:        S?  -- deliberately not guessed. See below.
+class:           safety, if it is the engine
+invariant:       INV-RAFT-14 (a linearizable read never returns state older than
+                 a completed write)
+layer:           raft
+found_by:        dst-random -- the P8 seed fleet, first run, 24 seeds
+api_visible:     yes if real -- a client read returned a stale value
+seed:            21
+config:          SimConfig::from_seed(21), workload raft_kv with RaftKvConfig{},
+                 max_time 30s, heal_and_settle 120s  (tools/fleet.sh)
+commit_found:    P8
+runs_to_first_hit: 1 in 24 seeds of raft_kv
+faults_minimised: [partition, disk.slow_io]
+root_cause: |
+  NOT YET DETERMINED, and this row exists in that state on purpose: the ledger's
+  rule is that a row is written the day the finding is made, and the fleet's job
+  is to produce candidates a human can act on rather than verdicts.
+
+  What is known, and all of it is reproducible:
+
+    n4 read k2 at index 12 after a write acknowledged at index 31 (stale)
+
+  The minimiser reduced the eleven fault features seed 21 draws to exactly two,
+  and verified 1-minimality -- every one of the other nine was individually shown
+  not to be needed. 45 predicate runs. The run is deterministic: two invocations
+  produce identical event counts, identical detail and an identical signature.
+
+  What that minimisation rules out is the interesting part. There is **no clock
+  skew and no clock-bound violation** in the minimal set, so the standing
+  classification for stale lease reads -- a lease is an optimisation licensed by
+  a clock bound, and when the model exceeds its own declared bound the licence is
+  void -- does not apply. There is no crash and no media corruption, so the
+  workload's own `stale_reads_after_corruption` bucket does not apply either.
+  Partition plus slow I/O is a configuration a production cluster is in on an
+  ordinary afternoon.
+
+  The two readings, and the reason this is not being guessed at:
+
+    ENGINE.  A read served through ReadIndex must wait for the state machine to
+      have applied the index the quorum round returned. `disk.slow_io` delays
+      exactly that apply. If the reply is generated before the wait completes --
+      or if the freshness measure it reports is not the log's applied index --
+      the read is genuinely stale and this is an S0.
+
+    HARNESS. This project has been here twice. ANV-0022: the workload's client
+      redrew its operation on each retry, so a timed-out write came back as a
+      read under the same identity and a late reply attached to the wrong one,
+      manufacturing stale reads out of a healthy system. ANV-0041: a read reply
+      used the state machine's applied index as a freshness measure, which a
+      snapshot install makes stale beside a state that is fresh, and reported a
+      stale read that never happened. Gotchas 10.12 and 10.23 both exist because
+      of this exact invariant.
+
+  Deciding it needs the trace, not more theorising -- gotcha 10.17. The
+  reproduction is one command and the fault set is two knobs.
+fix_commit:      none
+regression:      test/corpus/ANV-0066.seed
+invariant_added: none
+lesson: |
+  The row is here to record what the fleet is *for*, as much as the finding.
+
+  Seed 21 draws eleven fault features. Recorded as "reproduces under seed 21 with
+  everything on", this is a row nobody can reason about and nobody will pick up.
+  Recorded as "needs exactly a partition and slow I/O", it is a hypothesis with
+  two candidate mechanisms and a way to tell them apart -- and the *absence* of
+  clock skew from the minimal set is what eliminates the explanation that would
+  otherwise have been reached for first. That difference is the entire argument
+  for wiring the minimiser into the fleet rather than filing raw seeds, and it
+  cost 45 simulation runs.
+
+  Worth noting how it was nearly missed. The fleet's first version handed the
+  minimiser a *fresh* schedule seed for its first attempt, on the reasoning that
+  varying the schedule is what the minimiser's own header asks for. It is -- for
+  attempts after the first. Starting anywhere other than the schedule that
+  actually failed throws away the only run known to reproduce, and the finding
+  came back as eleven features with 1-minimality unverified, which is exactly
+  what a predicate that never reproduces looks like. Attempt 0 is now the
+  original run.
+```
+</details>
+
+<details open>
 <summary><b>ANV-0065</b> · S1 · txn · <b>a recovering reader implicitly commits a staging transaction the coordinator's read refresh would have aborted</b></summary>
 
 ```yaml

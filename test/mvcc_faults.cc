@@ -41,6 +41,7 @@
 #include "anvil/checker/mvcc_invariants.h"
 #include "anvil/sim/simulation.h"
 #include "workloads/mvcc_txn.h"
+#include "test/drill_report.h"
 
 namespace {
 
@@ -389,6 +390,12 @@ void test_seeded_mutation_drill(std::uint64_t seeds) {
                            : std::string("no");
     if (mutation.kind == Mutation::Kind::kEquivalent) row += "   (equivalent here)";
     std::cout << row << "\n";
+    anvil::testing::emit_drill(
+        "P4", "mvcc_txn", mutation.name, detected, seeds, detected, api_visible, 0,
+        fired.empty() ? std::string("-") : ids,
+        mutation.kind == Mutation::Kind::kMustDetect   ? "must-detect"
+        : mutation.kind == Mutation::Kind::kEquivalent ? "equivalent"
+                                                       : "control");
 
     if (mutation.kind == Mutation::Kind::kEquivalent) {
       // Two things have to hold for this classification to be honest. The

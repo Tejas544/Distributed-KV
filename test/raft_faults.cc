@@ -47,6 +47,7 @@
 #include "anvil/checker/raft_invariants.h"
 #include "anvil/sim/simulation.h"
 #include "workloads/raft_kv.h"
+#include "test/drill_report.h"
 
 namespace {
 
@@ -573,6 +574,10 @@ void test_seeded_mutation_drill(std::uint64_t seeds) {
     row.resize(112, ' ');
     row += std::to_string(by_invariant) + "/" + std::to_string(runs);
     std::cout << row << "\n";
+    anvil::testing::emit_drill(
+        "P3", "raft_kv", mutation.name, detected, runs, by_invariant, api_visible,
+        first_detect_ms, ids == "-- NOTHING FIRED --" ? std::string("-") : ids,
+        mutation.covered_by != nullptr ? "covered" : "must-detect");
 
     if (mutation.covered_by != nullptr) {
       // Reported, not asserted. The constructed case in raft_test.cc shows the
