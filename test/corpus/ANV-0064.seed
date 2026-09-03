@@ -1,0 +1,40 @@
+# ANV-0064 -- global counters in the model's state made two nodes' steps
+# non-commuting, and the partial-order reduction pruned real states
+#
+# Like ANV-0063, no seed: the input is a configuration class.
+seed        = n/a -- exhaustive search, not a sampled run
+binary      = anvil_dpor_test
+config      = 3 voters, 1 proposal/node, 2 ticks/node, <= 3 in flight
+              (test/dpor_test.cc, reduction_config())
+invariant   = none of the protocol's. The exhaustive search is the ground truth
+              and the reduced search is what deviated from it.
+reproduce   = give ModelState a single `std::vector<WireMessage> wire` numbered
+              from one `next_message_id`, and a single `proposals_used` counter
+              shared by all nodes, instead of per-link queues with per-link
+              sequence numbers and a per-node proposal budget.
+expect      = before the fix: reduced search reports  42 distinct terminal states
+              after  the fix: reduced search reports 382, exactly matching the
+                              exhaustive search over the same class
+witness     = the two searches' terminal-state fingerprint sets differ, and the
+              reduced one is a strict subset -- the signature of a reduction
+              that pruned something real, as opposed to ANV-0063's signature,
+              where the reduced set contained something the exhaustive one
+              lacked.
+guard       = test/dpor_test.cc::test_reduction_is_sound, same assertion as
+              ANV-0063. The two bugs are distinguished by which way the subset
+              relation fails, which is why the assertion is equality and not
+              containment.
+related     = the same class of mistake in the *search* rather than in the
+              state: a bound on messages in flight is not invariant under
+              commutation, because two orders that end in the same state pass
+              through different peaks. That is not fixed, because it is not a
+              bug -- it is a constraint on where the comparison is valid. The
+              test therefore also asserts `full.out_of_bounds == 0`, i.e. that
+              the bound never binds in the class the two searches are compared
+              over. Measured: on a class where it does bind, 42 terminal states
+              against 407.
+note        = api_visible: no. The general rule, which is the reason this row
+              exists at all: an independence relation is a claim about the
+              state *representation*, not about the system. Two nodes really do
+              commute in Raft. They did not commute in this encoding of Raft,
+              because the encoding threaded a global counter through both.

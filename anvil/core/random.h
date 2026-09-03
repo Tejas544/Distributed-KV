@@ -175,6 +175,21 @@ class DeterministicRandom {
     }
   }
 
+  // The generator's whole internal state, read-only.
+  //
+  // Exposed for exactly one caller: a systematic explorer, which has to be able
+  // to decide whether two states of a node are the *same* state. Two nodes with
+  // identical logs, terms and timers but different generator positions will draw
+  // different election timeouts and diverge, so a fingerprint that omits this
+  // merges states that are not equal -- and a state-space search that merges
+  // unequal states silently stops being exhaustive. That failure mode is not
+  // hypothetical here; it is what test/dpor_test.cc's cross-check between the
+  // reduced and unreduced searches caught (ANV-0063).
+  //
+  // Nothing in the engine may branch on this. It is an observation of the
+  // generator, not an input to anything.
+  constexpr std::uint64_t state_word(std::size_t index) const noexcept { return s_[index & 3]; }
+
  private:
   std::uint64_t s_[4]{};
 };

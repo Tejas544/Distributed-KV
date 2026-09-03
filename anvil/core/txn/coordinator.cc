@@ -45,18 +45,63 @@ void Coordinator::on_reply(const shard::ShardStore::TxnReply& reply) {
 // timestamps
 // ---------------------------------------------------------------------------
 
-Task<bool> Coordinator::next_timestamp(Ts* out) {
+// A timestamp from the oracle. `fresh` is the whole of ANV-0058.
+//
+// Reserving a run of timestamps and handing them out locally is the standard
+// way to make an oracle affordable, and for a *start* timestamp it is sound: a
+// stale start reads an older snapshot, which snapshot isolation permits, and
+// the prewrite conflict test is taken against that same start, so a stale one
+// makes the test stricter rather than weaker.
+//
+// For a *commit* timestamp it is not sound, and the failure is invisible from
+// inside either transaction involved. A reserved batch is a promise that these
+// numbers are yours. It is not a promise that they are still current. Two
+// coordinators holding [12,76) and [386,450) hand out timestamps whose order
+// has nothing to do with the order their transactions actually run in, and the
+// whole of first-committer-wins rests on that order:
+//
+//   T_b starts at 390, reads key k, finds nothing -- correctly, k is empty.
+//   T_a starts at 12, from a batch reserved long ago. It prewrites k (no
+//     version above 12 exists, so this is legal) and commits it at 13.
+//   T_b prewrites k. The conflict test is "a version committed above my
+//     start_ts". The version is at 13, and 13 < 390, so there is no conflict
+//     and the prewrite succeeds.
+//   T_b commits at 391, overwriting a value it never saw.
+//
+// Both transactions were told they committed and one of the two writes is
+// gone, with no rule broken -- because the rule assumes a commit timestamp is
+// allocated *after* every read that could conflict with it, which is exactly
+// what a reservation stops being true. Percolator's oracle hands out strictly
+// increasing timestamps on demand, and "on demand" is load-bearing at commit
+// rather than an implementation detail.
+//
+// Drawing *both* ends fresh was tried first and is worse than the disease: on
+// the fault profiles this phase runs, an extra round trip per begin took seed 7
+// from 15 commits to zero, and a run that commits nothing proves nothing. One
+// fresh draw per commit, batched starts, keeps the ordering the levels promise
+// at a cost that is measured rather than assumed -- see CONTEXT.md section 14.
+Task<bool> Coordinator::next_timestamp(Ts* out, bool fresh) {
   if (options_.source == TsSource::kHybrid) {
+    // The HLC has the property for free: every reading is taken now and folded
+    // forward from every peer already seen, so it cannot be stale the way a
+    // reservation can.
     *out = clock_.now(runtime_->now());
     co_return true;
   }
-  if (batch_next_ < batch_end_) {
+  if (!fresh && batch_next_ < batch_end_) {
     *out = batch_next_++;
     co_return true;
   }
   if (!oracle_) co_return false;
   Ts first = 0;
-  if (!co_await oracle_(64, &first)) co_return false;
+  if (!co_await oracle_(fresh ? 1 : 64, &first)) co_return false;
+  if (fresh) {
+    // Deliberately not used to refill the batch. A commit draw is a point, not
+    // the head of a run, and treating it as one would put the next start back
+    // in the past the moment this commit's neighbours are handed out.
+    *out = first;
+    co_return true;
+  }
   batch_next_ = first;
   batch_end_ = first + 64;
   *out = batch_next_++;
@@ -85,7 +130,21 @@ Task<Coordinator::Response> Coordinator::send(bool read, const shard::RangeDescr
 
   // Whoever holds the lease, or any replica -- which answers with a hint, and
   // the hint is how the coordinator finds the one that can serve it.
-  NodeId to = range.lease.holder;
+  //
+  // The hint used to be recorded by `on_reply` and read by nobody, which is
+  // [ANV-0061]. Every retry above this went back to the same replica the cached
+  // descriptor named, so a coordinator whose descriptor was one lease behind
+  // spent all eight of its attempts asking a node that had already told it, in
+  // as many words, which node to ask instead. It shows up as `not_leader`
+  // counted in the thousands beside a few hundred transactions begun: on seed 1
+  // at snapshot isolation, 1,986 rejections against 321 transactions, of which
+  // 5 committed. A retry that does not use what the last attempt returned is
+  // not a retry, it is the same request again -- gotcha 10.12 with the repeated
+  // half being the destination rather than the operation.
+  NodeId to;
+  const auto hinted = leaders_.find(range.id.value());
+  if (hinted != leaders_.end()) to = hinted->second;
+  if (!to.valid()) to = range.lease.holder;
   if (!to.valid()) to = range.replicas.empty() ? NodeId{} : range.replicas.front();
   if (!to.valid()) co_return response;
 
@@ -100,10 +159,27 @@ Task<Coordinator::Response> Coordinator::send(bool read, const shard::RangeDescr
     if (!it->second.answered) continue;
     response = it->second;
     inbox_.erase(it);
+    // Learned from the answer, whichever way it went: a hint names the node
+    // that can serve this range, and an answer that came back kOk names it by
+    // having answered. Cleared rather than kept when neither holds, so that a
+    // stale hint cannot outlive the lease it came from -- the next attempt then
+    // falls back to the descriptor, which is where a wrong-range reply sends it
+    // anyway.
+    if (response.hint.valid()) {
+      leaders_[range.id.value()] = response.hint;
+    } else if (response.status == shard::ShardStore::kOk) {
+      leaders_[range.id.value()] = to;
+    } else {
+      leaders_.erase(range.id.value());
+    }
     co_return response;
   }
   inbox_.erase(request.seq);
   ++stats_.rpc_timeouts;
+  // Silence is not evidence about who the leader is, but it is evidence that
+  // this node did not answer, and going back to it unconditionally is how a
+  // crashed replica takes a coordinator down with it.
+  leaders_.erase(range.id.value());
   co_return response;
 }
 
@@ -433,9 +509,12 @@ Task<TxnOutcome> Coordinator::commit(Handle* handle) {
 
   // ---- prewrite -----------------------------------------------------------
   //
-  // The primary goes first, always. It is the commit point, and a crash between
-  // the two orders leaves either intents with a record to resolve them against
-  // (recoverable) or intents with none (not).
+  // The primary goes first by default. Note what has *already* happened above:
+  // the record is written before this loop runs, unconditionally, so neither
+  // order can produce an intent with no record to resolve it against. The
+  // ordering here is conventional rather than load-bearing; see the long note
+  // on `primary_first` in coordinator.h for why the knob is a drill control and
+  // what actually carries the argument.
   std::vector<std::string> order;
   order.reserve(handle->writes.size());
   if (options_.primary_first) order.push_back(handle->primary);
@@ -505,7 +584,7 @@ Task<TxnOutcome> Coordinator::commit(Handle* handle) {
     // at the top and waiting until the bottom has passed it is the same
     // statement written so that the wait is visible.
     commit_ts = clock_.interval(clock_.now(runtime_->now())).latest;
-  } else if (!co_await next_timestamp(&commit_ts)) {
+  } else if (!co_await next_timestamp(&commit_ts, /*fresh=*/true)) {
     co_await put_record(handle, TxnStatus::kAborted, 0, false);
     co_await resolve_intents(handle, false);
     live_.erase(handle->id);

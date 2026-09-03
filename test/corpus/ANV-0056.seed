@@ -1,0 +1,28 @@
+# ANV-0056 -- the audit resolved a live intent against the wrong range's record
+#
+# A record lives on the range that owns its transaction's *primary* key and
+# nowhere else (record.h). audited_value looked for it on the range the
+# *intent* sat on, which finds nothing for every cross-range transaction -- the
+# transactions this phase exists to exercise -- so the audit read past the
+# intent to the version from before the transaction.
+seed        = 1 and 7 (bank, snapshot isolation)
+workload    = txn_bank, kBank
+nodes       = 5
+keys        = 16 x 100 = 1600, neighbourhood 4
+faults      = drawn from seed; needs only a cross-range transfer whose secondary
+              intent has not been lazily resolved by the time the audit runs,
+              which is the common case after settle because settle has no
+              clients left to read anything
+invariant   = the bank's conserved total (workload)
+reproduce   = anvil_txn_faults 30
+expect      = before the fix, seed 1 reports `the cluster holds 1583 and started
+              with 1600` and seed 7 reports 1585/1600, both with converged=yes.
+              Both shortfalls are smaller than one account because each is one
+              half of one transfer: the debit's range had materialised its
+              version and the credit's range still held an unresolved intent.
+              After the fix, 30/30 seeds at all three levels.
+note        = api_visible: no. The money was never missing; the audit could not
+              see it. The rejected alternative -- searching every range for the
+              record -- is recorded in CONTEXT.md section 14 and must not be
+              re-tried: it accepts any replica anywhere that says kCommitted,
+              which reconstructs the total the engine should have had.

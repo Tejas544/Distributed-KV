@@ -1,0 +1,38 @@
+# ANV-0058 -- a batched oracle timestamp made a commit timestamp stale, and
+# first-committer-wins compared against the wrong order
+#
+# Coordinator::next_timestamp reserved 64 timestamps at a time and handed them
+# out locally. A commit timestamp drawn from a reservation is not ordered
+# against timestamps other coordinators have already used, and the whole of
+# first-committer-wins ("a version committed above my start_ts") assumes it is.
+seed        = 8 (list-append, serializable); also 7 (list-append, snapshot)
+workload    = txn_bank, kListAppend
+nodes       = 5
+keys        = 16, neighbourhood 4, txns_per_client 16
+faults      = drawn from seed; no specific fault is required. The two
+              coordinators only have to be holding reservations that are far
+              apart, which happens whenever they started at different times.
+invariant   = the list-append audit: an acknowledged element is not in the
+              final list
+reproduce   = anvil_txn_faults 30   (test_isolation_matches_the_declared_level,
+              which must be run over the full seed range -- it was capped at 4
+              seeds and neither 7 nor 8 was inside the cap)
+expect      = before the fix, seed 8 at serializable reports
+                `element 562954248388616 was acknowledged as committed to
+                 key00005 and is not in the final list`
+              with converged=yes, and seed 7 at snapshot isolation reports the
+              same for element 844429225099275 on key00002. After it, 10/10 at
+              every level.
+witness     = the version chain on key00005 at the end of the run, which is the
+              whole bug in four lines:
+
+                ts=391 list: 1407383473487874 (start=390, commit=391)
+                ts=13  list: 562954248388616  (start=12,  commit=13)
+
+              The survivor's snapshot (390) is three hundred timestamps *above*
+              the version it failed to see (13), because the transaction that
+              wrote 13 was running on a reservation issued long before and
+              committed, in real time, after the other had already read.
+note        = api_visible: yes. This is the phase's first S0 that a black-box
+              client could have observed: both transactions were told they
+              committed and one of the two appends is gone.

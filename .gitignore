@@ -28,3 +28,14 @@ artifacts/
 .idea/
 *.swp
 .DS_Store
+
+# Leiningen's build output for the Elle cross-validation harness. The project
+# and its source are tracked; the compiled classes and the dependency cache are
+# not, and neither is tla2tools.jar -- tools/fetch_tla.sh and
+# tools/fetch_elle.sh exist so that a 2 MB binary and a 100 MB jar cache do not
+# live in a source tree where nobody would ever upgrade them.
+tools/elle/target/
+
+# TLC's own scratch: a states/ directory per run, holding the fingerprint set
+# and any counterexample dump. Regenerable by tools/tlc.sh.
+spec/states/

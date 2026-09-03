@@ -1,0 +1,43 @@
+# ANV-0057 -- the seeded-mutation drill had no null control, and five of its
+# nine rows were scoring the harness's own failure as coverage
+#
+# The drill reported "detected 6/7 deliberate bugs". Adding one row -- a
+# mutation that changes nothing -- showed the real number was 2/7.
+seed        = 1 and 7 (bank, snapshot isolation), the two seeds ANV-0056 fails
+              on. That is the entire finding: those two seeds are what five
+              rows were detecting.
+workload    = txn_bank, kBank and kListAppend
+reproduce   = build the tree at 95318de with one extra row in the mutation
+              table of test/txn_faults.cc:
+
+                {"no mutation", Expectation::kControl, txn::Level::kSnapshot,
+                 [](workloads::TxnBankConfig*) {}, "the noise floor"},
+
+              and run `anvil_txn_faults 30`.
+expect      = the null row fires 2/10, on seeds 1 and 7 -- and so do
+              `no refresh on push`, `uncertain reads never restart`, `terminal
+              status is not final`, `uncertainty never honoured` and the
+              `parallel commit` control, on seeds 1 and 7 and nothing else.
+              `lost update` fires on {1,6,7,8,9} and `intents invisible to
+              readers` on {6,9,10}: those two are the only rows carrying
+              information about their own mutation.
+
+              After the fix the drill prints, for every row, the seeds it fired
+              on *that its cell's null control did not*, and asserts on that
+              number rather than on the raw count.
+three separate defects, one row:
+  1. no null control at all, so a row's detection count was never compared
+     against the harness's own failure rate.
+  2. `uncertain reads never restart` and `uncertainty never honoured` ran at
+     kSnapshot, where base_profile selects the oracle and Coordinator::begin
+     sets `uncertainty_limit = start` -- "with the oracle there is none". The
+     window is empty, VersionStore::get's uncertainty branch is unreachable,
+     and neither flag had anything to switch off. Provably vacuous rows.
+  3. every row ran against the bank, whose oracle is a conserved total. A
+     conserved total cannot see a whole transaction disappearing (a transfer is
+     balanced, so losing all of it leaves the sum right) and cannot see write
+     skew (the bank writes every key it reads, which is the one shape write
+     skew is not). `no refresh on push` and `terminal status is not final` were
+     asking a question their workload could not answer.
+note        = api_visible: no. S4: an unreliable harness invalidates every
+              result after it, and this one was inflating a headline number.

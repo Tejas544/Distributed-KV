@@ -19,6 +19,8 @@ add_library(anvil_sim STATIC
   process_model.cc
   fault_injector.cc
   buggify_policy.cc
+  minimiser.cc
+  dpor.cc
   sim_runtime.cc
   simulation.cc
 )

@@ -907,6 +907,653 @@ lesson: |
 </details>
 
 <details open>
+<summary><b>ANV-0065</b> · S1 · txn · <b>a recovering reader implicitly commits a staging transaction the coordinator's read refresh would have aborted</b></summary>
+
+```yaml
+id:              ANV-0065
+title:           under parallel commit at serializable, the implicit-commit predicate skips the read refresh, so whoever reaches the record first decides the transaction
+status:          open -- parallel_commit is off by default; see below
+severity:        S1
+class:           safety, under a non-default configuration
+invariant:       NoWriteSkew, in spec/SsiCommit.tla
+layer:           txn
+found_by:        tlc
+api_visible:     yes -- as write skew in a history the engine calls serializable
+seed:            n/a. TLC, spec/SsiParallel.cfg, 13-step counterexample
+config:          Key={k1,k2} Txn={t1,t2} MaxTs=6 RefreshReadsOnPush=TRUE ParallelCommit=TRUE
+commit_found:    P7
+runs_to_first_hit: immediate -- 1 second, 10,881 distinct states
+faults_minimised: [none -- no fault of any kind is involved]
+root_cause: |
+  Parallel commit writes the record as kStaging with the full key list, and the
+  transaction is *implicitly* committed once every key it lists carries its
+  intent. That predicate is evaluated by whoever meets the intent -- typically a
+  blocked reader -- on the coordinator's behalf.
+
+  At serializable, the coordinator's own commit path does one more thing before
+  it moves the record to kCommitted: it refreshes its reads, and aborts if
+  anything it read has changed since its start timestamp. The recovering reader
+  does not, and cannot, because the read set belongs to the coordinator and is
+  not in the record.
+
+  So the two paths can reach opposite verdicts about the same transaction, and
+  whichever runs first decides it. TLC's counterexample: t1 and t2 each write one
+  key and read the other's, both write staging records, t1 prewrites and commits,
+  t2 prewrites -- and a reader then resolves t2 as committed, because every key
+  it lists carries its intent. t2's coordinator, had it got there first, would
+  have found its read set invalidated by t1 and aborted. One of the two outcomes
+  is the write skew serializability forbids.
+fix_commit:      none yet
+regression:      spec/SsiParallel.cfg (required to fail), with
+                 spec/SsiParallelSnapshot.cfg as the companion that isolates it
+invariant_added: NoWriteSkew in spec/SsiCommit.tla
+lesson: |
+  This is the exact measurement the end of P6 said was missing. The note there
+  reads: "a coordinator can still write kAborted over a staging record whose
+  intents are all present -- if the fresh timestamp draw fails, or if the read
+  refresh does at serializable. No seed has produced a divergence from it. The
+  measurement that would is a recovering reader racing an aborting coordinator,
+  and it is the first thing to build if parallel commit is ever taken further."
+
+  No seed produced it because the race is one specific interleaving of two
+  transactions over two keys, and the fault sweep is not searching for specific
+  interleavings -- it is sampling a very much larger space. The spec found it in
+  one second. That is the argument for writing specifications rather than only
+  tests: they are the instrument for questions whose answer is a single
+  interleaving out of very many, which is the same argument the state-space
+  search makes with a different tool.
+
+  Scope, stated plainly: `parallel_commit` defaults to false in
+  `CoordinatorOptions`, so nothing ships with this behaviour and the drill
+  carries the knob as a control. The finding is that the mechanism is unsound at
+  serializable *as designed*, not that a shipped default is broken. The fix is
+  not obvious and is deliberately not guessed at here -- either the staging
+  record carries enough for a recovering reader to perform the refresh itself, or
+  implicit commit is restricted to snapshot isolation. Choosing between those is
+  a design decision, not a patch.
+
+  spec/SsiParallelSnapshot.cfg exists so that the diagnosis is the finding rather
+  than the symptom: parallel commit at snapshot isolation, where there is no
+  refresh to skip, passes every invariant. The mechanism is not the problem; its
+  interaction with the refresh is.
+```
+</details>
+
+<details open>
+<summary><b>ANV-0064</b> · S4 · sim · <b>global counters in the model's state made two nodes' steps non-commuting, and the partial-order reduction pruned real states</b></summary>
+
+```yaml
+id:              ANV-0064
+title:           messages numbered from one global counter, and one shared proposal counter, broke the independence relation the reduction rests on
+status:          fixed
+severity:        S4
+class:           test infrastructure
+invariant:       the exhaustive search, used as ground truth for the reduced one
+layer:           sim
+found_by:        dst-dpor -- the two searches disagreeing about terminal states
+api_visible:     no
+seed:            n/a. test/dpor_test.cc, the reduction's configuration class
+config:          3 voters, 1 proposal, 2 ticks/node, <= 3 in flight
+commit_found:    P7
+runs_to_first_hit: 1 in 1
+root_cause: |
+  Sleep-set partial-order reduction rests on one claim: transitions of different
+  nodes commute, so exploring one order covers the other. The model's *state
+  representation* made that claim false, in two places.
+
+  Messages lived in one list with ids from one counter. Node 1 sending and node 2
+  sending produce the same set of messages either way -- but with the numbers
+  swapped and in different list positions, so the two orders reach states the
+  fingerprint distinguishes, and "already covered" becomes a lie.
+
+  The same shape again: `proposals_used` was one counter shared by every node,
+  and the value a node wrote was named after it. Two nodes proposing in either
+  order therefore disagree about who wrote which value.
+
+  The reduced search reported 42 distinct terminal states against the exhaustive
+  search's 407.
+fix_commit:      P7
+regression:      test/dpor_test.cc asserts the two searches agree exactly on
+                 terminal-state fingerprints
+invariant_added: none
+lesson: |
+  The fix is per-link message queues with per-link sequence numbers, and a
+  per-node proposal budget. A node then appends only to links it is the source
+  of, consumes only from links it is the destination of, and appending to the
+  tail of a deque commutes with popping its head.
+
+  The general rule is worth more than the fix. **An independence relation is a
+  claim about the state representation, not about the system.** Two nodes really
+  do commute in Raft; they did not commute in *this encoding of Raft*, because
+  the encoding threaded a global counter through both of them. Anything shared
+  and order-sensitive -- an id allocator, a sequence number, an insertion
+  position -- is a coupling that no amount of reasoning about the protocol will
+  reveal.
+
+  A third instance turned up in the same sitting, in the *search* rather than in
+  the state: a bound on messages in flight is not invariant under commutation
+  either, because two orders ending in the same state pass through different
+  peaks, so one can be cut off at the bound while the other survives. That one is
+  not a bug to fix but a constraint on where the comparison is valid. It is
+  written down in anvil/sim/dpor.h and enforced by the test, which asserts the
+  bound never binds in the class it compares over.
+```
+</details>
+
+<details open>
+<summary><b>ANV-0063</b> · S4 · sim · <b>an "exhaustive" state-space search was merging states that behave differently, because the fingerprint came from the public accessors</b></summary>
+
+```yaml
+id:              ANV-0063
+title:           the model checker's state fingerprint omitted replication progress, election timers and the generator position, so the search silently stopped being exhaustive
+status:          fixed
+severity:        S4
+class:           test infrastructure -- and the kind that makes a green gate meaningless
+invariant:       the reduced search, used as a cross-check on the exhaustive one
+layer:           sim
+found_by:        dst-dpor -- the reduced search reached a terminal state the exhaustive one could not
+api_visible:     no
+seed:            n/a. test/dpor_test.cc, 3 voters, 1 proposal, 2 ticks/node
+config:          test/dpor_test.cc reduction class
+commit_found:    P7
+runs_to_first_hit: 1 in 1, once the cross-check existed at all
+root_cause: |
+  `explore_exhaustive` deduplicates on a fingerprint of the global state, and the
+  first fingerprint was assembled from `RaftNode`'s public accessors: role, term,
+  vote, leader, log, commit index and applied index.
+
+  None of those include the leader's per-peer replication progress, the election
+  and heartbeat timers, the randomised election timeout, the vote tally, or the
+  position of the node's own random generator. All of them decide what the node
+  does next. Two states differing only in those were treated as one state, the
+  second was never expanded, and everything reachable only through it fell
+  silently outside the "exhaustive" search.
+
+  The scale of the error: on the small class, 1,674 distinct states became 22,989
+  once the fingerprint was complete, and 3 terminal states became 259. The search
+  had been missing roughly fourteen states out of every fifteen.
+fix_commit:      P7
+regression:      test/dpor_test.cc's terminal-state comparison between the two
+                 searches; and RaftNode::state_digest() is now the single
+                 definition of what a node's state is
+invariant_added: none
+lesson: |
+  Two things, and the second is the general one.
+
+  It was found by a *disagreement between two instruments*, and could not have
+  been found by either alone. The exhaustive search reported no violations and
+  was wrong. The reduced search reported no violations and was also wrong, in a
+  different way. What was diagnostic was that the reduced search reached a
+  terminal state the exhaustive one had never visited -- which is impossible if
+  the exhaustive search is exhaustive. Neither number looked suspicious on its
+  own. That is the reason dpor.cc ships two searches rather than only the fast
+  one, and it is the same argument as the hermeticity gate's negative control.
+
+  And: **a state machine you cannot fingerprint is a state machine you cannot
+  model-check.** `RaftNode::state_digest()` was added for this. It is a pure
+  observation -- it records nothing, changes nothing, and the protocol never
+  consults it. That distinction is the one CONTEXT.md gotcha 10.26 draws between
+  a checker reading state and a state machine carrying evidence for its checker,
+  and it is worth being careful about: the first is free, the second means the
+  thing being tested is no longer the thing that ships.
+```
+</details>
+
+<details open>
+<summary><b>ANV-0062</b> · S4 · checker · <b>INV-TXN-01 called a transaction non-existent because its record was inside a split payload</b></summary>
+
+```yaml
+id:              ANV-0062
+title:           the intent-attribution invariant walked range machines and not the payloads a split leaves records in
+status:          fixed
+severity:        S4
+class:           test-infra
+layer:           checker
+invariant:       INV-TXN-01 (every intent is attributable to a transaction record)
+found_by:        dst-random
+api_visible:     no
+seed:            7 (list-append, strict-serializable)
+config:          test/txn_faults.cc, 5 nodes, faults on
+commit_found:    P6
+runs_to_first_hit: 1 in 10 seeds at strict-serializable
+faults_minimised: [none required -- an uncollected split at settle time, which
+                   is the common case under continuous churn]
+root_cause: |
+  The invariant gathered every record from every range machine and then reported
+  any intent whose transaction was not among them as "a key locked by something
+  that never existed". A record is also, legitimately, inside a parent's pending
+  split payload for the width of a handover -- that is where the split put it
+  and where the child will collect it from.
+
+  Seed 7 fired on t2362634680074240, whose kAborted record was sitting in
+  payload 3->8 the entire time, while its intent sat on key00009 on a live
+  range. Nothing was locked and nothing was missing.
+
+  Third instance of one shape in this phase, and the second in a single day:
+  [ANV-0059] is the same mistake in the workload's audit, and ANV-0054 is the
+  same mistake with the topology in place of the payload.
+fix_commit:      P6
+regression:      test/corpus/ANV-0059.seed (the same run exercises both)
+invariant_added: none -- INV-TXN-01 now walks `pending_splits()` payloads in its
+                 record-gathering pass
+lesson: |
+  A checker's map of where data can be has to match the protocol's, not the
+  steady state's. Every one of this phase's manufactured findings has been the
+  checker knowing about fewer places than the protocol uses, and the split
+  payload is now the third such place to have to be added by hand -- to the
+  workload's bank audit, to its list audit, and now to an internal invariant.
+  The right shape is one function that answers "where does this key live", used
+  by everyone; `owning_store` is that function on the workload side and the
+  invariants do not yet share it.
+```
+</details>
+
+<details open>
+<summary><b>ANV-0061</b> · S2 · txn · <b>the coordinator recorded the leader hint every reply carried and retried against the node that sent it</b></summary>
+
+```yaml
+id:              ANV-0061
+title:           on_reply stored reply.leader_hint and nothing ever read it, so every retry went back to the replica that had just refused
+status:          fixed
+severity:        S2
+class:           liveness
+layer:           txn
+invariant:       none -- found by asking why 92% of transactions aborted
+found_by:        code-review, prompted by a measurement
+api_visible:     yes -- as an abort, not as a wrong answer
+seed:            1 (bank, snapshot isolation) is the sharpest, but it is every seed
+config:          test/txn_faults.cc, 5 nodes, faults on, topology churning
+commit_found:    P6
+runs_to_first_hit: 1 in 1
+root_cause: |
+  `Coordinator::send` chooses its destination from the cached descriptor: the
+  lease holder if there is one, otherwise the first replica. Every reply carries
+  a `leader_hint`, and `on_reply` faithfully copied it into the response. No
+  caller ever looked at it.
+
+  So a coordinator whose descriptor was one lease behind sent all eight of its
+  attempts to a node that had, each time, told it in as many words which node to
+  ask instead. Seed 1 at snapshot isolation: 1,986 not-leader rejections against
+  321 transactions begun, of which 5 committed. Across the suite, 108 committed
+  against 1,199 aborted.
+
+  This is gotcha 10.12 -- "a retry must resend the same request" -- with the
+  repeated half being the destination rather than the operation. A retry that
+  does not use what the last attempt returned is not a retry; it is the same
+  request again.
+fix_commit:      P6
+regression:      none of its own; the whole suite is the regression, and the
+                 abort rate is the measurement
+invariant_added: none
+lesson: |
+  Two things worth separating.
+
+  The bug is small and the *consequence* was not, because it was upstream of
+  every measurement the phase makes. A drill that scores a mutation by whether
+  an anomaly appears cannot score anything when the workload commits four
+  transactions a seed. Fixing this took the suite from 108 committed to 147, and
+  `lost update` from 11/15 to 15/15 with nothing about the mutation or the
+  detector changed. Detection rates are a function of throughput, and a
+  throughput bug reads as a detection gap.
+
+  And: it was found by asking what the counters meant. `not_leader` had been
+  printed in the coordinator's stats the whole time; nobody had divided it by
+  the number of transactions.
+```
+</details>
+
+<details open>
+<summary><b>ANV-0060</b> · S0 · txn · <b>a heartbeat narrowed a staging record's key list to its own primary, and parallel commit's predicate then answered yes about one key</b></summary>
+
+```yaml
+id:              ANV-0060
+title:           put_record let a kPending heartbeat overwrite the key list a kStaging record had declared
+status:          fixed
+severity:        S0
+class:           safety
+invariant:       the bank's conserved total; INV-TXN-11 could not see it
+layer:           txn
+found_by:        dst-random (the `parallel commit` drill control firing)
+api_visible:     yes, under parallel commit
+seed:            12 (bank, snapshot isolation, parallel_commit on)
+config:          workloads/txn_bank.cc, kBank, 5 nodes, 16 keys x 100, faults on
+commit_found:    P6
+runs_to_first_hit: 1 in 15 seeds with parallel commit enabled
+faults_minimised: [none required -- a transaction that lives long enough to be
+                   heartbeated once, which is any transaction that meets a
+                   partition or a moving range]
+root_cause: |
+  Every record write carries the primary in `keys`, unconditionally, because
+  that is how a record is located when a span is partitioned for a split or a
+  merge. `heartbeat_all` writes kPending with `with_keys=false`, which therefore
+  arrives as the one-element list `[primary]` -- and `VersionStore::put_record`
+  merged it with
+
+      if (!record.keys.empty()) current.keys = record.keys;
+
+  so a heartbeat replaced the full key list a kStaging record had declared. The
+  status survived (a kPending write does not overwrite one) and the key list did
+  not.
+
+  That is the whole of parallel commit. A staging record is committed exactly
+  when every key it lists carries its intent, so a record truncated to its own
+  primary satisfies its own predicate as soon as the primary is prewritten --
+  before the other intents are written, before the commit timestamp is drawn,
+  and before the read refresh that may yet abort the transaction. Any recovering
+  reader then calls it committed.
+
+  Seed 12, read off the surviving state:
+
+      R 164 status=kStaging start=164 commit=0 keys=[key00009]
+      I key00009 txn=164 prim=key00009
+
+  One intent, one listed key, no commit timestamp, and its other half never
+  written. Counted as committed, its debit added to the total and its credit
+  never applied: 1,592 against 1,600.
+fix_commit:      P6
+regression:      test/corpus/ANV-0060.seed
+invariant_added: INV-TXN-11 strengthened. It checked only for an *empty* key
+                 list, which is the loud way for a record to be undecidable; the
+                 quiet way is a narrowed one, where the predicate still
+                 evaluates, over fewer keys than the transaction wrote, and
+                 comes out committed. It now reports, at quiesce, any intent at
+                 the record's own epoch on a key the staging record does not
+                 list. It had been evaluated 143,000 times a seed and had never
+                 said a word about this.
+lesson: |
+  A message that carries a field it does not mean to set will set it. The
+  primary is in `keys` for one reason -- span partitioning -- and the merge rule
+  read it as a second, unrelated claim about the transaction's write set. The
+  fix is one line moved: the key list now moves with the status, inside the
+  branch that already knows a kPending write carries no verdict, so "a heartbeat
+  says I am alive and nothing else" is stated in the code rather than assumed by
+  every reader of it.
+
+  The audit had a matching hole, found in the same hour and worth recording
+  beside it: `implicitly_committed` accepted "some version exists on this key"
+  as evidence that a listed intent had been resolved. Resolution writes the
+  version *at* the record's commit timestamp, so that exact version is the
+  evidence and nothing else is -- and a staging record with no commit timestamp
+  cannot be judged by that branch at all. Before the fix, an unrelated
+  transaction's version on key00010 stood in as proof that t164's intent had
+  been resolved there.
+```
+</details>
+
+<details open>
+<summary><b>ANV-0059</b> · S4 · checker · <b>the audit compared applied indices across two Raft logs, and read the key off a replica that no longer owned it</b></summary>
+
+```yaml
+id:              ANV-0059
+title:           holder_of ranked claimants by applied index, which numbers entries in one range's own log and says nothing across two
+status:          fixed
+severity:        S4
+class:           test-infra
+layer:           checker
+invariant:       the list-append element audit; the bank's conserved total
+found_by:        dst-random
+api_visible:     no -- nothing was ever lost or gained; the audit read the wrong replica
+seed:            10 (list-append, serializable) and 7 (bank, snapshot isolation)
+config:          workloads/txn_bank.cc, 5 nodes, faults on, topology churning
+commit_found:    P6
+runs_to_first_hit: 1 in 10 seeds per level
+faults_minimised: [none required -- one replica behind on its own log, which is
+                   the ordinary state of a cluster under partitions]
+root_cause: |
+  Two defects, one function, and they point in opposite directions -- which is
+  what makes them worth one row.
+
+  **Lost, seed 10.** `holder_of` asked every live replica whether its descriptor
+  contained the key and took the claimant with the highest applied index. An
+  applied index numbers entries in one range's own Raft log; comparing two of
+  them across two ranges compares two unrelated counters. Node 2 held a lagging
+  replica of range 3 whose descriptor was still the pre-split `[, )` at
+  generation 6 and index 141, while range 8 -- `[key00010, )`, generation 1, the
+  range that had owned the keys since the split -- sat at index 78 on four nodes
+  with both elements durably in its version chain. 141 > 78, so the audit read a
+  replica that had not yet learned it no longer owned the key, found nothing,
+  and reported two acknowledged elements as lost.
+
+      node 1  range 8 [key00010,) gen=1 applied=78
+                 V key00013  ts=333[1125912791744546]
+                 V key00014  ts=333[1125912791744545]
+      node 2  range 3 [,)         gen=6 applied=141      <- the audit asked this one
+                 (nothing for key00013 or key00014)
+
+  **Found, seed 7.** The audit had two ways to read a key: through a range
+  machine, where `audited_value` resolves a committed-but-unmaterialised intent
+  the way a client's reader would, and through a split payload, where
+  `committed_value` does not. A cross-range transfer caught across that seam had
+  its credit counted from the range that stayed put and its debit skipped inside
+  the payload. Seed 7 finished 1,614 against 1,600 -- fourteen over, one
+  transfer's worth, with the debit sitting in the payload as an intent nobody
+  asked about.
+fix_commit:      P6
+regression:      test/corpus/ANV-0059.seed
+invariant_added: `ambiguous_keys`, reported not asserted: the number of keys
+                 more than one live range claimed with its newest descriptor
+                 when the audit ran. Every value the audit reads comes from one
+                 range, so this is the number that says whether "the range that
+                 holds this key" was a well-posed question at all.
+lesson: |
+  What is comparable within one log is not comparable across two. The freshest
+  claim a *range* has to a key is its newest descriptor generation, which is
+  bumped by every split and merge it takes part in and is therefore a
+  within-one-log comparison; the applied index is only a tiebreak among replicas
+  of the same range, which is the one place it means anything. Gotcha 10.23 said
+  this about a state machine's index against its log's; it is the same sentence
+  with two logs.
+
+  The second half is the more transferable one. An audit that reads a key two
+  ways will eventually read it two *different* ways, and the difference will be
+  a finding about the checker. The fix was not to teach the payload branch the
+  same trick -- it was to stop having two branches. There is now one
+  `owning_store(key)` that answers with a live range's store or a payload's, and
+  everything reads through it.
+
+  And an audit that finds money is exactly as broken as one that loses it. The
+  loss was loud and got fixed first; the gain appeared in the same run and would
+  have been easy to wave through as noise.
+```
+</details>
+
+<details open>
+<summary><b>ANV-0058</b> · S0 · txn · <b>a reserved batch of oracle timestamps made a commit timestamp stale, and first-committer-wins compared against the wrong order</b></summary>
+
+```yaml
+id:              ANV-0058
+title:           the commit timestamp came from a local reservation, so it was not ordered against timestamps other coordinators had already committed at
+status:          fixed
+severity:        S0
+class:           safety
+layer:           txn
+invariant:       the list-append audit -- an acknowledged element is not in the final list
+found_by:        dst-random
+api_visible:     yes
+seed:            8 (list-append, serializable); also 7 (list-append, snapshot isolation)
+config:          workloads/txn_bank.cc, kListAppend, 5 nodes, 16 keys, faults on
+commit_found:    95318de
+sim_time_to_detect: the whole run; the audit is the detector
+runs_to_first_hit: 2 in 10 seeds at the levels that use the oracle
+faults_minimised: [none required -- two coordinators holding reservations that
+                   are far apart is enough, and that happens whenever they
+                   started at different times]
+root_cause: |
+  `Coordinator::next_timestamp` reserved 64 timestamps from the oracle and
+  handed them out locally. A reservation is a promise that these numbers are
+  yours; it is not a promise that they are still current. Two coordinators
+  holding [12,76) and [386,450) issue timestamps whose order has nothing to do
+  with the order their transactions run in -- and the whole of
+  first-committer-wins rests on that order.
+
+      T_b starts at 390, reads key k, finds nothing. Correct: k is empty.
+      T_a starts at 12, off a reservation taken long before. It prewrites k --
+        legal, no version above 12 exists -- and commits it at 13.
+      T_b prewrites k. The conflict test is "a version committed above my
+        start_ts". The version is at 13. 13 < 390. No conflict.
+      T_b commits at 391, overwriting a value it never saw.
+
+  Both transactions were told they committed and one of the two appends is
+  gone, with no rule broken, because the rule assumes a commit timestamp is
+  allocated *after* every read that could conflict with it. Percolator's oracle
+  hands out strictly increasing timestamps on demand and "on demand" is
+  load-bearing at commit, not an implementation detail.
+
+  Read straight off the surviving version chain, which is the whole bug in two
+  lines:
+
+      ts=391  list: 1407383473487874   (start=390, commit=391)
+      ts=13   list: 562954248388616    (start=12,  commit=13)
+
+  The survivor's snapshot is three hundred timestamps *above* the version it
+  failed to see.
+fix_commit:      P6
+regression:      test/corpus/ANV-0058.seed
+invariant_added: none -- the workload's existing element audit was already the
+                 right detector and had never been run on these seeds, because
+                 test_isolation_matches_the_declared_level was capped at 4 seeds
+lesson: |
+  Two things, and the second is the bigger one.
+
+  Drawing *both* ends fresh was tried first and is worse than the disease: an
+  extra round trip per begin took seed 7 from 15 commits to zero, and a run
+  that commits nothing proves nothing. The fix is one fresh draw per commit
+  with batched starts -- a stale start reads an older snapshot, which snapshot
+  isolation permits, and the prewrite conflict test is taken against that same
+  start, so a stale one makes the test stricter rather than weaker. The
+  asymmetry is the finding, not the batching.
+
+  And: this was invisible for the whole phase because the only test that runs
+  list-append was capped at four seeds while the bank ran ten. A checker that
+  is not run on a seed is not a checker on that seed. The cap is gone.
+```
+</details>
+
+<details open>
+<summary><b>ANV-0057</b> · S4 · checker · <b>the seeded-mutation drill had no null control, and five of its nine rows were scoring the harness's own failure as coverage</b></summary>
+
+```yaml
+id:              ANV-0057
+title:           a mutation's detection count was never compared against the detection count of no mutation at all
+status:          fixed
+severity:        S4
+class:           test-infra
+layer:           checker
+invariant:       none -- found by adding the control the drill did not have
+found_by:        code-review
+api_visible:     no
+seed:            1 and 7 (bank, snapshot isolation) -- the two seeds ANV-0056
+                 fails on, which is the entire finding
+config:          test/txn_faults.cc, the mutation table
+commit_found:    95318de
+runs_to_first_hit: 1 in 1, once the control exists
+root_cause: |
+  Three defects, one row, because they are the same mistake at three scales:
+  the drill never asked whether the thing it measured was caused by the thing
+  it changed.
+
+  1. No null control. Adding one row -- a "mutation" that changes nothing --
+     showed it firing 2/10, on seeds 1 and 7. So did `no refresh on push`,
+     `uncertain reads never restart`, `terminal status is not final`,
+     `uncertainty never honoured`, and the `parallel commit` control: on seeds
+     1 and 7 and nothing else. They were all detecting ANV-0056. `lost update`
+     fired on {1,6,7,8,9} and `intents invisible to readers` on {6,9,10} --
+     those two were the only rows carrying information about their mutation.
+     The drill reported 6/7. It was 2/7.
+
+  2. Two rows ran at a level where their mechanism is switched off.
+     `base_profile` only selects the HLC at kStrictSerializable, and
+     `Coordinator::begin` sets `uncertainty_limit = start` under the oracle --
+     "with the oracle there is none". At kSnapshot the uncertainty window is
+     empty, `VersionStore::get`'s uncertainty branch is unreachable, and
+     neither `restart_on_uncertainty` nor `honour_uncertainty` has anything to
+     switch off. Provably vacuous, and scoring 2/10 anyway.
+
+  3. Every row ran against the bank, whose oracle is a conserved total. A
+     conserved total cannot see a whole transaction disappearing -- a transfer
+     is balanced, so losing all of it leaves the sum exactly right -- and it
+     cannot see write skew, because the bank writes every key it reads, which
+     is the one shape write skew is not. `no refresh on push` and `terminal
+     status is not final` were asking questions their workload could not
+     answer.
+fix_commit:      P6
+regression:      test/corpus/ANV-0057.seed
+invariant_added: the null control itself: one row per (level, workload) cell,
+                 reported rather than asserted silent, and every must-detect row
+                 now asserts on the seeds it fired on that its cell's null
+                 control did not
+lesson: |
+  A mutation drill without a null control measures the harness, not the
+  mutations, and it does so in the flattering direction. The number it produces
+  is the headline claim of the whole checker -- "N of M deliberate bugs caught"
+  -- so it is exactly the number that must not be taken on trust.
+
+  The general form is worth keeping: every row of the table now declares the
+  level *and* the workload at which its effect is observable, and both are
+  claims that can be wrong. A drill row is an experiment, and an experiment
+  needs a control, a mechanism that fires, and an instrument that can see the
+  effect. This one had none of the three.
+```
+</details>
+
+<details open>
+<summary><b>ANV-0056</b> · S4 · checker · <b>the audit resolved a live intent against the wrong range's record, and reported the money it could not see as missing</b></summary>
+
+```yaml
+id:              ANV-0056
+title:           audited_value looked for a transaction's record on the range its intent sat on, not on the range that owns its primary key
+status:          fixed
+severity:        S4
+class:           test-infra
+layer:           checker
+invariant:       the bank's conserved total (workload)
+found_by:        dst-random
+api_visible:     no -- the money was never missing; the audit could not see it
+seed:            1 and 7 (bank, snapshot isolation)
+config:          workloads/txn_bank.cc, kBank, 5 nodes, 16 keys x 100, faults on
+commit_found:    95318de
+runs_to_first_hit: 2 in 10 seeds at snapshot isolation
+faults_minimised: [none required -- a cross-range transfer whose secondary
+                   intent is still unresolved when the audit runs, which is the
+                   common case because settle has no clients left to read]
+root_cause: |
+  A record lives on the range that owns its transaction's *primary* key and
+  nowhere else (record.h). `audited_value` asked the range the *intent* sat on,
+  which finds nothing for every cross-range transaction -- the transactions
+  this phase exists to exercise -- so the audit fell through to the version
+  from before the transaction. Seeds 1 and 7 finished 17 and 15 short of 1600,
+  and both shortfalls were smaller than one account because each is one half of
+  one transfer: the debit's range had materialised its version, the credit's
+  range still held the intent.
+
+  The fix asks `holder_of(intent.primary)` -- one range, the same one
+  `resolve_blocker` asks with `locate(blocked.blocker_primary)`.
+fix_commit:      P6
+regression:      test/corpus/ANV-0056.seed
+invariant_added: none
+lesson: |
+  Recorded in CONTEXT.md section 14 as a rejected fix, and worth keeping
+  rejected: searching *every* range for the record also fixes seeds 1 and 7,
+  and it accepts any replica anywhere that says kCommitted. That resolves the
+  intent the way the transaction *meant* to go rather than the way the cluster
+  decided it went, which reconstructs the total the engine should have had.
+
+  The distinction that matters is not "search more places", it is "ask the one
+  place that is entitled to answer". Third time in this phase, after ANV-0054
+  (asking the topology instead of the machines) and the P6 audit's pending-split
+  blind spot.
+
+  A note on the reasoning that kept this open. The rejected fix was rejected
+  because it "dropped the drill from 7/7 to 3/7", and that was read as evidence
+  of blinding. It was not: five of those rows were scoring this very bug, and
+  the drill's real score was 2/7 the whole time. The null control added in
+  ANV-0057 is what makes that measurable, and this fix left the two genuine
+  detectors intact and then improved one of them -- `lost update` went 5/10 to
+  8/10 once the audit stopped reporting phantom losses on top of real ones.
+```
+</details>
+
+<details open>
 <summary><b>ANV-0001</b> · S4 · sim · <b>the scheduler silently discarded one event at every deadline</b></summary>
 
 ```yaml

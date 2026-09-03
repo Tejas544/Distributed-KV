@@ -199,6 +199,69 @@ add_test(NAME txn.faults COMMAND anvil_txn_faults 20)
 set_tests_properties(txn.faults PROPERTIES LABELS "txn;faults;gate" TIMEOUT 1800)
 
 # ---------------------------------------------------------------------------
+# P7 exit criterion 2: cross-validation against Jepsen's Elle.
+#
+# This binary only writes: 10,000 histories in Elle's own format, each carrying
+# Anvil's verdict, for tools/elle/ to read back. The comparison itself needs a
+# JVM and Clojure and therefore cannot be a ctest target without making the
+# whole suite depend on them -- so what is registered here is the export, and
+# `tools/elle_cross.sh` runs both halves.
+#
+# It is the only gate in the tree that is not Anvil checking Anvil, which is
+# the entire reason it is worth the dependency.
+# ---------------------------------------------------------------------------
+add_executable(anvil_elle_export elle_export.cc)
+target_link_libraries(anvil_elle_export PRIVATE anvil::checker anvil::sanitizers)
+add_test(NAME checker.elle_export COMMAND anvil_elle_export 200 200 /tmp/anvil-histories-smoke.edn)
+set_tests_properties(checker.elle_export PROPERTIES LABELS "checker;verification" TIMEOUT 300)
+
+# ---------------------------------------------------------------------------
+# P7 exit criterion 3, second half: trace validation.
+#
+# Writes one run of anvil::raft::RaftNode in spec/Raft.tla's variable
+# vocabulary. `tools/trace_validate.sh` drives it across seeds and replays each
+# trace through TLC, which is why the grading is not here: the comparison needs
+# a JVM, and making the C++ suite depend on one is how a gate stops being run.
+#
+# The ctest entry is a smoke test -- the exporter runs and produces a module --
+# not the conformance check itself.
+# ---------------------------------------------------------------------------
+add_executable(anvil_trace_export trace_export.cc)
+target_link_libraries(anvil_trace_export PRIVATE anvil::sim anvil::sanitizers)
+add_test(NAME verification.trace_export COMMAND anvil_trace_export 1 60 /tmp/anvil-trace-smoke.tla)
+set_tests_properties(verification.trace_export PROPERTIES LABELS "verification" TIMEOUT 300)
+
+# ---------------------------------------------------------------------------
+# P7 exit criterion 4: systematic exploration.
+#
+# Every reachable state of a tiny Raft configuration, with the real state
+# machine and no simulator underneath it, plus the seeded-mutation drill over
+# the same class. This is the gate that reaches the interleavings the fault
+# sweep would need thousands of seeds and a BUGGIFY site to sample.
+#
+# It takes about six and a half minutes, and most of that is the five mutations
+# that are *not* detected: each one has to traverse the whole 2.2M-state class
+# to establish that it stays silent, which is the point of running them.
+# ---------------------------------------------------------------------------
+add_executable(anvil_dpor_test dpor_test.cc)
+target_link_libraries(anvil_dpor_test PRIVATE anvil::sim anvil::sanitizers)
+add_test(NAME verification.dpor COMMAND anvil_dpor_test)
+set_tests_properties(verification.dpor PROPERTIES LABELS "verification;gate" TIMEOUT 1800)
+
+# ---------------------------------------------------------------------------
+# P7 exit criterion 5: the fault-schedule minimiser.
+#
+# A ledger row whose `faults_minimised` field says "everything the seed drew" is
+# a row nobody can reason about. This is the gate that says the field is
+# computed rather than guessed, and it is graded against causes that are known
+# in advance rather than merely against a smaller number.
+# ---------------------------------------------------------------------------
+add_executable(anvil_minimiser_test minimiser_test.cc)
+target_link_libraries(anvil_minimiser_test PRIVATE anvil::workloads anvil::sanitizers)
+add_test(NAME verification.minimiser COMMAND anvil_minimiser_test 400)
+set_tests_properties(verification.minimiser PROPERTIES LABELS "verification;gate" TIMEOUT 900)
+
+# ---------------------------------------------------------------------------
 # The gate's negative test.
 #
 # This archive is deliberately full of forbidden symbols. The test passes only

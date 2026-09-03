@@ -329,16 +329,40 @@ checker-clean, INV-TXN-09 silent. See [CONTEXT.md §14](../CONTEXT.md).
 
 ## P7 — Verification depth: checker, TLA+, trace validation, DPOR · Weeks 26–29
 
-**Status: started. Exit criterion 1 is met.** `anvil_checker_mutation`
-(`test/checker_mutation.cc`, ctest name `checker.mutation`) reports a **100%
-mutation score — 200/200 anomalous histories detected and 200/200 correctly
-named** across nine anomaly classes, and **zero false positives over 10,000
-reference-model histories** (200,000 transactions) checked at all five
-isolation levels, plus 120/120 discrimination pairs clean where the level
-permits the anomaly. This was taken first on purpose: the three findings
-immediately before it were all checker bugs, two of which
-([ANV-0051](../BUGS.md), [ANV-0053](../BUGS.md)) returned confidently wrong
-verdicts for a whole phase. Remaining deliverables below are untouched.
+**Status: complete. All five exit criteria are met.**
+
+| # | Criterion | State | Produced by |
+|---|---|---|---|
+| 1 | checker mutation 100%, 0 false positives / 10,000 | **met** — 200/200 detected and named across 9 classes, 0 FPs at all 5 levels, 120/120 discrimination pairs | `checker.mutation` |
+| 2 | zero unexplained disagreements with Jepsen Elle / 10,000 | **met** — 10,000/10,000 verdicts identical, 10,000/10,000 same anomaly class, 0 disagreements | `tools/elle_cross.sh` |
+| 3 | TLC finds no violations; every trace-validation run conforms | **met** — TLC: 9/9 configurations behaved as specified (5 clean, 4 required to fail on a named property). Trace validation: 16/16 implementation runs conform; 12/16 mutated runs rejected, the other 4 equivalent on their seed | `tools/tlc.sh`, `tools/trace_validate.sh` |
+| 4 | DPOR covers its configuration class; state count reported | **met** — 2,202,433 distinct states, complete, 0 violations, 3/3 seeded mutations caught | `verification.dpor` |
+| 5 | minimiser: ≥10 faults → ≤3 in <5 min | **met** — 11 → 1 (`process.crash`), 1-minimality verified, 0.016s | `verification.minimiser` |
+
+**What trace validation covers, and what it does not.** It replays runs of
+`anvil::raft::RaftNode` against `spec/Raft.tla` — the shipping state machine,
+with no simulator underneath. It does not cover the full simulator, and it runs
+the implementation configured to the specification's action set: pre-vote off,
+CheckQuorum off, one entry per append, no heartbeats. The last is the sharpest
+limit and is itself a finding: the implementation clamps the commit index a
+heartbeat advertises at the *sender*, the specification at the *receiver*. Both
+are sound, they are not the same mechanism, and reconciling them needs a
+matchIndex variable the specification deliberately does not have.
+
+**Seven discrepancies were found by building it**, and that is the argument for
+the deliverable. Three were in the exporter's mirror of the specification's
+variables, three were in the specification itself — `committedLog` re-recording
+entries that were already committed, a missing `StepDown` action, and an
+`mmatch` field that disagreed on rejection — and one is the heartbeat difference
+above. None was visible by reading either artefact.
+
+**Three findings came out of the phase**, and all three from two instruments
+disagreeing rather than from either failing: [ANV-0063](../BUGS.md) (the
+"exhaustive" search was visiting one state in fifteen, because its fingerprint
+came from the public accessors), [ANV-0064](../BUGS.md) (global counters in the
+model's state made two nodes' steps non-commuting, so the partial-order
+reduction pruned real states), and [ANV-0065](../BUGS.md) (TLC produced the
+parallel-commit divergence P6 predicted and no seed had ever reached).
 
 **Goal.** Prove the tests themselves are worth trusting. This phase is what separates the project from "I injected some faults."
 

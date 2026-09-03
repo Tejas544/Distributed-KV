@@ -1,0 +1,52 @@
+# ANV-0059 -- the audit compared applied indices across two Raft logs, and read
+# the key off a replica that no longer owned it
+#
+# One function, two defects, pointing in opposite directions: a key reported
+# lost because the audit asked a lagging replica of a range that had given the
+# key away, and money reported *gained* because the audit's two ways of reading
+# a key -- through a range machine and through a split payload -- resolved live
+# intents differently.
+#
+# ANV-0062 rides on the same run: at strict-serializable, seed 7 fires
+# INV-TXN-01 for a transaction whose record is inside a split payload.
+seed        = 10 (list-append, serializable) for the loss;
+              7 (bank, snapshot isolation) for the gain;
+              7 (list-append, strict-serializable) for ANV-0062
+workload    = txn_bank, both kinds
+nodes       = 5
+keys        = 16, neighbourhood 4, txns_per_client 16
+faults      = drawn from seed; no specific fault is required. All that is needed
+              is one replica behind on its own log while a split or merge has
+              moved a key out from under it, which under this phase's continuous
+              churn is the ordinary state of the cluster.
+invariant   = the list-append element audit (seed 10); the bank's conserved
+              total (seed 7); INV-TXN-01 (seed 7, strict)
+reproduce   = anvil_txn_faults 30
+expect      = before the fix, seed 10 at serializable reports
+                `element 1125912791744545 was acknowledged as committed to
+                 key00014 and is not in the final list`
+              and the same for 1125912791744546 on key00013, with
+              converged=yes; seed 7 at snapshot isolation reports
+                `the cluster holds 1614 and started with 1600`;
+              seed 7 at strict-serializable reports
+                `n2 r3 holds an intent on 'key00009' for t2362634680074240, and
+                 no range in the cluster has a record for that transaction`.
+              After it, 10/10 at every level.
+witness     = the two elements seed 10 called lost, sitting on four nodes:
+
+                node 1  range 8 [key00010,) gen=1 applied=78
+                           V key00013  ts=333[1125912791744546]
+                           V key00014  ts=333[1125912791744545]
+                node 2  range 3 [,)         gen=6 applied=141   <- audit asked this
+                           (nothing for key00013 or key00014)
+
+              141 > 78, and the two numbers index different logs.
+
+              For seed 7, the per-account breakdown pairs every delta except
+              one: key00009 is eight short with no matching credit anywhere,
+              because the credit's intent was inside payload 3->8 and the
+              payload branch read only committed versions.
+note        = api_visible: no, both ways. Nothing was ever lost and nothing was
+              ever gained; the audit read the wrong replica in one case and half
+              a transfer in the other. Filed at S4 for that reason and taken as
+              seriously as an S0 for the reason CONTEXT.md section 10.20 gives.

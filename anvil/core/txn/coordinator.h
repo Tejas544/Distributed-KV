@@ -96,10 +96,25 @@ struct CoordinatorOptions {
   // and the only way to see it is a real-time edge in the history. INV-TXN-08.
   bool commit_wait = true;
 
-  // false: the secondaries are prewritten before the primary. The primary is
-  // the commit point, so a crash between them leaves intents with no record to
-  // resolve them against, and nobody can tell whether the transaction happened.
-  // INV-TXN-02.
+  // false: the secondaries are prewritten before the primary.
+  //
+  // This comment used to claim that a crash between the two orders "leaves
+  // intents with no record to resolve them against, and nobody can tell whether
+  // the transaction happened". That is Percolator, where the primary *lock* is
+  // the commit record. It is not this design, and the difference is worth
+  // stating rather than leaving as a trap: here the record is a separate object
+  // and `commit()` writes it -- kPending, or kStaging under parallel commit --
+  // before any prewrite at all, whichever order this flag selects. The window
+  // the claim describes never opens. What the flag reorders is the intents
+  // among themselves, which changes which key a conflicting transaction
+  // collides on first and nothing about safety, and it is why the drill carries
+  // this knob as a control rather than a must-detect (test/txn_faults.cc).
+  //
+  // The property that actually carries the atomicity argument is the one
+  // `push_record` enforces: a push against a transaction with no record writes
+  // an *aborted* record, and `put_record` refuses to leave a terminal state, so
+  // a coordinator that died before writing its own record can never come back
+  // and commit over the verdict a reader already published. INV-TXN-02.
   bool primary_first = true;
 
   // false: parallel commit. The record goes to kStaging with the full key list
@@ -205,7 +220,9 @@ class Coordinator {
     NodeId hint{};
   };
 
-  Task<bool> next_timestamp(Ts* out);
+  // `fresh` bypasses the reservation and asks the oracle for a timestamp now.
+  // Required for a commit timestamp; see coordinator.cc.
+  Task<bool> next_timestamp(Ts* out, bool fresh = false);
   Task<Response> send(bool read, const shard::RangeDescriptor& range, const TxnCommand& command,
                       std::string_view key, Ts read_ts, Ts uncertainty, TxnId reader);
   Task<bool> resolve_blocker(Handle* handle, std::string_view blocked_key,
@@ -224,7 +241,15 @@ class Coordinator {
   std::map<TxnId, Handle> live_;
   std::map<TxnId, TxnId> waits_;
 
-  // Reserved oracle timestamps not yet handed out.
+  // Per range, the node the last answer said could serve it. Not a cache of the
+  // topology -- the descriptor is that -- but of who is answering for it right
+  // now, which is the question a lease makes different from membership. See
+  // `send` and [ANV-0061].
+  std::map<std::uint64_t, NodeId> leaders_;
+
+  // Reserved oracle timestamps not yet handed out. Start timestamps only:
+  // a commit timestamp is always drawn fresh, and the reason is ANV-0058 and
+  // the long note on `next_timestamp` in coordinator.cc.
   Ts batch_next_ = 0;
   Ts batch_end_ = 0;
 

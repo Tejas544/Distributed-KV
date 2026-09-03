@@ -1,0 +1,33 @@
+# ANV-0061 -- the coordinator recorded the leader hint every reply carried and
+# retried against the node that sent it
+#
+# Coordinator::send picks its destination from the cached descriptor. Every
+# reply carries a leader_hint; on_reply copied it into the response and no
+# caller ever read it. So every one of a request's eight attempts went back to
+# the replica that had just refused it and named the alternative.
+seed        = 1 (bank, snapshot isolation) is the sharpest; it is every seed
+workload    = txn_bank, either kind
+nodes       = 5
+keys        = 16, neighbourhood 4, txns_per_client 16
+faults      = drawn from seed. Any lease handover or leadership change is
+              enough, which under this phase's churn is constant.
+invariant   = none. This is a liveness bug and the measurement is the abort
+              rate, which is why it survived every safety gate in the phase.
+reproduce   = anvil_txn_faults 30, and read the header line
+expect      = before the fix, across 3 levels x 10 seeds:
+                108 committed, 1199 aborted
+              on seed 1 alone, from the coordinators' own counters:
+                begun=321 committed=5 aborted=312 not_leader=1986
+              1,986 rejections against 321 transactions is six refusals per
+              transaction, each of which named the node to ask instead.
+              After the fix: 147 committed, 949 aborted.
+witness     = `not_leader` divided by `begun`. The counter had been printed the
+              whole time.
+note        = api_visible: yes, as an abort rather than a wrong answer -- which
+              is why it is S2 and not S0. The consequence was out of proportion
+              to the bug because it sat upstream of every measurement the phase
+              makes: a mutation drill that scores a deliberate bug by whether an
+              anomaly appears cannot score anything when the workload commits
+              four transactions a seed. `lost update` went 11/15 to 15/15 on
+              this fix alone, with nothing about the mutation or its detector
+              changed.

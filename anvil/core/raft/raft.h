@@ -38,6 +38,7 @@
 #include <string>
 #include <vector>
 
+#include "anvil/core/digest.h"
 #include "anvil/core/raft/config.h"
 #include "anvil/core/raft/log.h"
 #include "anvil/core/raft/types.h"
@@ -201,6 +202,24 @@ class RaftNode {
 
   // Diagnostics, for violation messages. Allocates; never called on a hot path.
   std::string describe() const;
+
+  // A fingerprint of *everything* that determines what this node will do next.
+  //
+  // `describe()` is for humans and is deliberately lossy. This is for a
+  // systematic explorer, which needs the opposite: two nodes must produce the
+  // same digest if and only if they will behave identically from here on. So it
+  // covers the private timers, the replication progress, the vote tally, the
+  // pending reads and the generator's own position -- none of which any public
+  // accessor reaches, and every one of which decides what happens on the next
+  // tick.
+  //
+  // This is an observation, not a hook. It records nothing, changes nothing,
+  // and the protocol does not consult it -- the distinction CONTEXT.md §10.26
+  // draws between a checker reading state and a state machine carrying evidence
+  // for its checker. It exists because a state machine you cannot fingerprint is
+  // a state machine you cannot model-check, and the incomplete fingerprint that
+  // preceded it made an "exhaustive" search quietly incomplete (ANV-0063).
+  Digest state_digest() const;
 
  private:
   // ---- role transitions --------------------------------------------------

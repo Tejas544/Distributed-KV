@@ -1271,4 +1271,96 @@ std::string RaftNode::describe() const {
   return out;
 }
 
+Digest RaftNode::state_digest() const {
+  Digest d;
+
+  d.mix(self_).mix(static_cast<std::uint64_t>(role_)).mix(term_).mix(vote_).mix(leader_);
+
+  // The log, including every watermark. Three of them differ by exactly one
+  // fsync and must not be collapsed (ANV-0016), so a fingerprint that folded
+  // them together would merge two genuinely different states.
+  d.mix(log_.snapshot_index())
+      .mix(log_.snapshot_term())
+      .mix(log_.commit_index())
+      .mix(log_.applied_index())
+      .mix(log_.persisted_index())
+      .mix(log_.writing_index())
+      .mix(log_.last_index())
+      .mix(log_.has_pending_truncate())
+      .mix(log_.pending_truncate_from());
+  for (std::uint64_t i = log_.first_index().value(); i <= log_.last_index().value(); ++i) {
+    const LogEntry* entry = log_.at(LogIndex{i});
+    if (entry == nullptr) continue;
+    d.mix(entry->index).mix(entry->term).mix(static_cast<std::uint64_t>(entry->type)).mix(
+        entry->data);
+  }
+
+  for (const std::uint64_t voter : config_.incoming()) d.mix(voter);
+  d.mix(std::uint64_t{0});
+  for (const std::uint64_t voter : config_.outgoing()) d.mix(voter);
+  d.mix(std::uint64_t{0});
+  for (const std::uint64_t learner : config_.learners()) d.mix(learner);
+  d.mix(std::uint64_t{0});
+
+  for (const auto& [peer, progress] : progress_) {
+    d.mix(peer)
+        .mix(progress.next)
+        .mix(progress.match)
+        .mix(static_cast<std::uint64_t>(progress.state))
+        .mix(progress.inflight)
+        .mix(progress.recent_active)
+        .mix(progress.idle_rounds)
+        .mix(progress.acked_send)
+        .mix(progress.pending_send)
+        .mix(progress.snapshot_offset)
+        .mix(progress.snapshot_index)
+        .mix(progress.is_learner);
+  }
+
+  for (const auto& [voter, granted] : votes_) d.mix(voter).mix(granted);
+
+  d.mix(election_elapsed_).mix(heartbeat_elapsed_).mix(randomized_election_timeout_);
+  d.mix(lease_expiry_).mix(lease_ticks_);
+
+  for (const auto& [context, read] : pending_reads_) {
+    d.mix(context).mix(read.index).mix(read.waiting_for_term_commit);
+    for (const std::uint64_t ack : read.acks) d.mix(ack);
+    d.mix(std::uint64_t{0});
+  }
+
+  const auto mix_snapshot = [&d](const Snapshot& snapshot) {
+    d.mix(snapshot.index).mix(snapshot.term).mix(snapshot.config).mix(snapshot.data);
+  };
+  mix_snapshot(snapshot_);
+  mix_snapshot(incoming_snapshot_);
+  d.mix(incoming_offset_).mix(has_incoming_snapshot_);
+
+  d.mix(static_cast<std::uint64_t>(outbox_.size()));
+  for (const RaftMessage& msg : outbox_) {
+    d.mix(msg.to).mix(static_cast<std::uint64_t>(msg.type)).mix(msg.term).mix(msg.prev_index);
+  }
+  d.mix(static_cast<std::uint64_t>(ready_reads_.size()));
+  for (const ReadState& read : ready_reads_) d.mix(read.context).mix(read.index);
+
+  d.mix(hard_state_dirty_)
+      .mix(persisted_hard_.term)
+      .mix(persisted_hard_.vote)
+      .mix(persisted_hard_.commit);
+  d.mix(pending_install_);
+  mix_snapshot(pending_install_snapshot_);
+
+  d.mix(pending_conf_index_).mix(leader_transferee_).mix(transfer_elapsed_);
+
+  // The generator's position. A node whose next election timeout will be four
+  // ticks is not in the same state as one whose will be two, and nothing else
+  // here distinguishes them.
+  for (std::size_t i = 0; i < 4; ++i) d.mix(rng_.state_word(i));
+
+  // Deliberately excluded: revision_, which counts mutations rather than
+  // describing state. Two nodes that reached the same state by different routes
+  // are the same state, and including a route counter would defeat exactly the
+  // deduplication this exists to make sound.
+  return d;
+}
+
 }  // namespace anvil::raft

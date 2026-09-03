@@ -246,10 +246,33 @@ WriteOutcome VersionStore::put_record(const TxnRecord& record) {
   if (record.heartbeat > current.heartbeat) current.heartbeat = record.heartbeat;
   if (record.ttl_nanos != 0) current.ttl_nanos = record.ttl_nanos;
   if (record.pushed_to > current.pushed_to) current.pushed_to = record.pushed_to;
-  if (!record.keys.empty()) current.keys = record.keys;
   if (record.status != TxnStatus::kPending) {
+    // The key list moves with the status and not on its own, and that is
+    // [ANV-0060]. Every record write carries the primary in `keys` whether or
+    // not it means to declare a key list -- it has to, because that is how a
+    // record is located when a span is partitioned for a split or a merge. A
+    // heartbeat is such a write: `heartbeat_all` sends kPending with no key
+    // list, which arrives as the one-element list `[primary]`, and assigning it
+    // here overwrote the full list a kStaging record had declared.
+    //
+    // What that costs is the whole of parallel commit. A staging record is
+    // committed exactly when every key it lists carries its intent, so a record
+    // truncated to its own primary satisfies its own predicate the moment the
+    // primary is prewritten -- which is *before* the other intents are written,
+    // before the commit timestamp is drawn, and before the read refresh that
+    // may yet abort it. Every recovering reader then calls a transaction
+    // committed that the coordinator had not committed and might never commit.
+    // Seed 12 lost eight units of the bank's total to one such record: t164,
+    // kStaging, key list truncated to `[key00009]`, one intent present, no
+    // commit timestamp, and its other half never written.
+    //
+    // A heartbeat says "I am still alive" and nothing else. It may not narrow
+    // what the transaction has already declared about itself, which is why this
+    // now sits beside the status and the commit timestamp rather than above
+    // them.
     current.status = record.status;
     current.commit_ts = record.commit_ts;
+    if (!record.keys.empty()) current.keys = record.keys;
     if (record.status == TxnStatus::kCommitted) ++stats_.records_committed;
     if (record.status == TxnStatus::kAborted) ++stats_.records_aborted;
   }

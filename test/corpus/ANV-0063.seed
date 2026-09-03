@@ -1,0 +1,35 @@
+# ANV-0063 -- an "exhaustive" state-space search was merging states that behave
+# differently, because the fingerprint came from the public accessors
+#
+# There is no seed here, and that is worth a sentence rather than an apology.
+# A state-space search has no seed: its input is a configuration class and it
+# visits all of it. What reproduces this bug is the *class* plus the defective
+# fingerprint, so the reproduction below is a pair of numbers rather than an
+# integer to replay.
+seed        = n/a -- exhaustive search, not a sampled run
+binary      = anvil_dpor_test
+config      = 3 voters, 1 proposal/node, 2 ticks/node, <= 3 in flight
+              (test/dpor_test.cc, reduction_config())
+invariant   = none of the protocol's. The cross-check between the two searches
+              is what caught it: explore_por reached a terminal state
+              explore_exhaustive had never visited, which is impossible if the
+              exhaustive search is exhaustive.
+reproduce   = build RaftModel::fingerprint() from RaftNode's public accessors
+              only -- role, term, vote, leader, log, commit index, applied
+              index -- instead of from RaftNode::state_digest().
+expect      = before the fix:  1,674 distinct states,   3 terminal states
+              after  the fix: 22,989 distinct states, 259 terminal states
+              i.e. the search had been visiting roughly one state in fifteen,
+              and reporting "no violations found" over the rest.
+witness     = the terminal-state fingerprint sets. Before the fix the reduced
+              search's set is not a subset of the exhaustive search's, which is
+              the only observation in either run that is impossible rather than
+              merely surprising.
+guard       = test/dpor_test.cc::test_reduction_is_sound asserts the two sets
+              are equal. It fails if either search regresses.
+note        = api_visible: no. S4, and the severity understates it: a search
+              that silently covers a fifteenth of what it claims makes every
+              "no violation" result downstream of it worthless. The fix is
+              RaftNode::state_digest(), which is now the single definition of
+              what a node's state is -- a pure observation that records nothing
+              and that the protocol never consults.

@@ -1,0 +1,47 @@
+# ANV-0060 -- a heartbeat narrowed a staging record's key list to its own
+# primary, and parallel commit's predicate then answered yes about one key
+#
+# Every record write carries the primary in `keys` whether or not it means to
+# declare a key list, because that is how a record is located when a span is
+# partitioned. A heartbeat is such a write. VersionStore::put_record took it as
+# a key list and overwrote the one a kStaging record had declared.
+seed        = 12 (bank, snapshot isolation, parallel_commit on)
+workload    = txn_bank, kBank
+nodes       = 5
+keys        = 16 x 100, neighbourhood 4, txns_per_client 16
+faults      = drawn from seed. Nothing specific is required beyond a transaction
+              living long enough to be heartbeated once, which is any
+              transaction that meets a partition or a moving range.
+invariant   = the bank's conserved total. INV-TXN-11 was armed for exactly this
+              and could not see it: it checked for an *empty* key list, and this
+              one had a single element in it.
+reproduce   = anvil_txn_faults 30   (the `parallel commit` control in the drill;
+              the control firing above its cell's noise floor is the detector)
+expect      = before the fix, seed 12 with parallel commit on reports
+                `the cluster holds 1592 and started with 1600`
+              while the same seed with parallel commit off is clean at
+              1600/1600 -- which is what made it look like a bug in parallel
+              commit rather than in the record merge underneath it.
+witness     = the record and the intent, at the end of the run:
+
+                R 164 status=kStaging start=164 commit=0 keys=[key00009]
+                I key00009 txn=164 prim=key00009
+
+              One intent, one listed key, no commit timestamp, and the other
+              half of the transfer never written. "Committed iff every listed
+              key carries its intent" is satisfied, and the transaction was
+              never committed by anyone.
+
+              After the fix the same record reads
+
+                R 164 status=kStaging keys=[key00009, key00010]
+
+              and the predicate correctly says no.
+note        = api_visible: yes, under parallel commit. Also fixed in the same
+              breath, and worth its own line: the audit's implicitly_committed
+              accepted "some version exists on this key" as proof that a listed
+              intent had been resolved. Resolution writes the version *at* the
+              record's commit timestamp, so a record with no commit timestamp
+              cannot be judged by that branch at all -- an unrelated
+              transaction's version on key00010 had been standing in as
+              evidence about t164.

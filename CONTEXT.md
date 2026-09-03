@@ -8,7 +8,7 @@ If you change architecture, add a layer, hit a non-obvious trap, or finish a
 phase — **update this file in the same commit**. A context document that lags the
 code is worse than none, because it is trusted.
 
-- Last updated: end of **P5** (sharding), branch `main`
+- Last updated: end of **P7** (verification depth), branch `main`
 - Repo: `https://github.com/Tejas544/Distributed-KV.git`, branch `main`
 - ~32,300 lines C++20 + Python tooling, 118 source files
 
@@ -314,7 +314,7 @@ planting a bug.
 | **P4 MVCC + transactions** | **done** | 8 `INV-MVCC-*` armed; snapshot isolation confirmed against the checker at two levels; whole sweep runs in <1s |
 | **P5 sharding** | **done again, and for a better reason** | MultiRaft, one Raft group per range; 9 `INV-SHARD-*` armed; 20 ledger rows, 7 of them S0. `shard_faults` 20/20 green. ANV-0051 found INV-SHARD-CLIENT comparing concurrent reads as sequential; because the simulator halts on first violation that false positive had been capping seed 19 at tick 4395 for the whole phase, hiding ANV-0052 (S0) -- a range merged away while holding the only copy of a child's data. Both fixed. See §14 |
 | **P6 distributed transactions** | **in progress, four findings open** | Percolator/SSI/StrictSerializable behind one `Coordinator`; 7 `INV-TXN-*` armed (01-04, 09, 11, 12). Green: `anvil_txn_test` 30/30, determinism 3/3, serializable and strict-serializable 4/4 checker-clean, INV-TXN-09 silent. The fault-free money-loss finding is fixed (two root causes), as are the two that turned out to be checkers looking in too few places. What remains: two small conservation shortfalls, one INV-TXN-02, one list-append loss. See §14 |
-| **P7 verification depth** | **started, exit criterion 1 met** | `checker.mutation`: 100% mutation score (200/200 detected, 200/200 correctly named across 9 anomaly classes), zero false positives over 10,000 reference-model histories at all 5 levels, 120/120 discrimination pairs. Taken first because the three findings before it were all checker bugs. TLA+, trace validation, DPOR and the minimiser are untouched |
+| **P7 verification depth** | **done** | All 5 exit criteria met: checker mutation (200/200, 0 FPs), Elle cross-validation (10,000/10,000 verdicts identical), TLA+ (9/9 configurations as specified) and trace validation (16/16 runs conform, 12/16 mutated rejected), state-space search (2.2M states complete, 0 violations, 3/3 drill), minimiser (11 features → 1, verified 1-minimal). Three ledger findings — ANV-0063, ANV-0064 (both S4, both from two instruments disagreeing) and ANV-0065 (S1, TLC produced the parallel-commit divergence P6 predicted and no seed reached) — plus seven discrepancies found by trace validation, three of them in the specification itself. See §15 |
 | P8+ | not started | The bug hunt at scale, prod runtime |
 
 ### Measured (see README results block)
@@ -1335,34 +1335,454 @@ Open, and now a short list of genuine findings rather than a fog:
    checker-clean**, with the drill unchanged mutation-for-mutation, which is
    what says the fix is orthogonal rather than a blinding.
 
-### Where P6 stands after all of that
+### Closing P6: the last four findings, and what the drill was actually measuring
 
-Green: `shard_faults` 20/20, mechanism 30/30, shard and checker units,
-`checker.mutation` (P7's gate) 100%, determinism 3/3, **all three levels 4/4
-checker-clean**, INV-TXN-02/09 silent.
+Everything above left four things open. All four are closed, and three of them
+turned out to be the same sentence written in different places.
 
-Open, and all three are named rather than vague:
+**9. The audit ranked claimants by applied index, across two Raft logs.** This
+is [ANV-0059]. `holder_of` asked every live replica whether its descriptor
+contained the key and took the highest applied index among them. An applied
+index numbers entries in *one range's own log*; comparing two of them across two
+ranges compares two unrelated counters -- gotcha 10.23 with the two consumers
+being two logs rather than a log and a state machine. Seed 10 lost two
+acknowledged elements to it:
 
-- **Two conservation shortfalls** (seeds 1 and 7, 17 and 15 of 1600). The
-  audit's cross-range intent blind spot described above -- real, with a fix
-  that is known and rejected for blinding the drill. Needs a different fix.
-- **`secondaries before primary` is no longer detected by the drill** (0/15).
-  This is a cost of finding 7, and it is honest to state it that way: the
-  mutation was previously "caught" through the stale-descriptor blind spot,
-  which is detection by accident rather than by design. Its real signature is
-  intents with no record to resolve them against. `orphaned_intents` now
-  counts those accurately -- it was looking for the record on the intent's own
-  range, so every cross-range transaction counted as an orphan and a healthy
-  run reported ~111 of them; it now reports 86 real ones. Asserting that count
-  to be zero was tried and is wrong: resolution is lazy, the settle phase has
-  no clients left to read anything, and an intent whose owner died before
-  writing its record is cleaned by the next reader that meets it -- of which
-  there are none. "Nobody has tidied up yet" and "nobody ever will" are
-  different claims. A detector for this mutation needs to distinguish them,
-  probably by driving a reader over every key during settle.
-- **The `parallel commit` control still fires** through the conserved total,
-  which is the second bullet leaking into the drill rather than a bug in
-  parallel commit.
+```
+node 1  range 8 [key00010,) gen=1 applied=78
+           V key00013  ts=333[1125912791744546]
+           V key00014  ts=333[1125912791744545]
+node 2  range 3 [,)         gen=6 applied=141      <- the audit asked this one
+           (nothing for key00013 or key00014)
+```
+
+141 > 78, so the audit read a replica that had not yet learned it no longer
+owned the key. What *is* comparable is a descriptor generation within one range:
+it is bumped by every split and merge that range takes part in, so each range now
+speaks with its newest descriptor and only then is the key matched against it.
+Applied index survives as the tiebreak among replicas *of the same range*, which
+is the one place it means anything. Two live ranges claiming one key is now
+counted and reported (`ambiguous_keys`) rather than resolved by a coin flip.
+
+The same row carries its mirror image, which is the more useful half. The audit
+had two ways to read a key -- through a range machine, where `audited_value`
+resolves a committed intent the way a client's reader would, and through a split
+payload, where `committed_value` did not. A cross-range transfer caught across
+that seam had its credit counted and its debit skipped, and seed 7 finished
+**fourteen over** its starting total. An audit that finds money is exactly as
+broken as one that loses it, and the fix was not to teach the second branch the
+same trick but to stop having two branches: one `owning_store(key)` now answers
+with a live range's store or with a payload, and everything reads through it.
+
+**10. A heartbeat narrowed a staging record's key list, and parallel commit's
+predicate then answered yes about one key.** This is [ANV-0060], the phase's
+second S0 and the one the `parallel commit` control was pointing at all along.
+Every record write carries the primary in `keys`, unconditionally, because that
+is how a record is located when a span is partitioned. A heartbeat is such a
+write -- and `put_record` merged it as though it were a declaration:
+
+```cpp
+if (!record.keys.empty()) current.keys = record.keys;   // before
+```
+
+A kPending heartbeat does not overwrite the status, so the record stayed
+kStaging with its key list cut down to `[primary]`. Since a staging record is
+committed exactly when every key it lists carries its intent, that record
+satisfied its own predicate the moment its primary was prewritten -- before the
+other intents, before the commit timestamp, before the refresh that might yet
+abort it. Seed 12: `R 164 kStaging keys=[key00009] commit=0`, one intent, other
+half never written, eight units of the bank's total gone. The key list now moves
+with the status, inside the branch that already knows a kPending write carries
+no verdict.
+
+INV-TXN-11 was armed for exactly this and watched it happen 143,000 times a seed
+without a word, because it checked for an *empty* key list. An empty list is the
+loud way for a record to be undecidable; a narrowed one is the quiet way, and it
+is strictly worse -- the predicate still evaluates, over fewer keys than the
+transaction wrote, and comes out committed. It now reports any intent at the
+record's epoch on a key the record does not list.
+
+**11. The retry that went back to the node which had just refused.** This is
+[ANV-0061], and it is the reason everything else in the drill was unmeasurable.
+Every reply carries a `leader_hint`; `on_reply` copied it into the response and
+no caller read it. `send` picked its destination from the cached descriptor
+every time, so all eight attempts went to the replica that had, each time, named
+the alternative. Seed 1: **1,986 not-leader rejections against 321 transactions
+begun, of which five committed.** Gotcha 10.12 with the repeated half being the
+destination rather than the operation.
+
+The fix took the suite from 108 committed to 147 and `lost update` from 11/15 to
+15/15 with nothing about that mutation or its detector changed. **Detection rate
+is a function of throughput, and a throughput bug reads as a detection gap** --
+which is what four of the drill's rows had been reporting.
+
+**12. And the drill itself was measuring the wrong thing in three more ways.**
+[ANV-0057] added the null control and found that five of nine rows were scoring
+the harness's own noise. Finishing the job needed three more corrections, each
+of which is a general point:
+
+*A cell is a configuration, not a (level, workload) pair.* Two rows switch off a
+mechanism that a **second mechanism makes redundant**. Spanner waits out the
+clock bound at commit; CockroachDB restarts a read that lands inside it. Anvil
+does both, so either alone is sufficient and removing either alone is an
+equivalent mutant. Measured in both directions rather than argued:
+
+| configuration | detections |
+|---|---|
+| commit-wait on, uncertainty restart off | 0 / 40 seeds |
+| commit-wait off, uncertainty restart on | 0 / 20 seeds |
+| both off | real-time violations, 5/20 and 3/20 |
+
+So the two uncertainty rows now run in a cell where commit-wait is off, and
+`no commit-wait` is that cell's null control -- a control and a finding at once.
+
+*A mechanism has to be reachable before a row about it means anything.* The
+uncertainty window is `(start_ts, start_ts + bound]`, and at the bound
+`FaultProfile::from_seed` draws (1--250 ms), across a run that commits about
+eight transactions, it is never once occupied: `restarts_uncertain` is exactly
+zero. Declaring a wider bound on its own does **not** fix it, and the first
+attempt did exactly that and looked like it had -- 98 restarts across 15 seeds
+and still no detection -- because `max_offset` is *derived* from
+`declared_uncertainty` in `from_seed`. Raising only the declaration widens the
+window without moving the clocks, so almost every version inside it genuinely is
+in the future and skipping it is genuinely correct. The window was occupied and
+vacuous at the same time. Both are now scaled together.
+
+*A checker starved of observations reports VALID for the same reason an empty
+history does.* `no refresh on push` puts the mechanism squarely under load --
+sixty refresh failures a seed, five transactions per seed committing without one
+-- and produced nothing in 25 seeds. Two reasons, both structural. Elle recovers
+a key's version order from the reads that observed it, and with sixteen keys and
+ten commits a seed the graph came out with **two edges in it**; the same run at
+four keys builds twenty-five. And an anti-dependency in one direction is not a
+cycle: the reciprocal write-skew pair has to happen concurrently on the same pair
+of keys, which random draws will not deliver. The cell now states the two-doctors
+shape instead of sampling for it, and the row detects G2-item on 4/15 seeds.
+
+There is now also a **settle-phase reader**: one read-only transaction per key
+after the heal, recorded in the history. It was independently required by three
+things -- Elle's version-order recovery, the lazy intent resolution that has
+nobody to trigger it once the writers stop, and the fact that nothing otherwise
+exercises the serving path after a heal. The edge count in a 55-transaction
+history went from single digits to 131.
+
+### Where P6 stands
+
+**Green, and P6 is complete.** `anvil_txn_faults 30` passes end to end:
+
+```
+under faults (3 levels x 10 seeds): 145 committed, 949 aborted,
+  173 cross-range transactions, 112m simulated node-time
+snapshot-isolation ....... 10/10 seeds checker-clean
+serializable ............. 10/10
+strict-serializable ...... 10/10
+determinism .............. 3/3 seeds reproduce exactly
+seeded-mutation drill .... 6/6 deliberate bugs detected above their cell's
+                           null control; all five null controls silent;
+                           all three configuration controls silent
+```
+
+`shard_faults` 20/20, `mvcc_faults`, `checker_mutation` (P7's first gate) and
+every unit suite green beside it.
+
+Two things are deliberately *not* claimed, and both are written down rather than
+buried:
+
+- **`secondaries before primary` is a control, not a must-detect.** The knob's
+  own comment used to describe Percolator, where the primary lock *is* the
+  commit record and writing it last leaves intents nobody can resolve. That is
+  not this design: the record is a separate object and `commit()` writes it
+  before any prewrite at all, whichever order the flag selects, so the window
+  the comment describes never opens. What the flag reorders is the intents among
+  themselves. It is kept as a control because the reordering must stay harmless.
+- **The staging window opens earlier than parallel commit's textbook version.**
+  The record goes to kStaging *before* the prewrites and with `commit_ts = 0`;
+  CockroachDB's STAGING record carries the provisional commit timestamp and is
+  written last. With the key list fixed the predicate is sound, but a
+  coordinator can still write kAborted over a staging record whose intents are
+  all present -- if the fresh timestamp draw fails, or if the read refresh does
+  at serializable. No seed has produced a divergence from it. The measurement
+  that would is a recovering reader racing an aborting coordinator, and it is
+  the first thing to build if parallel commit is ever taken further.
+
+---
+
+## 15. P7 (verification depth): what was built, and what it found
+
+P7 is the phase that asks whether the previous six phases' evidence is worth
+anything. Every gate before it is Anvil checking Anvil — our corpus against our
+checker, our model against our invariants — and that arrangement can catch a
+mistake made once but not a mistake made consistently. So this phase builds
+four instruments that are *not* the fault sweep, and the interesting result is
+that three of them immediately found something.
+
+### The shape of the phase
+
+| # | Criterion | Instrument | State |
+|---|---|---|---|
+| 1 | checker mutation score 100%, zero false positives | `checker.mutation` | **met** |
+| 2 | zero unexplained disagreements with Jepsen Elle | `tools/elle_cross.sh` | **met** |
+| 3 | TLC finds no violations; trace validation conforms | `tools/tlc.sh`, `tools/trace_validate.sh` | **met** |
+| 4 | DPOR covers its configuration class; state count reported | `verification.dpor` | **met** |
+| 5 | minimiser reduces ≥10 faults to ≤3 in <5 min | `verification.minimiser` | **met** |
+
+### What each one is
+
+**The minimiser** (`anvil/sim/minimiser.h`, `test/minimiser_test.cc`) is Zeller's
+ddmin over a set of *fault features* — one entry per knob the profile can arm,
+plus BUGGIFY. The empty subset is exactly `FaultProfile::none()`, so "minimised
+to nothing" and "the codebase's own control condition" are the same
+configuration rather than two things that look alike.
+
+The honest caveat is in the header and it determines how to read every result:
+ddmin's 1-minimality guarantee assumes a deterministic predicate, and this one is
+not. Disabling a fault does not remove an event from a fixed schedule; it changes
+which dice are rolled, so the whole execution downstream diverges. Hence
+`attempts` (several schedule seeds per candidate) and
+`verified_one_minimal` (the closing check actually ran and every kept feature was
+individually shown to be load-bearing), both reported rather than assumed.
+
+It is graded against causes known in advance rather than against a smaller
+number: `fsync_before_ack = false` acknowledges a write that is only in the page
+cache, and in this model a crash is the only thing that takes the page cache
+away, so the answer *must* be exactly `{process.crash}`. It is. And because a
+search that had learned to answer "process.crash" would pass all of that, a third
+case chases detected corruption instead, with no planted bug at all — and gets
+`{disk.bit_rot, process.crash}`, which is the right pair: bit rot damages bytes
+already written, and a restart is what makes the checksum fire on replay.
+
+**The state-space search** (`anvil/sim/dpor.h`, `test/dpor_test.cc`) is a model
+checker over `anvil/core/raft/raft.h` itself — the shipping state machine, no
+simulator underneath. That is only possible because P3 made it a pure state
+machine whose only output is a `Ready` batch; a model checker needs exactly that,
+so this deliverable cost a few hundred lines rather than a rewrite.
+
+It ships two searches, and the second is graded against the first: full
+reachable-state enumeration with fingerprint deduplication (the ground truth),
+and the same search under sleep-set partial-order reduction. **The reduction is
+validated, not asserted** — both must report the same terminal states, which is
+the same discipline as the hermeticity gate's negative control.
+
+**The TLA+ specs** (`spec/Raft.tla`, `spec/SsiCommit.tla`) are specifications of
+the safety *argument*, not transcriptions of the code. A spec that mirrors an
+implementation line by line proves nothing, because it inherits the
+implementation's mistakes.
+
+**The Elle cross-validation** (`test/elle_export.cc`, `tools/elle/`) is the only
+gate in the tree that is not self-referential. Anvil emits histories in Jepsen's
+own format with its verdict attached; a Clojure harness runs Jepsen's Elle over
+the same histories and compares.
+
+### The results
+
+```
+checker mutation ....... 200/200 detected and correctly named across 9 anomaly
+                         classes; 0 false positives over 10,000 reference-model
+                         histories at all 5 levels; 120/120 discrimination pairs
+
+elle cross-validation .. 10,000 shared histories (5,000 correct, 5,000
+                         anomalous); 10,000/10,000 verdicts identical;
+                         10,000/10,000 same anomaly class; 0 disagreements
+
+state-space search ..... 2,202,433 distinct states, 5,545,749 transitions,
+                         5,530 terminal states, depth 78, complete, 0 violations
+                         (3 voters, 2 proposals/node, 2 ticks/node, ≤4 in flight)
+                         drill: 3/3 must-detect caught, 5 equivalent-in-class
+                         with a written argument each
+reduction .............. 382/382 terminal states identical to the exhaustive
+                         search over the same class, 128,400 edges pruned
+
+minimiser .............. 11 armed features → 1 (`process.crash`), 1-minimality
+                         verified, 15 predicate runs, 0.016s; a second failure
+                         on the same workload minimises to a different cause
+
+TLA+ ................... 9 configurations, five required clean and four
+                         required to fail on a *named* property
+trace validation ....... 16/16 runs of anvil::raft::RaftNode permitted by
+                         spec/Raft.tla; 12/16 runs of a deliberately broken
+                         implementation correctly rejected, the other 4
+                         equivalent on their seed and named
+```
+
+### Three findings, and all three came from disagreement rather than from failure
+
+**[ANV-0063]: the "exhaustive" search was visiting one state in fifteen.** The
+state fingerprint was assembled from `RaftNode`'s public accessors, which omit
+the leader's replication progress, the election timers, the randomised timeout,
+the vote tally and the generator's own position — every one of which decides what
+the node does next. Two states differing only in those were merged, the second
+never expanded, and everything reachable only through it was silently outside the
+search. On the small class, 1,674 distinct states became 22,989 once the
+fingerprint was complete.
+
+It could not have been found by either search alone: both reported no violations
+and both were wrong. What was diagnostic is that the *reduced* search reached a
+terminal state the exhaustive one had never visited, which is impossible if the
+exhaustive search is exhaustive.
+
+The fix is `RaftNode::state_digest()`, now the single definition of what a node's
+state is. It is a pure observation — records nothing, changes nothing, never
+consulted by the protocol — which is the distinction §10.26 draws between a
+checker reading state and a state machine carrying evidence for its checker.
+
+**[ANV-0064]: the independence relation was a claim about the encoding, not
+about Raft.** Messages lived in one list numbered from one counter, and
+`proposals_used` was one counter shared by every node. Two nodes stepping in
+either order therefore reached states the fingerprint distinguished, so
+"transitions of different nodes commute" was false and the reduction pruned real
+states — 42 terminal states against the exhaustive search's 407. Per-link queues
+with per-link sequence numbers and a per-node proposal budget fix it at the root.
+
+A third instance of the same idea turned up in the *search* rather than the
+state, and it is not a bug: **a bound on messages in flight is not invariant
+under commutation**, because two orders ending in the same state pass through
+different peaks, so one can be cut off at the bound while the other survives.
+That is a constraint on where the comparison is valid, and the test enforces it
+by asserting the bound never binds in the class the two searches are compared
+over.
+
+**[ANV-0065]: TLC produced the divergence P6 predicted and no seed had ever
+reached.** Under parallel commit at serializable, a recovering reader evaluates
+the implicit-commit predicate — every key the staging record lists carries its
+intent — and commits the transaction. That path never performs the read refresh,
+which the coordinator's own commit path does and which would have aborted the
+transaction. Whichever gets there first decides, and one of the two outcomes is
+write skew in a history the engine calls serializable.
+
+The end of P6 names this exactly: *"a coordinator can still write kAborted over a
+staging record whose intents are all present... the measurement that would show
+it is a recovering reader racing an aborting coordinator, and it is the first
+thing to build if parallel commit is ever taken further."* No seed produced it,
+because the race is one interleaving of two transactions over two keys and the
+sweep is sampling a far larger space. TLC produced it in one second and 10,881
+states. `parallel_commit` is off by default, so nothing ships with it; the
+finding is that the mechanism is unsound at serializable *as designed*.
+
+### What the specifications cost, which is the part worth reading
+
+Writing a spec that is *wrong* is easy and the failure mode is specific: it
+produces a violation that looks exactly like the system being broken. Three
+happened here, in one afternoon, and each took a real counterexample to see:
+
+1. **Configuration as a global variable.** The first `Raft.tla` let any leader
+   change the membership atomically. TLC immediately produced two leaders in one
+   term — one leader had shrunk the cluster out from under the other. In Raft a
+   configuration change is a *log entry*, and each server's configuration is
+   derived from its own log, which is also what makes truncation revert it for
+   free.
+2. **Leader Completeness keyed on the wrong term.** The property guarded on the
+   entry's term rather than on the term the commit *decision* was made in. Those
+   differ exactly when an old entry becomes committed under a later leader —
+   which is the Figure-8 situation — and the wrong version demands that a leader
+   of term 3 hold an entry nobody committed until term 4. Raft does not promise
+   that.
+3. **A follower trusting `mcommit` over its whole log.** Clamping the follower's
+   new commit index to `Len(log)` rather than to the last index *this message
+   verified* lets a follower with a divergent tail record entries as committed
+   that the leader has never had. StateMachineSafety fails, and it reads as a
+   protocol bug.
+
+All three are the same lesson the ledger keeps recording about checkers, in a
+new notation: **the model was wrong in a way that looked exactly like the system
+being wrong.** Roughly a third of this project's findings have been the harness
+rather than the engine, and specifications are not exempt.
+
+There is a fourth, smaller, and worth knowing: `x' = a \/ b` parses as
+`(x' = a) \/ b`, because `=` binds tighter than `\/`. TLC reports it as
+"successor state is not completely specified", which is a far better error than
+the silent one it would be in most languages.
+
+### And what the *searches* cost, which is a different lesson
+
+Three separate times, a search that "could not find" something was not searching
+too shallowly — it was searching a space made needlessly large.
+
+The five-server Figure-8 counterexample is about fifteen steps deep. Breadth-first
+search was still at depth 14 after ten minutes and 137 million states; random
+simulation checked 112 million states without reaching it. Neither was the
+answer. What worked was **removing branching**: switching heartbeats off and
+restricting who may campaign — both named constants, both documented in the
+`.cfg` — took that run from "not found in 112 million states" to "found in
+11,746". Depth was never the problem.
+
+The same applies to the main `Raft.cfg` run. Making handled messages actually be
+*removed* (the first version left them in the set, which made `MaxMessages` bound
+the total a behaviour may ever send rather than the number in flight) was
+necessary for correctness and multiplied the state space; symmetry reduction over
+`Server` bought a factor of about six back, and it is sound only because that
+configuration has no `ConfigChoices` — a configuration change names particular
+servers and destroys the symmetry. That is why joint consensus lives in
+`RaftJoint.cfg` and not in `Raft.cfg`.
+
+### Where P7 stands
+
+**All five criteria are met**, and each is produced by something in this tree.
+
+Criterion 3 has two halves and both landed:
+
+- Both specifications exist, TLC model-checks them exhaustively over stated
+  slices, and every configuration is graded — five required clean and four
+  required to *fail on a named property*, because a specification whose
+  properties have only ever been observed to hold is indistinguishable from one
+  whose properties are vacuous (ANV-0005, in a new notation).
+- **Trace validation** replays runs of `anvil::raft::RaftNode` against
+  `spec/Raft.tla`: 16/16 conform, and 12/16 runs of a deliberately broken
+  implementation are correctly rejected (the other four are seeds on which the
+  mutation never had an opportunity to manifest, counted and named).
+
+### What building trace validation cost, and why it was worth it
+
+Seven discrepancies, every one of them real, and none visible by reading either
+artefact:
+
+*Three in the exporter's mirror of the specification's variables.* A candidate
+re-campaigning at a higher term lost its own vote. A vote arriving at a node that
+had already won was credited anyway, where the specification credits votes only
+to candidates — and the fix has to test the role *before* the transition, because
+the winning vote is consumed by a node that is a leader by the time anything
+looks. And already-committed entries were re-recorded with whatever term the node
+happened to hold, inventing commit decisions nobody made.
+
+*Three in the specification.* `committedLog` had the same re-recording bug, on
+both paths. `StepDown` was missing entirely — the implementation abandons an
+election once a quorum has rejected it, which shortens every split-vote round by
+a full timeout, and the specification had no action for it. And an
+`AppendEntriesResponse` disagreed about `mmatch` on rejection.
+
+*One genuine design difference*, and the most interesting of the seven: both
+sides clamp the commit index a heartbeat advertises, and they clamp it in
+different places. The implementation clamps at the **sender** —
+`broadcast_heartbeat` advertises `min(pr.match, commit_index)`, never telling a
+follower to apply what it is not known to hold. The specification clamps at the
+**receiver** — `min(mcommit, verified)`, where `verified` is the prefix that
+message actually checked. Both are sound. They are not the same mechanism, and
+reconciling them needs a `matchIndex` variable the specification deliberately
+does not have. So heartbeats are out of scope for the replay, and what is
+validated is elections, replication and the commit rule.
+
+That last one is the shape of finding this deliverable exists to produce: the two
+artefacts agree on *what* must hold and differ on *where* it is enforced, which
+no amount of reading either one would have surfaced.
+
+None of the seven is a BUGS.md row, and the reason is the ledger's own rule
+rather than modesty: a row needs a commit to bisect against, and every one of
+them is in code that did not exist before this phase — the specification, the
+exporter, or both. They are recorded here for the same reason P6's pre-commit
+fixes are recorded in §14. The three findings that *do* have rows (ANV-0063,
+ANV-0064, ANV-0065) are the ones about code or designs that predate them.
+
+One more, smaller and purely mechanical: a use-after-free in the exporter's
+driver. `message_of()` returns a pointer into the link's deque and `fire()` pops
+that deque, so a pointer taken before the transition dangled during the
+observation after it. It read plausible bytes rather than crashing, and the
+symptom was a candidate becoming leader with one vote instead of two, sixty steps
+before the replay actually stalled. CONTEXT.md gotcha 10.14 with `fire()` in the
+place of the suspension point.
+
+Long-standing blockers are unchanged: `anvil/prod/` is still an empty target,
+the cross-toolchain digest gate has still never run, and **ANV-0033** — a run's
+outcome depending on sixteen bytes of environment variable — is still the single
+highest-value thing to do with a Linux box.
 
 ---
 

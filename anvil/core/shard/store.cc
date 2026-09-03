@@ -1373,6 +1373,17 @@ void ShardStore::handle_txn_request(const Message& envelope, std::string_view bo
     // applied everything it knows is committed. Both conditions, for the reason
     // ANV-0048 records: the lease is durable and comes back with a restarted
     // node while its state machine is still catching up.
+    //
+    // The lease-grant argument the bank read above gives for preferring this
+    // over `can_serve_local_reads()` has a hole worth naming, since it is
+    // repeated here: applying the entry that made you holder orders you after
+    // everything the *previous* holder could have served, and says nothing
+    // about entries this holder itself committed under its current lease. The
+    // stronger condition was tried here while hunting ANV-0058 and bought no
+    // finding -- the anomaly was in the timestamps, not in the reads -- so it
+    // was reverted rather than kept on the strength of the argument alone. The
+    // hole is real and unexercised; a seed that exercises it is worth more than
+    // a guard that costs a round trip on every read.
     const std::uint64_t now = runtime_->now().physical;
     const bool caught_up = replica.driver->node().log().applied_index() >=
                            replica.driver->node().log().commit_index();

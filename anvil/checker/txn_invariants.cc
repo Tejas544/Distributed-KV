@@ -330,6 +330,16 @@ void arm_txn_invariants(InvariantRegistry& registry, TxnObserver* observer) {
   registry.arm("INV-TXN-01", "every intent is attributable to a transaction record",
                CostClass::kQuiesce, [observer]() -> std::optional<std::string> {
                  observer->refresh();
+                 // A record is not only on a range machine. For the width of a
+                 // split handover it is inside the parent's payload, which is
+                 // where the split put it and where the child will collect it
+                 // from -- and a checker that walks only the machines calls
+                 // that a transaction which never existed. Same shape as
+                 // [ANV-0059] one layer up: the payload is not a place the data
+                 // has gone missing, it is a place the protocol says the data
+                 // lives. Seed 7 at strict-serializable fired this on t2362...,
+                 // whose kAborted record was sitting in payload 3->8 the whole
+                 // time.
                  std::map<txn::TxnId, txn::TxnStatus> records;
                  for (const NodeId id : observer->live_nodes()) {
                    const shard::ShardStore* store = observer->store(id);
@@ -338,6 +348,18 @@ void arm_txn_invariants(InvariantRegistry& registry, TxnObserver* observer) {
                      if (replica.machine == nullptr) continue;
                      for (const auto& [txn_id, rec] : replica.machine->txn_store().records()) {
                        records[txn_id] = rec.status;
+                     }
+                     for (const auto& [child_id, pending] :
+                          replica.machine->pending_splits()) {
+                       std::string_view section;
+                       if (!shard::RangeMachine::decode_txn_section(pending.payload, &section)) {
+                         continue;
+                       }
+                       txn::VersionStore payload;
+                       if (!payload.load(section)) continue;
+                       for (const auto& [txn_id, rec] : payload.records()) {
+                         records[txn_id] = rec.status;
+                       }
                      }
                    }
                  }
@@ -366,9 +388,26 @@ void arm_txn_invariants(InvariantRegistry& registry, TxnObserver* observer) {
   // if every key it lists carries its intent or its version. The recovery
   // protocol has to reach the same verdict the coordinator would have, and the
   // way to check that is to evaluate the predicate the recovery uses.
+  //
+  // "Decidable from its keys" needs the key list to name every key the
+  // transaction actually touched, and an empty list is only the loudest way for
+  // that to fail. A list that has been *narrowed* is the quiet way, and it is
+  // strictly worse: the predicate still evaluates, it evaluates over fewer keys
+  // than the transaction wrote, and it comes out committed. That is [ANV-0060],
+  // which this invariant watched happen 143,000 times a seed without a word,
+  // because `keys` was never empty -- it had exactly one element, the primary,
+  // put there by a heartbeat.
+  //
+  // Stated over cluster state rather than over one record: at quiesce, an
+  // intent at the record's own epoch on a key the record does not list is a
+  // transaction no reader can decide, whichever way the truncation happened.
+  // Quiesce is load-bearing here -- the record and the intents go to different
+  // Raft groups, so before things are idle an intent may legitimately have
+  // landed while the record write is still in flight.
   registry.arm("INV-TXN-11", "a staging record's implicit commit is decidable from its keys",
                CostClass::kQuiesce, [observer]() -> std::optional<std::string> {
                  observer->refresh();
+                 std::map<txn::TxnId, const txn::TxnRecord*> staging;
                  for (const NodeId id : observer->live_nodes()) {
                    const shard::ShardStore* store = observer->store(id);
                    if (store == nullptr) continue;
@@ -381,6 +420,40 @@ void arm_txn_invariants(InvariantRegistry& registry, TxnObserver* observer) {
                                 " is staging with no key list, so no reader can decide "
                                 "whether it committed";
                        }
+                       // The longest list any replica holds. A replica that is
+                       // behind has an older list, and older is longer here --
+                       // the narrowing is the newer entry -- so taking the
+                       // longest cannot manufacture a finding out of lag.
+                       const auto seen = staging.find(txn_id);
+                       if (seen == staging.end() ||
+                           rec.keys.size() > seen->second->keys.size()) {
+                         staging[txn_id] = &rec;
+                       }
+                     }
+                   }
+                 }
+
+                 if (staging.empty()) return std::nullopt;
+                 for (const NodeId id : observer->live_nodes()) {
+                   const shard::ShardStore* store = observer->store(id);
+                   if (store == nullptr) continue;
+                   for (const auto& [range_id, replica] : store->ranges()) {
+                     if (replica.machine == nullptr) continue;
+                     for (const auto& [key, intent] :
+                          replica.machine->txn_store().intents()) {
+                       const auto it = staging.find(intent.txn);
+                       if (it == staging.end()) continue;
+                       // An intent from a previous attempt is already dead --
+                       // commit_intent refuses it (kStaleEpoch) -- so it is not
+                       // a key this record has to account for.
+                       if (intent.epoch != it->second->epoch) continue;
+                       const auto& keys = it->second->keys;
+                       if (std::find(keys.begin(), keys.end(), key) != keys.end()) continue;
+                       return "t" + std::to_string(intent.txn) + " is staging over " +
+                              std::to_string(keys.size()) +
+                              " key(s) and holds an intent on '" + key +
+                              "', which it does not list -- its own predicate says it "
+                              "committed without ever looking at that key";
                      }
                    }
                  }

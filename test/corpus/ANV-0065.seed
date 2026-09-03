@@ -1,0 +1,47 @@
+# ANV-0065 -- a recovering reader implicitly commits a staging transaction that
+# the coordinator's own read refresh would have aborted
+#
+# No seed, and for a different reason from ANV-0063 and ANV-0064: this one was
+# found by TLC, whose input is a specification and a set of constants rather
+# than a schedule. The reproduction is a .cfg file and it is checked in.
+seed        = n/a -- TLC, breadth-first and exhaustive over the slice below
+spec        = spec/SsiCommit.tla
+config      = spec/SsiParallel.cfg
+              Key = {k1, k2}   Txn = {t1, t2}   MaxTs = 6
+              RefreshReadsOnPush = TRUE        (serializable)
+              ParallelCommit     = TRUE        (staging records)
+invariant   = NoWriteSkew
+reproduce   = tools/tlc.sh SsiParallel
+expect      = "Error: Invariant NoWriteSkew is violated", in about one second,
+              after roughly 10,881 distinct states. The counterexample is 13
+              steps and its last action is ResolveStaging.
+counterexample =
+              t1, t2      Begin
+              t1, t2      Write (each to the key the other will read)
+              t1, t2      Read  (each reads the other's key)
+              t1, t2      WriteRecord  -> kStaging, full key list
+              t1          Prewrite
+              t1          Commit       -> kCommitted; its version is now visible
+              t2          Prewrite
+              --          ResolveStaging(t2): every key t2 lists carries its
+                          intent, so a reader declares t2 committed. That path
+                          never evaluates ReadsAreStillValid, which t1's commit
+                          has just invalidated. t2's own coordinator would have
+                          aborted.
+control     = spec/SsiParallelSnapshot.cfg -- the same configuration at snapshot
+              isolation, where there is no refresh to skip. It is clean, which
+              is what makes the finding "implicit commit versus the read
+              refresh" rather than "parallel commit is broken".
+default     = parallel_commit is FALSE in CoordinatorOptions. Nothing ships with
+              this behaviour; the drill carries the knob as a control. This is a
+              finding about the design of a non-default mechanism.
+status      = OPEN. Two candidate fixes, and choosing between them is a design
+              decision rather than a patch: either the staging record carries
+              enough for a recovering reader to perform the refresh itself, or
+              implicit commit is restricted to snapshot isolation.
+note        = api_visible: yes -- as write skew, in a history the engine calls
+              serializable. Predicted at the end of P6 ("the measurement that
+              would show it is a recovering reader racing an aborting
+              coordinator") and never produced by any seed, because the sweep
+              samples a much larger space than the two-transaction interleaving
+              this needs.

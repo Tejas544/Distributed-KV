@@ -198,6 +198,7 @@ struct Summary {
   std::uint64_t aborted = 0;
   std::uint64_t unknown = 0;
   std::uint64_t restarts = 0;
+  std::uint64_t uncertain_reads = 0;
   std::uint64_t reads = 0;
   std::uint64_t writes = 0;
   std::uint64_t cross_range = 0;
@@ -326,6 +327,50 @@ Summary run_seed(std::uint64_t seed, RunOptions options) {
   if (!options.inject_faults) cfg.faults = sim::FaultProfile::none();
   cfg.max_time = options.max_time;
   cfg.nodes = options.nodes;
+  // The declared clock bound, which belongs to the deployment rather than to
+  // the transaction engine -- the workload hands the simulator's declared
+  // uncertainty straight to the coordinator (txn_bank.cc), because a system
+  // told a bound its clocks do not honour is a different experiment from a
+  // system told the truth.
+  //
+  // Strict serializability gets a wider one, and it is scaled rather than set,
+  // which is the whole of the lesson here.
+  //
+  // A read is uncertain when a version was committed inside `(start_ts,
+  // start_ts + bound]` on the key it is reading. At the bound `from_seed` draws
+  // -- 1 to 250 ms -- over a 20-second run in which about eight transactions
+  // commit, that window is essentially never occupied: `restarts_uncertain` is
+  // exactly 0 across 15 seeds, `VersionStore::get`'s uncertainty branch is
+  // unreachable, and the two mutations that switch the mechanism off have
+  // nothing to switch off. Rows asking nothing, scoring like rows that failed.
+  //
+  // Declaring a wide bound on its own does not fix that, and the first attempt
+  // here did exactly that and looked like it had worked: 98 reads restarted for
+  // uncertainty across 15 seeds, and still not one detection. The reason is in
+  // `FaultProfile::from_seed` -- `max_offset` is *derived* from
+  // `declared_uncertainty`, either equal to it or two to five times it. Raising
+  // only the declaration widens the window without moving the clocks, so nearly
+  // every version inside it genuinely is in the future, skipping it is genuinely
+  // correct, and a mutation that skips it causes no anomaly. The window was
+  // occupied and vacuous at the same time, which is a more interesting way to
+  // measure nothing than the original.
+  //
+  // Scaling both keeps the seed's own relationship between what the clocks do
+  // and what the system is told they do -- including whether this seed drew a
+  // profile that violates its own bound -- and makes the window one that real
+  // skew can put a genuinely earlier version into.
+  if (options.workload.txn.level == txn::Level::kStrictSerializable) {
+    sim::ClockFaults& clock = cfg.faults.clock;
+    const std::int64_t declared = clock.declared_uncertainty.nanos();
+    if (declared > 0) {
+      const std::int64_t target = Duration::seconds(2).nanos();
+      const std::uint32_t factor =
+          static_cast<std::uint32_t>(std::max<std::int64_t>(1, target / declared));
+      clock.declared_uncertainty = clock.declared_uncertainty * factor;
+      clock.max_offset = clock.max_offset * factor;
+      clock.max_jump = clock.max_jump * factor;
+    }
+  }
 
   Summary summary;
   summary.seed = seed;
@@ -344,6 +389,11 @@ Summary run_seed(std::uint64_t seed, RunOptions options) {
   summary.violations = faulted.violations;
 
   heal_everything(simulation);
+  // A client sweep over every key, issued *after* the heal and before the
+  // settle runs, so that the reads happen against a cluster that is converging
+  // and are recorded in the history the checker grades. See
+  // `workloads::start_settle_reads`.
+  workloads::start_settle_reads(simulation, &state);
   const sim::RunResult settled = simulation.heal_and_settle(options.settle);
   summary.settled_reason = settled.reason;
   summary.panic_message += settled.panic_message;
@@ -356,6 +406,7 @@ Summary run_seed(std::uint64_t seed, RunOptions options) {
   summary.aborted = state.aborted;
   summary.unknown = state.unknown;
   summary.restarts = state.restarts;
+  summary.uncertain_reads = state.uncertain_reads;
   summary.reads = state.reads;
   summary.writes = state.writes;
   summary.cross_range = state.cross_range;
@@ -511,6 +562,31 @@ struct Mutation {
   const char* name;
   Expectation expectation;
   txn::Level level;  // the level at which this flag's effect is observable
+  // The workload at which it is observable, which is a separate question from
+  // the level and was previously not asked at all -- every row ran against the
+  // bank. The bank's oracle is a conserved total, and a conserved total cannot
+  // see a whole transaction disappearing: a transfer is balanced, so losing all
+  // of it leaves the sum exactly right. It also cannot see write skew, because
+  // every key the bank reads it also writes, which is the one shape write skew
+  // is not. Those two blind spots are the reason four must-detect rows were
+  // scoring nothing but the harness's own noise. List-append's oracle is every
+  // acknowledged element being present exactly once, plus Elle's verdict
+  // against the declared level, and it sees both.
+  workloads::TxnWorkloadKind kind;
+  // The configuration this row is measured in, and the name of that
+  // configuration. Every row in a cell runs the same `cell_config` and is
+  // scored against the one null control that declares the same cell name.
+  //
+  // The level and the workload used to be the whole of a cell, and they are not
+  // enough. Two of this table's mutations turn off a mechanism that a *second*
+  // mechanism makes redundant, and in the configuration where both are on,
+  // turning either one off changes nothing an oracle can see -- they are
+  // equivalent mutants there, and no number of seeds will make them otherwise.
+  // A cell is a configuration, so a row can name the configuration in which its
+  // mechanism is the one carrying the guarantee. See the commit-wait cell
+  // below, which is the whole argument written out.
+  const char* cell;
+  void (*cell_config)(workloads::TxnBankConfig*);
   void (*apply)(workloads::TxnBankConfig*);
   const char* note;
 };
@@ -520,80 +596,266 @@ struct DrillResult {
   std::uint64_t seeds = 0;
   std::uint64_t api_visible = 0;
   std::set<std::string> fired;
-  std::uint64_t first_seed = 0;
+  // Which seeds fired, not just how many. The count alone cannot distinguish a
+  // mutation being caught from the harness failing on the same seeds it fails
+  // on with no mutation at all, and that distinction turned out to be five of
+  // this drill's nine rows -- see the null control below.
+  std::set<std::uint64_t> seeds_detected;
+
+  // Coverage, so that "detected nothing" can be told apart from "asked
+  // nothing". A row whose mechanism never fired across every seed is a vacuous
+  // row, and the detection count on its own cannot say which of the two it is.
+  std::uint64_t committed = 0;
+  std::uint64_t uncertain_reads = 0;
 };
 
 DrillResult run_mutation(const Mutation& mutation, std::uint64_t seeds) {
   DrillResult result;
   result.seeds = seeds;
   RunOptions options;
-  options.workload = base_profile(mutation.level, workloads::TxnWorkloadKind::kBank);
+  options.workload = base_profile(mutation.level, mutation.kind);
+  mutation.cell_config(&options.workload);
   mutation.apply(&options.workload);
 
   for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
     const Summary s = run_seed(seed, options);
+    result.committed += s.committed;
+    result.uncertain_reads += s.uncertain_reads;
     if (s.detected()) {
       ++result.detected;
-      if (result.first_seed == 0) result.first_seed = seed;
+      result.seeds_detected.insert(seed);
       if (s.api_visible()) ++result.api_visible;
       for (const std::string& id : s.fired_ids()) result.fired.insert(id);
-      if (!s.client_safe() && s.kind == workloads::TxnWorkloadKind::kBank) {
-        result.fired.insert("conservation");
+      if (!s.client_safe()) {
+        result.fired.insert(s.kind == workloads::TxnWorkloadKind::kBank ? "conservation"
+                                                                        : "elements");
       }
     }
   }
   return result;
 }
 
+// The cell configurations. A cell is the experiment's setup; a mutation is the
+// one thing changed inside it; the cell's null control is the same setup with
+// nothing changed.
+void kPlain(workloads::TxnBankConfig*) {}
+
+// The two-doctors shape, and a key space small enough that Elle has a graph to
+// find a cycle in.
+//
+// The second half is not a detail. With sixteen keys and ten commits a seed, a
+// key's list holds about one element, no read ever observes two appends in
+// order, and the dependency graph comes out with two edges in it -- Elle
+// recovers a key's version order from the reads that saw it, and there is
+// nothing to recover. The same run at four keys builds twenty-five, and the
+// write-skew cycle appears. A checker starved of observations reports VALID for
+// the same reason an empty history is valid.
+void kWriteSkew(workloads::TxnBankConfig* c) {
+  c->disjoint_read_write = true;
+  c->keys = 4;
+}
+
+// Commit-wait off, so that the uncertainty restart is the only thing left
+// holding external consistency up. See the two rows that use it.
+void kNoCommitWait(workloads::TxnBankConfig* c) { c->txn.commit_wait = false; }
+
 void test_seeded_mutation_drill(std::uint64_t seeds) {
   const Mutation mutations[] = {
+      // The drill's own control, and the row that has to be read before any
+      // other one is worth anything: a "mutation" that changes nothing. Its
+      // detection rate is the drill's noise floor, and any row that fires on
+      // the same seeds as this one and no others is not detecting its mutation.
+      //
+      // It was added after the fact and it immediately paid for itself. On the
+      // tree at 95318de this row fired 2/10, on seeds 1 and 7 -- and so did
+      // `no refresh on push`, `uncertain reads never restart`, `terminal status
+      // is not final`, `uncertainty never honoured` and the `parallel commit`
+      // control, on seeds 1 and 7 and nothing else. Five of the nine rows were
+      // scoring the audit's own cross-range blind spot (CONTEXT.md section 14)
+      // and reporting it as coverage. The drill read 6/7; it was 2/7.
+      //
+      // One per *cell*, where a cell is a configuration: level, workload, and
+      // whatever else the rows in it need switched on. The floor is a property
+      // of the configuration, not of the mutation.
+      {"no mutation (snap/bank)", Expectation::kControl, txn::Level::kSnapshot,
+       workloads::TxnWorkloadKind::kBank, "snap/bank", kPlain,
+       [](workloads::TxnBankConfig*) {},
+       "the noise floor: a mutation that changes nothing, so that a row which fires on the "
+       "same seeds as this one can be seen for what it is"},
+      {"no mutation (snap/list)", Expectation::kControl, txn::Level::kSnapshot,
+       workloads::TxnWorkloadKind::kListAppend, "snap/list", kPlain,
+       [](workloads::TxnBankConfig*) {}, "the same, at snapshot isolation on list-append"},
+      {"no mutation (ser/list)", Expectation::kControl, txn::Level::kSerializable,
+       workloads::TxnWorkloadKind::kListAppend, "ser/list", kPlain,
+       [](workloads::TxnBankConfig*) {}, "the same, at serializable on list-append"},
+      {"no mutation (strict/list)", Expectation::kControl, txn::Level::kStrictSerializable,
+       workloads::TxnWorkloadKind::kListAppend, "strict/list", kPlain,
+       [](workloads::TxnBankConfig*) {}, "the same, at strict-serializable on list-append"},
+      {"no mutation (ser/skew)", Expectation::kControl, txn::Level::kSerializable,
+       workloads::TxnWorkloadKind::kListAppend, "ser/skew", kWriteSkew,
+       [](workloads::TxnBankConfig*) {},
+       "the same, in the write-skew configuration -- and the row that says the shape itself "
+       "is legal, since serializability is what the unmutated engine has to deliver on it"},
+      {"no commit-wait", Expectation::kControl, txn::Level::kStrictSerializable,
+       workloads::TxnWorkloadKind::kListAppend, "strict/-wait", kNoCommitWait,
+       [](workloads::TxnBankConfig*) {},
+       "the null control of the commit-wait-off cell, and a finding in its own right: "
+       "turning commit-wait off at strict serializability, with a real-time history to "
+       "grade it against, produces no violation. It is not that the loss is invisible -- "
+       "it is that the uncertainty restart still covers it. The two mechanisms are "
+       "redundant with each other, and the two rows below are what establishes that, by "
+       "removing the second one as well"},
+      // Write skew is the shape "read a key, write a different one". The bank
+      // writes every key it reads, so its read set and its write set are the
+      // same set and there is nothing for a refresh to protect -- and
+      // first-committer-wins rejects the stale prewrite anyway, before the
+      // refresh would have mattered. This row was a no-op against the bank, and
+      // then a no-op against the default list-append plan for a subtler reason:
+      // that plan draws every key independently, so a transaction reads and
+      // appends the same key as often as not, and a stale read on a key you
+      // also write is again first-committer-wins's business. The write-skew
+      // cell states the shape instead of sampling for it. See
+      // `disjoint_read_write` and the note in draw_plan.
       {"no refresh on push", Expectation::kMustDetect, txn::Level::kSerializable,
+       workloads::TxnWorkloadKind::kListAppend, "ser/skew", kWriteSkew,
        [](workloads::TxnBankConfig* c) { c->txn.refresh_reads_on_push = false; },
        "a pushed transaction commits without re-checking what it read: write skew wearing "
        "serializability's name"},
-      {"secondaries before primary", Expectation::kMustDetect, txn::Level::kSnapshot,
+      {"secondaries before primary", Expectation::kControl, txn::Level::kSnapshot,
+       workloads::TxnWorkloadKind::kBank, "snap/bank", kPlain,
        [](workloads::TxnBankConfig* c) { c->txn.primary_first = false; },
-       "a crash between the two orders leaves intents with no record to resolve them against"},
-      {"uncertain reads never restart", Expectation::kMustDetect, txn::Level::kSnapshot,
+       "an ordering change, and -- in this design -- not a bug, which is why it is a control "
+       "and not a must-detect. The comment on the knob describes Percolator, where the "
+       "primary lock *is* the commit record and writing it last leaves intents nobody can "
+       "resolve. Here the record is a separate object and commit() writes it before any "
+       "prewrite at all (coordinator.cc), whatever this flag says, so the window the knob "
+       "claims to widen does not exist. What the flag actually reorders is the intents "
+       "among themselves. Kept as a control because the reordering must stay harmless"},
+      // Both uncertainty rows run in the commit-wait-off cell, and *why* is the
+      // most useful thing this table has to say.
+      //
+      // They were originally at kSnapshot, where they are provably no-ops:
+      // base_profile only selects the HLC at kStrictSerializable, and
+      // Coordinator::begin sets `uncertainty_limit = start` under the oracle --
+      // "with the oracle there is none". The window is empty and neither flag
+      // has anything to switch off. Moving them to strict-serializable and
+      // widening the clock bound until the window is genuinely occupied (66
+      // reads restarted for uncertainty across 15 seeds, see run_seed) still
+      // detected nothing, in 40 seeds.
+      //
+      // The reason is that this engine has *two* mechanisms for the same
+      // guarantee, one from each of its ancestors. Spanner waits out the bound
+      // at commit so that no reader can be behind an acknowledged write;
+      // CockroachDB restarts a read that lands inside the bound. Anvil does
+      // both, so either one alone is enough and removing either one alone is an
+      // equivalent mutant. Measured in both directions rather than argued:
+      // commit-wait on and uncertainty off, 0 detections in 40 seeds; commit-
+      // wait off and uncertainty on, 0 in 20; both off, real-time violations on
+      // 5 of 20 and 3 of 20 seeds respectively. That is what makes these rows
+      // experiments rather than assertions about a mechanism nothing needs.
+      {"uncertain reads never restart", Expectation::kMustDetect,
+       txn::Level::kStrictSerializable, workloads::TxnWorkloadKind::kListAppend,
+       "strict/-wait", kNoCommitWait,
        [](workloads::TxnBankConfig* c) { c->txn.restart_on_uncertainty = false; },
-       "an ambiguous read is treated as unambiguous instead of restarting"},
+       "an ambiguous read is treated as unambiguous instead of restarting -- with commit-"
+       "wait already off, so this is the last thing standing between a reader and a write "
+       "that preceded it"},
+      {"uncertainty never honoured", Expectation::kMustDetect,
+       txn::Level::kStrictSerializable, workloads::TxnWorkloadKind::kListAppend,
+       "strict/-wait", kNoCommitWait,
+       [](workloads::TxnBankConfig* c) { c->store.range.txn.honour_uncertainty = false; },
+       "the same guarantee removed at the other end: the range never reports the ambiguity, "
+       "so the coordinator is never given the chance to restart"},
       {"parallel commit", Expectation::kControl, txn::Level::kSnapshot,
+       workloads::TxnWorkloadKind::kBank, "snap/bank", kPlain,
        [](workloads::TxnBankConfig* c) { c->txn.parallel_commit = true; },
        "a configuration change, not a bug; the recovery protocol must reach the same verdict"},
-      {"no commit-wait", Expectation::kControl, txn::Level::kStrictSerializable,
-       [](workloads::TxnBankConfig* c) { c->txn.commit_wait = false; },
-       "still serializable; the loss is external consistency, which the bank's conserved "
-       "total and the internal invariants here cannot see -- it needs a real-time history, "
-       "which is test_isolation_matches_the_declared_level's job, not the drill's"},
       {"lost update", Expectation::kMustDetect, txn::Level::kSnapshot,
+       workloads::TxnWorkloadKind::kBank, "snap/bank", kPlain,
        [](workloads::TxnBankConfig* c) { c->store.range.txn.first_committer_wins = false; },
        "two transactions that both read a key and both write it both commit"},
       {"intents invisible to readers", Expectation::kMustDetect, txn::Level::kSnapshot,
+       workloads::TxnWorkloadKind::kBank, "snap/bank", kPlain,
        [](workloads::TxnBankConfig* c) { c->store.range.txn.reads_respect_intents = false; },
        "a reader is never blocked by a live writer and never discovers the conflict"},
-      {"terminal status is not final", Expectation::kMustDetect, txn::Level::kSnapshot,
+      // A record flipping out of kCommitted rolls back intents the coordinator
+      // was told were committed, which loses the *whole* transaction. The bank
+      // cannot see that: a transfer is balanced, so losing all of it leaves the
+      // total exactly right. Only a partial loss moves the sum, and this
+      // mutation does not produce partial ones. List-append's oracle is every
+      // acknowledged element being present, which is the question this asks --
+      // at strict-serializable, where the clock bound is wide enough that a
+      // push is a routine event rather than a rare one, and so a retried push
+      // against an already-committed record is reachable.
+      {"terminal status is not final", Expectation::kMustDetect,
+       txn::Level::kStrictSerializable, workloads::TxnWorkloadKind::kListAppend,
+       "strict/list", kPlain,
        [](workloads::TxnBankConfig* c) { c->store.range.txn.terminal_status_is_final = false; },
        "a committed transaction's record can flip to aborted under a retried push"},
-      {"uncertainty never honoured", Expectation::kMustDetect, txn::Level::kSnapshot,
-       [](workloads::TxnBankConfig* c) { c->store.range.txn.honour_uncertainty = false; },
-       "a read silently answers instead of restarting when a version might have preceded it"},
   };
 
   std::cout << "\n  seeded-mutation drill (" << seeds << " seeds each)\n";
   std::cout << "  ------------------------------------------------------------------------"
                "----------------------\n";
-  std::cout << "  mutation                        detected  first  invariants that fired"
-               "            API?\n";
+  std::cout << "  mutation                        detected  seeds        invariants that fired"
+               "        API?\n";
   std::cout << "  ------------------------------------------------------------------------"
                "----------------------\n";
 
   std::set<std::string> ever_fired;
   std::uint64_t must_detect = 0;
   std::uint64_t caught = 0;
+  // The noise floor per (level, workload), filled in by the null rows before
+  // any real mutation runs. A must-detect row has to fire on a seed that is not
+  // in here. Keyed by the pair rather than the level because the bank and
+  // list-append have different oracles and therefore different floors.
+  using Cell = std::string;
+  // The floor carries the cell's *coverage* as well as its noise, and the
+  // coverage has to be measured on the null control rather than on the mutated
+  // run. Reading it off the mutation is circular: `uncertain reads never
+  // restart` switches the restart off, so its own run reports zero restarts and
+  // the row cannot tell "the mechanism never fired here" from "the mechanism
+  // fired and I broke it, which is the point". The null control is the same
+  // configuration with nothing changed, and it is the only run in the cell
+  // entitled to answer whether the mechanism is reachable at all.
+  struct Floor {
+    std::set<std::uint64_t> seeds;
+    std::uint64_t committed = 0;
+    std::uint64_t uncertain_reads = 0;
+  };
+  std::map<Cell, Floor> floor;
+
+  const auto render_seeds = [](const std::set<std::uint64_t>& s) {
+    if (s.empty()) return std::string{"-"};
+    std::string out;
+    for (const std::uint64_t seed : s) {
+      if (!out.empty()) out += ",";
+      if (out.size() > 9) {
+        out += "...";
+        break;
+      }
+      out += std::to_string(seed);
+    }
+    return out;
+  };
 
   for (const Mutation& mutation : mutations) {
     const DrillResult result = run_mutation(mutation, seeds);
     for (const std::string& id : result.fired) ever_fired.insert(id);
+
+    const Cell cell{mutation.cell};
+    const bool is_null = std::string_view{mutation.name}.substr(0, 11) == "no mutation";
+    if (is_null) {
+      floor[cell] = Floor{result.seeds_detected, result.committed, result.uncertain_reads};
+    }
+
+    // What this row saw that its cell's noise floor did not. This, and not
+    // `detected`, is the number that says the mutation was caught.
+    std::set<std::uint64_t> beyond_floor;
+    const Floor& base = floor[cell];
+    for (const std::uint64_t seed : result.seeds_detected) {
+      if (base.seeds.find(seed) == base.seeds.end()) beyond_floor.insert(seed);
+    }
 
     std::string names;
     for (const std::string& id : result.fired) {
@@ -605,10 +867,13 @@ void test_seeded_mutation_drill(std::uint64_t seeds) {
     std::string row = "  ";
     row += mutation.name;
     row.resize(34, ' ');
-    row += std::to_string(result.detected) + "/" + std::to_string(result.seeds);
+    row += std::to_string(beyond_floor.size()) + "/" + std::to_string(result.seeds);
+    if (result.detected != beyond_floor.size()) {
+      row += " (" + std::to_string(result.detected - beyond_floor.size()) + " at floor)";
+    }
     row.resize(44, ' ');
-    row += result.first_seed == 0 ? "-" : std::to_string(result.first_seed);
-    row.resize(51, ' ');
+    row += render_seeds(beyond_floor);
+    row.resize(57, ' ');
     row += names;
     row.resize(86, ' ');
     row += result.api_visible == 0 ? "no"
@@ -618,17 +883,40 @@ void test_seeded_mutation_drill(std::uint64_t seeds) {
 
     if (mutation.expectation == Expectation::kMustDetect) {
       ++must_detect;
-      if (result.detected > 0) ++caught;
-      check(result.detected > 0, std::string{"the drill must catch: "} + mutation.name);
+      if (!beyond_floor.empty()) ++caught;
+      if (beyond_floor.empty()) {
+        std::cout << "    (this cell's null control: " << base.committed << " committed, "
+                  << base.uncertain_reads << " reads restarted for uncertainty across "
+                  << result.seeds << " seeds; under the mutation, " << result.committed
+                  << " committed)\n";
+      }
+      check(!beyond_floor.empty(),
+            std::string{"the drill must catch, on a seed the null control does not fail on: "} +
+                mutation.name);
+    } else if (is_null) {
+      // Deliberately not asserted to be silent. The null control is a
+      // measurement, not a claim: a non-zero floor means the harness has a
+      // failure of its own on those seeds, and that is reported by
+      // test_safety_under_faults, whose job it is. Asserting it here would fail
+      // the same finding twice and hide the floor's real use, which is making
+      // every other row in this table readable.
+      std::cout << "    (cell " << mutation.cell << " -- " << txn::to_string(mutation.level)
+                << " on "
+                << (mutation.kind == workloads::TxnWorkloadKind::kBank ? "bank" : "list-append")
+                << ": floor " << result.detected << "/" << result.seeds << " on "
+                << render_seeds(result.seeds_detected) << ", " << result.committed
+                << " committed, " << result.uncertain_reads
+                << " reads restarted for uncertainty)\n";
     } else {
-      check(result.detected == 0, std::string{"the control must stay silent: "} + mutation.name);
+      check(beyond_floor.empty(),
+            std::string{"the control must stay silent above the noise floor: "} + mutation.name);
     }
   }
 
   std::cout << "  ------------------------------------------------------------------------"
                "----------------------\n";
   std::cout << "  detected " << caught << "/" << must_detect
-            << " deliberate bugs; invariants observed firing:";
+            << " deliberate bugs above the null control's floor; invariants observed firing:";
   for (const std::string& id : ever_fired) std::cout << " " << id;
   std::cout << "\n";
 }
@@ -658,7 +946,11 @@ void test_invariant_health() {
 int main(int argc, char** argv) {
   const std::uint64_t seeds = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 12;
   const std::uint64_t per_level = std::max<std::uint64_t>(2, seeds / 3);
-  const std::uint64_t drill_seeds = std::max<std::uint64_t>(4, seeds / 3);
+  // Half rather than a third, because the drill's power is proportional to the
+  // number of transactions that actually commit, and drawing the commit
+  // timestamp fresh (ANV-0058) cost about 30% of them. A detector whose rate
+  // per seed drops needs more seeds or it stops being a detector.
+  const std::uint64_t drill_seeds = std::max<std::uint64_t>(4, seeds / 2);
 
   std::cout << "distributed transactions under fault injection: " << seeds << " seeds\n";
 
@@ -666,7 +958,12 @@ int main(int argc, char** argv) {
   test_strict_serializable_catches_a_real_time_violation();
 
   test_safety_under_faults(per_level);
-  test_isolation_matches_the_declared_level(std::min<std::uint64_t>(per_level, 4));
+  // The same seed range as everything else. This used to be capped at 4, which
+  // meant the only test that runs list-append and the only test that runs Elle
+  // covered a quarter of the seeds the bank did -- and the drill's null control
+  // promptly found list-append failures on seeds 7 and 8, outside the cap and
+  // therefore never reported by the test whose job it is.
+  test_isolation_matches_the_declared_level(per_level);
   test_determinism(std::min<std::uint64_t>(seeds, 3));
   test_seeded_mutation_drill(drill_seeds);
   test_invariant_health();
