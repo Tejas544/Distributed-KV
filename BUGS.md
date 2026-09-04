@@ -698,7 +698,7 @@ root_cause: |
   going backwards. Neither client ever saw an inversion -- the 17 was served
   before the 18 existed. Under fault injection that reordering is not an edge
   case, it is the point of the harness.
-fix_commit:      P6
+fix_commit:      56f321e
 regression:      test/corpus/ANV-0051.seed
 lesson: |
   Two lessons, and the second is the expensive one.
@@ -749,7 +749,7 @@ root_cause: |
   were gone while the topology still routed clients to it. Observed on seed 19
   as r7 [acct0010,acct0015) sitting at applied index 0 on all three replicas
   with the five accounts it owned missing from the audit.
-fix_commit:      P6
+fix_commit:      dde085b
 regression:      test/corpus/ANV-0052.seed
 lesson: |
   The audit had believed the right thing for longer than the state could
@@ -790,7 +790,7 @@ root_cause: |
   pending splits for exactly this reason; the P6 audit was written without that
   half. This phase's topology churns continuously by design, so there is
   essentially always a split in flight when the audit runs.
-fix_commit:      P6
+fix_commit:      dde085b
 regression:      test/corpus/ANV-0053.seed
 lesson: |
   Proved by measurement rather than argument: running the same seed with a
@@ -827,7 +827,7 @@ root_cause: |
   span that plainly covered it.
 
   The same routing error cost the bank audit 890 of 1600 on seed 5.
-fix_commit:      P6
+fix_commit:      df51c79
 regression:      test/corpus/ANV-0054.seed
 lesson: |
   Third instance of one mistake in this phase, after ANV-0053 and the
@@ -886,7 +886,7 @@ root_cause: |
   its two readings: "either the generator is broken or the database applied a
   write twice", and from a history alone those are indistinguishable. This one
   was the generator.
-fix_commit:      P6
+fix_commit:      95318de
 regression:      test/corpus/ANV-0055.seed
 invariant_added: none -- but the workload now asserts its own precondition
 lesson: |
@@ -992,6 +992,515 @@ lesson: |
   came back as eleven features with 1-minimality unverified, which is exactly
   what a predicate that never reproduces looks like. Attempt 0 is now the
   original run.
+```
+</details>
+
+<details open>
+<summary><b>ANV-0067</b> · S0 · raft · <b>bit rot on an already-fsynced HardState record lets a node forget a durable vote and grant a second one in the same term -- partially fixed, and the partial fix's own measured effect is what confirms this is the engine</b></summary>
+
+```yaml
+id:              ANV-0067
+title:           267 of 1,830 seeds (14.6%) fail under the P8 mixed-version
+                 rolling-upgrade workload, spanning INV-RAFT-04/05/06/07/08/09/14.
+                 The pinned seed (24) minimises to {partition, disk.bit_rot,
+                 clock.jump}. A source-traced fix closes that specific
+                 mechanism -- verified against the pinned seed -- but a
+                 300-seed before/after comparison shows a second, structurally
+                 unfixable-by-content-alone sub-mechanism is doing most of the
+                 damage, and the fix's own side effects make that visible
+                 rather than hiding it.
+status:          open, partially fixed. The interior-corruption sub-mechanism
+                 (root_cause, part 1) is fixed and verified. A second
+                 sub-mechanism (part 2) -- bit rot landing on the true tail
+                 record, indistinguishable from a torn write by file content
+                 alone -- is not fixed and is now known, from a controlled
+                 before/after run, to be the larger contributor. Closing it
+                 needs a persistence-format change (redundant/dual hard-state
+                 records), out of scope for this pass. Regression-testing the
+                 fix also surfaced [ANV-0068](../BUGS.md): the fix makes a
+                 permanently-unrecoverable Raft group replica a reachable
+                 state for the first time, and shard's dead-replica
+                 replacement cannot see one because it only tracks liveness
+                 at node granularity. Filed separately rather than folded in
+                 here because it is a shard-layer gap this fix exposed, not a
+                 flaw in the fix's own raft-layer logic.
+severity:        S0 -- no longer a candidate. A double vote is a violation of
+                 Raft's core safety property (at most one leader per term).
+                 The partial fix's measured effect (see part 3) is itself the
+                 confirmation: a schedule-neutral, analytically-sound recovery
+                 change that only ever makes recovery *more* conservative
+                 caused *more* distinct seeds to exhibit this class of
+                 violation, not fewer or the same. A harness artifact does not
+                 respond to a targeted engine-side fix that way; a real,
+                 previously-undercounted vulnerability does.
+class:           safety
+invariant:       INV-RAFT-04 (leader completeness, 207 occurrences), INV-RAFT-07
+                 (double vote, 160), INV-RAFT-09 (durability, 64), INV-RAFT-05
+                 (state machines diverge, 42), INV-RAFT-14 (stale read, 26),
+                 INV-RAFT-08 (13), INV-RAFT-06 (4) -- across the full 200-node-
+                 hour run, not one isolated invariant
+layer:           raft
+found_by:        dst-random -- test/mixed_version_faults.cc (P8 exit criterion
+                 5). First seen on a 40-seed smoke run (seed 24); the full
+                 200-node-hour / 1,830-seed accumulation run this criterion
+                 requires anyway is what turned "one seed" into a rate
+api_visible:     not directly for the double vote itself, but INV-RAFT-04/05
+                 (207 + 42 occurrences) are client-visible-adjacent state
+                 machine divergence, and INV-RAFT-14 (26) is a directly
+                 client-visible stale read
+seed:            24 (first hit; the corpus file pins this one). 267 of the
+                 1,830 seeds in the full run fail; not an isolated seed
+config:          test/mixed_version_faults.cc, 5-9 nodes (from the seed draw),
+                 rolling upgrade then rollback (RaftKvConfig::node_raft_options
+                 toggles pre_vote per node on a fixed schedule, modelled as a
+                 deliberate ProcessModel::crash + 80ms restart per transition),
+                 random process crash/pause disabled for this workload, network/
+                 disk/clock faults from the seed's own draw
+commit_found:    P8
+runs_to_first_hit: 1 in 40 seeds on the smoke run; 267 in 1,830 (14.6%) on the
+                 full accumulation run
+faults_minimised: seed 24: [partition, disk.bit_rot, clock.jump] -- 11 -> 3
+                 features, 184 predicate runs, converged, 1-minimality
+                 verified. seed 19 (below): [disk.bit_rot] alone -- 10 -> 1
+                 feature, 14 predicate runs, converged, 1-minimality verified.
+                 Both produced by `anvil_mixed_version_faults --minimise
+                 <seed>` (new mode, same anvil/sim/minimiser.h ddmin
+                 ANV-0066 used, adapted to hold the deliberate upgrade
+                 schedule fixed and vary only the seed's own network/disk/
+                 clock draw). No clock skew survived as a *sustained* offset
+                 on seed 24 -- only clock.jump, a one-off step; seed 19 needs
+                 no clock fault or partition at all.
+root_cause: |
+  PART 1 -- the mechanism, fixed and verified. A specific mechanism, traced
+  through the source, backs the ENGINE reading for the pinned seed.
+
+  The minimal set needs disk.bit_rot specifically, and that is the load-bearing
+  clue. anvil/core/raft/storage.h documents the hard-state file as an
+  append-only log of HardState records where "recovery takes the last valid
+  record," using the LSM WAL reader's own contract (anvil/core/lsm/wal.h):
+  "reads until the first invalid record" -- everything after the first bad
+  record is dropped as "the tail," full stop, regardless of *where in the
+  file* that bad record sits. That is the right call for a torn write, because
+  a torn write only ever damages the true tail (an append that was never
+  fsynced). It is not obviously the right call for bit rot, which by
+  construction corrupts a record that already passed its checksum once --
+  i.e. already-durable data -- and can land anywhere in the file, not just at
+  the tail. workloads/raft_kv.cc's own recovery_callback comment says as much:
+  "Bit rot, and nothing else... rewrites bytes that were already durable."
+
+  Concretely: HardState carries term, vote and commit together. If bit rot
+  corrupts a record in the *middle* of n2's state file -- one written and
+  fsynced before a later record that recorded "voted for n2 in term 4" --
+  recovery stops at the corrupted record and silently reverts to whatever
+  HardState preceded it, discarding the later, genuinely-fsynced vote along
+  with it (anvil/core/raft/storage.cc:182-185, driver.cc:41-70:
+  `recovered.hard` is handed straight to `node_.restore()` with no check
+  beyond a stats counter). n2 now believes it never voted in term 4. A
+  partition plus a clock jump is enough to put it back in an election in that
+  term, and it grants a *second*, genuinely durable vote -- to n4 -- which is
+  exactly what INV-RAFT-07 caught.
+
+  The checker's own asymmetry corroborates this rather than contradicting it.
+  anvil/checker/raft_invariants.cc exempts a term regression (INV-RAFT-06) and
+  a commit regression (INV-RAFT-08) on a node flagged `corrupted`
+  (`note_corruption`, driven by the same recovery_callback, gated on
+  `disk.bit_rots > 0`) -- reasoning, in the comment directly above the check,
+  that "the driver sends nothing before its fsync, so a decision that never
+  reached the disk also never reached a peer; losing it in a crash is
+  invisible to the cluster and is not a regression." That reasoning is correct
+  for an *unsynced* tail (a torn write) but does not hold for bit rot: a
+  bit-rotted record was, by definition, fsynced and therefore already reached
+  a peer (a granted vote is replied to only after its fsync). The vote check
+  (INV-RAFT-07, a few lines below the term/commit checks) carries no
+  `corrupted` exemption at all -- which on this reading is not a gap in the
+  checker to close, but the checker correctly refusing to forgive the one
+  regression that a bit-rotted-but-previously-durable record cannot make
+  invisible to the cluster. Term and commit forget something only this node
+  ever acted on; a vote forgets something a peer already received and may
+  already be relying on.
+
+  This explains *how* seed 24's specific n2-votes-twice-in-term-4 failure can
+  happen and why disk.bit_rot is load-bearing in its minimal set while
+  torn_write and io_error are not (a torn write cannot damage fsynced data by
+  construction; an io_error surfaces as a read failure rather than a record
+  that decodes and passes its checksum before being silently accepted as the
+  new tail).
+
+  THE FIX. `anvil/core/lsm/wal.h`/`.cc`: `WalReadResult` gained
+  `discarded_had_more_data`, true exactly when the record that failed
+  validation had a length field that *did* fit inside the file (a checksum
+  mismatch or a short read, not the "impossible length" case) and the file
+  held bytes past that record's own declared end. `anvil/sim/disk_model.cc`'s
+  `crash_node()` only ever tears *dirty* (unsynced) sectors, and
+  `RaftDriver::persist()` (driver.cc) appends at most one hard-state record
+  before its `sync()`, so an honest torn write can only ever be the last thing
+  in the file -- `discarded_had_more_data` is false for it by construction,
+  every time. It can only be true when something was durably appended *after*
+  the point recovery now distrusts, which is impossible for an in-flight
+  write and therefore diagnostic of exactly the corrupted-after-the-fact case
+  above. `anvil/core/raft/storage.cc`'s `recover()` now returns
+  `StatusCode::kCorruption` instead of silently trusting the older record when
+  `durability_.fsync_state && records_discarded > 0 && discarded_had_more_data`
+  -- which (per `RaftDriver::boot()`'s existing unbounded-retry policy,
+  ANV-0003's own precedent) keeps that incarnation retrying forever rather
+  than ever rejoining the voting cluster with a memory it cannot trust.
+
+  Verified: seed 24 no longer reproduces INV-RAFT-07 after this change (was
+  reliably reproducing at tick 27714 every run; now clean at seed 24 across
+  repeated invocations of `anvil_mixed_version_faults 24`).
+
+  Fixing this also surfaced and fixed a second, independent bug in the test
+  harness, not the engine: `workloads/raft_kv.cc`'s `audit_durability()` and
+  `converged()` only ever excluded a node by `!simulation.process().alive()`,
+  which is true the instant a crashed process restarts -- but a driver stuck
+  in the new permanent recovery-retry loop *is* process-alive without ever
+  having called `node_.restore()`, so its untouched, default-constructed
+  `machine` was being audited as if it were a caught-up participant and
+  reported as "missing" every acknowledged write, manufacturing spurious
+  `lost_acked_writes` and non-convergence on seeds where nothing was actually
+  lost. Both functions now also check `RaftDriver::ready()` (already public,
+  already used for exactly this purpose elsewhere), the same exclusion a
+  genuinely-crashed node already gets and for the same reason: a node that
+  never became a real participant is not evidence about what the cluster as a
+  whole did or didn't retain.
+
+  PART 2 -- what the fix does not close, found by measuring it. The
+  discriminator above is sound but not complete: it is `false` whenever
+  nothing follows the bad record in the file, which is true both for an
+  honest torn write *and* for bit rot landing on the true last record (fully
+  synced, nothing appended since). Those two are genuinely indistinguishable
+  from file content alone -- there is no third bit of information in this
+  format that says "this record, though currently the file's tail, was
+  already-durable before this incarnation's crash" as opposed to "this record
+  was still in flight when the crash happened." Minimising a *second* failing
+  seed (19, `n3` votes for `n2` then `n3` in term 1) after the fix confirms
+  this gap is real and reachable: it minimises to `[disk.bit_rot]` alone -- no
+  partition, no clock fault needed at all -- and still reproduces on the
+  patched binary. Closing this fully needs a persistence-format change (e.g. a
+  redundant/dual-copy hard-state write, so a corrupted copy can be
+  cross-checked against an untouched one) rather than a smarter read of the
+  single file that exists today. Out of scope for this pass; named rather than
+  attempted under time pressure, same standard as ANV-0065.
+
+  PART 3 -- the fix's own measured effect, and why it is the strongest
+  evidence yet that this is the engine. A 300-seed run of
+  `anvil_mixed_version_faults 300`, before and after the storage.cc/wal.cc/
+  wal.h change (raft_kv.cc's audit fix included both times, to isolate just
+  the recovery-path change), gives a controlled comparison:
+
+    BEFORE: 39/300 seeds fail (13.0%). 12 distinct seeds show INV-RAFT-07.
+    AFTER:  44/300 seeds fail (14.7%). 25 distinct seeds show INV-RAFT-07.
+
+  Set difference: 10 seeds that failed before (including the pinned seed, 24)
+  now pass cleanly. 15 *different* seeds that passed before now fail, all with
+  the same recognisable invariant family (INV-RAFT-07 double votes,
+  INV-RAFT-08/09 durability and commit regressions, one INV-RAFT-14 stale
+  read) -- inspected individually; none is a crash, an assertion, or an
+  unrecognisable new failure mode, which rules out "the patch introduced an
+  unrelated bug" as the explanation. This is the simulator's determinism doing
+  exactly what P7's own lessons said it would (CONTEXT.md 5a.3): changing one
+  node's recovery timing on the seeds where the fix actually fires reshuffles
+  the *entire* rest of that seed's schedule, and 15 of those reshuffled
+  schedules land on a different instance of the same underlying vulnerability
+  that the original schedule happened not to reach. Net, on this sample, the
+  fix makes the raw failure *count* worse (39->44) while *fixing* a strict
+  superset of what it broke would suggest -- and that is itself the argument
+  for ENGINE over HARNESS: a targeted, analytically-justified, schedule-
+  neutral recovery-path fix that only ever makes recovery *more* conservative
+  should not systematically increase how often a *harness* artifact fires. It
+  is exactly what a fix that closes one real sub-mechanism of a larger, more
+  pervasive real vulnerability would do -- unmask more of it, not less,
+  because the original 12-seed count was itself an undercount produced by
+  luck in the timing, not a measure of how exposed the system actually is.
+
+  This is not really a mixed-version bug at all -- the mixed pre_vote
+  schedule's contribution is that it is the first workload in the tree to
+  force enough crash/restart cycles with disk.bit_rot simultaneously armed to
+  actually land a corrupted record somewhere that mattered. P3's 1,000+
+  node-hour sweep never constructed that combination because none of its
+  profiles pair a high enough crash-and-recover rate with bit rot the way this
+  workload's deliberate upgrade-crash schedule does.
+
+  What was known before this pass, retained because it still constrains the
+  broader 14.6% and is not superseded by the above:
+
+    - Seed 24 reproduces identically across repeated invocations (same tick
+      27714, same sim-time, same detail every time): n2 durably votes for n2
+      and then for n4, both in term 4.
+    - Disabling this workload's *random* process crashes/pauses (network, disk,
+      clock faults from the seed's own draw left on) did not make the class of
+      failure go away.
+    - The full 200-node-hour run (1,830 seeds, the accumulation this criterion
+      requires regardless) failed 267 seeds -- 14.6% -- against nearly every
+      INV-RAFT-* invariant, not just INV-RAFT-07. P3's own 1,000+ node-hour
+      sweep found zero INV-RAFT-* violations; a 14.6% rate against the same
+      invariant family is a large discrepancy either way it resolves.
+    - TESTED AND RULED OUT: quadrupling the recovery time between transitions
+      (max_time 25s -> 100s, same schedule, same number of transitions, just
+      4x more time between each) did *not* reduce the rate -- 6/40 (15%) at
+      4x versus 267/1,830 (14.6%) at the original spacing. If the cause were
+      simply "the cluster doesn't get enough time to recover between forced
+      restarts," 4x the time should have shown *some* improvement. It showed
+      none. This rules out the most obvious harness-tuning explanation.
+
+  Two readings were open before this pass, at the level of "is the workload
+  itself the problem":
+
+    ENGINE.  P3's entire 1,000+ node-hour sweep, and every other suite in this
+      tree, always constructs a cluster with *uniform* RaftOptions -- every
+      node the same pre_vote setting, every incarnation. This workload is the
+      first thing in the tree that ever constructs a genuinely heterogeneous
+      cluster (mixed pre_vote) at all. Standard Raft literature's claim is that
+      pre_vote is safely mixable; if this implementation's handling of a mixed
+      cluster has a real gap, this workload is exactly the kind of pressure
+      that would be the *first* thing to ever find it, because nothing else in
+      the tree has ever tried.
+
+    HARNESS.  This is also the first workload whose fault schedule is driven by
+      deliberate, host-side ProcessModel::crash() calls between
+      simulation.run_more() steps rather than by FaultProfile::draw(seed) (a
+      coroutine hosted on a node it then crashes was tried first and produced a
+      real use-after-free -- see the comment above drive_upgrade_schedule() in
+      test/mixed_version_faults.cc). The crash *count* is also higher and more
+      regular than a random per-second draw produces (every node, twice,
+      guaranteed, every run).
+
+  The minimisation and the code trace above narrow this for the pinned seed
+  specifically, and in a way neither reading quite anticipated: the mixed
+  pre_vote schedule is not itself the mechanism (the story above never touches
+  `pre_vote`), but the workload's crash/restart *cadence* is what the HARNESS
+  reading already flagged as denser than a random draw -- and that density is
+  exactly what makes it likely to land a disk.bit_rot hit inside a HardState
+  file that then gets read back before the next crash overwrites it. So this
+  is not a pick between the first two but closer to a third reading: a real
+  engine gap (interior corruption of an already-fsynced vote record was not
+  handled safely -- part 1, now fixed) that a uniform-RaftOptions, lower-
+  crash-rate workload was always unlikely to expose, sitting alongside a
+  second, structurally harder gap (part 2, not fixed) that this workload's
+  crash cadence is what makes reachable often enough to measure. Whether
+  either is reachable outside this workload's crash cadence is still open;
+  what part 3's measurement settles is that it is not a harness artifact.
+fix_commit:      none (uncommitted in-session fix; not yet its own commit).
+                 Touches anvil/core/lsm/wal.h, anvil/core/lsm/wal.cc,
+                 anvil/core/raft/storage.cc (the recovery-path fix, part 1)
+                 and workloads/raft_kv.cc (the audit_durability/converged
+                 fix, unrelated bug found while validating part 1). Partial:
+                 see part 2 for what remains and part 3 for the measured
+                 net effect before a fuller fix is attempted.
+regression:      test/corpus/ANV-0067.seed
+invariant_added: none
+lesson: |
+  Filed the same session it was found, at the same standard of honesty as
+  every other open row: what reproduces, what was ruled out, and the two
+  readings without picking one. The alternative -- tuning the workload's
+  timing until the sweep goes green and shipping that -- would have been
+  curve-fitting a real signal into invisibility, which is a worse outcome than
+  an unresolved row. That the first tuning attempt (4x the recovery time)
+  changed nothing is itself worth recording: it is evidence, not noise, and
+  updating the row with it rather than only reporting the first, smaller
+  number is what makes the row honest at the point it stopped being convenient.
+
+  Second pass, same session standard: ANV-0066's lesson was "the minimiser is
+  what turns a row nobody can act on into a hypothesis with a shape." This row
+  is the second data point for that claim, and a sharper one -- minimising
+  seed 24 to {partition, disk.bit_rot, clock.jump} is what made "which of
+  eleven fault knobs actually matters" answerable at all, and disk.bit_rot
+  being in a 3-feature minimal set (rather than, say, process.crash, which the
+  HARNESS reading would have predicted) is what pointed at the storage
+  recovery path instead of at the workload's own scheduling code. The
+  mixed_version_faults.cc `--minimise` mode is new in this pass and adapted
+  from the fleet's version (test/fleet.cc): the one change of substance is
+  holding the deliberate upgrade schedule fixed across every ddmin candidate
+  and every attempt, since that schedule is the thing under test, not part of
+  the adversary being minimised away.
+
+  Third pass, and the one worth remembering past this row. A fix that is
+  individually correct -- provable on paper, verified against the seed it was
+  built for -- is not the same claim as "the fix helps," and this project's
+  own simulator is exactly the instrument that catches the gap between them:
+  determinism means a change to one node's timing is a change to the whole
+  seed's schedule, so a targeted recovery-path fix does not just close what it
+  targeted, it reshuffles every seed where it fires into a different run. The
+  instinct after seeing seed 24 go clean was to call the row fixed. Running
+  the same 24-seed smoke set first, then a 300-seed before/after, is what
+  caught that the aggregate count went the wrong way (39 -> 44) before that
+  claim was written down anywhere durable. Reported as measured -- 10 seeds
+  fixed, 15 different seeds newly exposed, net worse by raw count and net
+  more informative about the true shape of the bug -- rather than either
+  "fixed" (false) or reverted on the strength of one aggregate number moving
+  the wrong way (which would have thrown away a verified, real partial fix and
+  the strongest evidence yet that this is the engine, to make a count look
+  better). The number that would have made this look like a clean win was one
+  seed, checked once; the number that told the truth needed a sample large
+  enough for the schedule-perturbation effect to average out into something
+  legible, and a set-difference, not just a count, to tell "fixed" apart from
+  "moved."
+```
+</details>
+
+<details open>
+<summary><b>ANV-0068</b> · S0-candidate · shard · <b>a range replica that can never safely recover is invisible to dead-replica replacement, which only ever sees node-level heartbeats</b></summary>
+
+```yaml
+id:              ANV-0068
+title:           shard_faults 24, previously 24/24 clean, now shows two
+                 conservation violations (seed 4: 0/24 accounts, "acked=0
+                 ranges=1"; seed 19: 18/24 accounts) after ANV-0067's
+                 recovery-path fix landed
+status:          open -- found while regression-testing ANV-0067's fix, not
+                 yet fixed, and not a flaw in that fix's own logic. It is a
+                 pre-existing gap the fix makes reachable for the first time:
+                 nothing in this tree could previously produce "a Raft group's
+                 local replica can never safely recover," because recovery
+                 always eventually succeeded (silently, sometimes wrongly --
+                 that silence is ANV-0067). Now that outcome exists, and
+                 shard's dead-replica replacement cannot see it.
+severity:        S0-candidate -- account loss is a conservation violation, the
+                 workload's own hard invariant, but this is filed as a
+                 candidate rather than plain S0 because the mechanism below is
+                 a strong, code-traced argument from reading
+                 anvil/core/shard/placement.cc, not an instrumented trace of
+                 either seed's actual replica states
+class:           safety / durability
+invariant:       shard's account-conservation check (workloads/shard_kv.cc
+                 audit_conservation): "the cluster holds N accounts; it
+                 started with 24"
+layer:           shard, interacting with the raft layer's ANV-0067 fix
+found_by:        regression testing -- running shard_faults 24 (previously
+                 24/24 clean per this project's own P5/P6 record) after
+                 applying ANV-0067's anvil/core/raft/storage.cc change,
+                 as part of validating that fix rather than as a fleet finding
+api_visible:     yes if real -- a client-visible account balance would be
+                 permanently gone, not just temporarily unreachable
+seed:            4 (nodes=?, ranges collapse to 1, acked=0 transfers the
+                 entire run -- total gridlock from very early) and 19
+                 (ranges=3, 18/24 accounts -- partial, localised loss).
+                 Both reproduce identically across repeated invocations of
+                 `anvil_shard_faults 24`. Neither fails on the pre-ANV-0067
+                 binary (verified: stashing the storage.cc/wal.cc/wal.h/
+                 raft_kv.cc changes and rebuilding gives "sharding under
+                 fault injection: all checks passed" on the same 24 seeds).
+config:          test/shard_faults.cc's standard 24-seed chaos-admin sweep,
+                 no changes to the workload itself
+commit_found:    P8 (same session as ANV-0067)
+runs_to_first_hit: 2 of 24 seeds on the standard sweep, both newly failing
+faults_minimised: not run -- shard_faults' chaos-admin profile is expensive
+                 to minimise (many concurrent Raft groups, splits and merges
+                 in flight at once) and this row is filed to record the
+                 mechanism and get it in front of a human, same standard as
+                 every other row this pass
+root_cause: |
+  Not a bug in ANV-0067's fix. `anvil/core/raft/storage.cc`'s recovery-path
+  change does exactly what it is supposed to: a Raft group's local replica
+  that cannot prove its recovered vote state is trustworthy now refuses to
+  come back, forever, rather than silently rolling one back. That is a new
+  *kind* of outcome for a Raft group's local storage layer to produce --
+  before this fix, `RaftDriver::boot()`'s unbounded retry always eventually
+  succeeded (ANV-0003's own policy assumed transient disk errors, and every
+  fault this tree could previously inject at the hard-state file was
+  eventually recoverable). "This replica can never come back" was not a state
+  the rest of the system had ever had to handle, because nothing could
+  previously produce it.
+
+  shard's dead-replica replacement (`anvil/core/shard/placement.cc::decide()`)
+  was built for the state that *could* previously happen: a node whose
+  process has stopped responding. `live_nodes()` (placement.cc:19-32) computes
+  liveness from `state.nodes[i].last_seen` against `options.node_dead_after`
+  -- a per-*node* heartbeat, replicated via `TopologyState::kNodeHeartbeat`
+  precisely so this decision is not local opinion. `decide()`'s dead-voter
+  handling (`dead_voters`, placement.cc:96-99) only ever asks "is this
+  replica's *node* live" -- there is no per-*range*, per-*replica* liveness
+  signal anywhere in this decision. A node hosts many Raft groups (one
+  placement group, one per range it replicates); ANV-0067's fatal recovery
+  path operates on one group's hard-state file at a time. A node whose
+  *placement* group and most of its range groups are perfectly healthy, but
+  whose replica of *one specific range* took a bit-rot hit that fatally
+  corrupted only that range's hard-state file, keeps heartbeating normally --
+  `last_seen` stays fresh, `live_nodes()` reports it live, and `dead_voters`
+  for that one stuck range is empty. The range is durably short a working
+  replica, and nothing in the placement decision loop can tell.
+
+  If enough replicas of one range independently take this hit -- more
+  plausible than it sounds, given shard_faults' chaos-admin profile churns
+  through 834 group creations and 587 retirements in this same 24-seed sweep,
+  each one a fresh opportunity for a hard-state file to exist and later be
+  corrupted -- the range has no live, initialised replica anywhere, forever.
+  `workloads/shard_kv.cc::audit_conservation()`'s own comment says what
+  happens next is *supposed* to mean: "The range exists in the topology and
+  no live replica has its data yet. That is the split window: the parent has
+  moved the keys out and the child has not committed its kInit." That
+  reasoning assumes "no live replica" is always temporary and self-resolving.
+  ANV-0067's fix makes it possible for "no live replica" to mean something
+  else -- permanently -- for the first time in this tree's history, and the
+  audit (correctly, per its own stated assumption) does not distinguish the
+  two: it silently skips the range rather than double-counting a legitimate
+  split window, and skipped-forever is indistinguishable from skipped-for-now
+  until nothing else in the topology ever picks the accounts back up. That is
+  a real account-conservation failure, not a display artefact -- confirmed by
+  `owners.size() != state->config.accounts` firing at the end of the run, past
+  every split-window exemption the audit already knows about.
+
+  Seed 4's profile (`ranges=1`, `acked=0` the entire run) is consistent with
+  this landing on the very first range -- the one covering the whole key
+  space before any split has ever happened -- early enough that the cluster
+  never gets anywhere. Seed 19's profile (`ranges=3`, 18/24 accounts, some
+  transfers acknowledged) is consistent with it landing on one range partway
+  through the run, after enough splits to have several ranges but before all
+  of this specific one's accounts moved elsewhere. Both are consistent with
+  the mechanism above; neither has been individually confirmed against an
+  instrumented trace of which node's which range hit the fatal recovery path,
+  which is the natural next step before treating this as fully confirmed
+  rather than strongly indicated -- same caveat ANV-0067 itself carried before
+  this pass's code trace, stated up front rather than discovered by a reader.
+fix_commit:      none. The real fix is a placement-side one: give the
+                 placement driver a per-range-replica liveness signal (e.g. a
+                 replica reports "recovery permanently failed" up through its
+                 RaftDriver stats, and `decide()` treats that the same as a
+                 dead node for *that specific replica* regardless of the
+                 host node's own heartbeat) rather than trying to weaken
+                 ANV-0067's fix to avoid ever producing the state. Out of
+                 scope for this pass; a placement-layer change is exactly
+                 the kind of design decision CLAUDE.md says not to make
+                 under time pressure (see ANV-0065's precedent).
+regression:      none pinned yet -- seeds 4 and 19 reproduce on
+                 `anvil_shard_faults 24` as of this row; a dedicated corpus
+                 file is the natural next step once the mechanism is
+                 confirmed rather than strongly indicated
+invariant_added: none
+lesson: |
+  The reason this is filed rather than used as an argument to revert
+  ANV-0067's fix: reverting would not remove this gap, it would only remove
+  the one thing capable of exposing it in this tree. The gap -- shard's
+  replica-health tracking cannot see below node granularity -- was already
+  real; ANV-0067's fix did not create it, it created the first *reachable*
+  state that depends on it. Shipping the revert would leave a confirmed S0
+  double-vote safety violation in place specifically to avoid making a
+  pre-existing availability gap newly visible, which is choosing an
+  invisible confirmed bug over a visible candidate one. Both are filed
+  instead, each honestly scoped to what is actually known about it.
+
+  This is also this pass's second instance of P7's own lesson (CONTEXT.md
+  5a.1: "two instruments that disagree find things neither one finds alone")
+  wearing a different hat -- here it is not two checkers disagreeing but a
+  fix in one layer changing what states a *different* layer's invariant now
+  has to cope with, and the regression suite (not the fleet, not a targeted
+  minimisation) is what caught it, because a targeted before/after on
+  mixed_version_faults alone would never have touched the shard workload
+  at all.
+
+  A third, smaller instance of the same schedule-perturbation effect showed
+  up running `anvil_txn_faults 30`: the "intents invisible to readers" drill
+  cell, which `anvil/core/shard/store.cc`'s own BUGGIFY-site comment already
+  documents as sitting at a fragile margin (it was pushed to 0/15 once before
+  by an unrelated timing change and re-tuned back to a bare 1/15), drops from
+  1/15 to 0/15 -- a must-detect cell failing outright -- with ANV-0067's fix
+  applied and nothing else changed. Confirmed on the unpatched binary: 1/15,
+  passing by the minimum possible margin. This is not a new mechanism, just
+  the same one (10.31: a lower-layer fix reshuffles every schedule downstream
+  of it) landing on an already-fragile margin instead of a hard invariant.
+  Noted rather than chased further -- re-stabilising a drill cell that was
+  already one seed away from failing is a harness-tuning question, not a
+  correctness one, and is not this row's problem to solve.
 ```
 </details>
 

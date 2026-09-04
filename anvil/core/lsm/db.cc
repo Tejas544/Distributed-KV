@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <utility>
 
+#include "anvil/core/buggify.h"
+
 namespace anvil::lsm {
 namespace {
 
@@ -463,6 +465,13 @@ int Db::pick_compaction_level() const {
   // them has to be consulted on a read. Too many L0 files is a read-latency
   // problem long before it is a space problem.
   if (version.levels[0].size() >= options_.l0_compaction_trigger) return 0;
+
+  // A compaction that starts well under the trigger is always safe -- the
+  // trigger is a scheduling heuristic, not a correctness bound -- so it is a
+  // legitimate rare path to nominate: real bugs in recovery/version-edit
+  // bookkeeping are far likelier to show up when compactions overlap flushes
+  // and other compactions than when they run one at a time, evenly spaced.
+  if (!version.levels[0].empty() && ANVIL_BUGGIFY) return 0;
 
   int best_level = -1;
   double best_score = 1.0;

@@ -698,14 +698,17 @@ void boot_node(sim::Simulation& simulation, RaftKvConfig cfg, RaftKvState* state
     on_command_applied(rt, state, self, client, seq, index);
   });
 
+  const raft::RaftOptions node_raft =
+      cfg.node_raft_options ? cfg.node_raft_options(self, cfg.raft) : cfg.raft;
+
   const std::uint64_t node_seed = rt.rng(RandomDomain::kConsensus).next_u64();
   auto transport =
-      std::make_unique<raft::RaftTransport>(&rt, self, cfg.raft.tick_interval);
+      std::make_unique<raft::RaftTransport>(&rt, self, node_raft.tick_interval);
   transport->set_foreign_handler([&rt, state, self](const Message& envelope) {
     handle_foreign(rt, state, self, envelope);
   });
   raft::RaftTransport* transport_ptr = transport.get();
-  auto driver = std::make_unique<raft::RaftDriver>(&rt, transport_ptr, GroupId{1}, self, cfg.raft,
+  auto driver = std::make_unique<raft::RaftDriver>(&rt, transport_ptr, GroupId{1}, self, node_raft,
                                                    cfg.durability, std::move(bootstrap),
                                                    machine_ptr, DeterministicRandom{node_seed});
   raft::RaftDriver* driver_ptr = driver.get();
@@ -865,7 +868,7 @@ std::uint64_t audit_durability(sim::Simulation& simulation, RaftKvState* state) 
   const NodeId leader = current_leader(*state, simulation);
   const raft::Config* config = nullptr;
   for (const auto& [id, node] : state->nodes) {
-    if (node.driver == nullptr) continue;
+    if (node.driver == nullptr || !node.driver->ready()) continue;
     if (!simulation.process().alive(NodeId{id})) continue;
     if (config == nullptr || NodeId{id} == leader) config = &node.driver->node().config();
   }
@@ -879,6 +882,17 @@ std::uint64_t audit_durability(sim::Simulation& simulation, RaftKvState* state) 
     const AckedWrite& newest = writes.back();
     for (const auto& [id, node] : state->nodes) {
       if (node.driver == nullptr || node.machine == nullptr) continue;
+      // A driver stuck retrying `recover()` forever (ANV-0067's fix: recovery
+      // refuses to trust a hard-state file with media damage beneath an
+      // already-durable record) is process-alive but never became a real
+      // cluster participant -- `node_.restore()` never ran, so its machine and
+      // config are whatever a freshly-constructed node starts with, not a
+      // reflection of anything the cluster actually decided. Auditing it the
+      // same as a node that finished recovery would report "missing" against
+      // a node that was never eligible to have the write in the first place,
+      // which is a harness artifact, not data loss -- the majority that does
+      // hold the write is what durability actually rests on.
+      if (!node.driver->ready()) continue;
       if (!simulation.process().alive(NodeId{id})) continue;
       // A node the membership change removed is not required to hold anything.
       // The leader stops replicating to it the moment it leaves, correctly, and
@@ -953,6 +967,10 @@ bool converged(sim::Simulation& simulation, const RaftKvState& state) {
     const AckedWrite& newest = writes.back();
     for (const auto& [id, node] : state.nodes) {
       if (node.driver == nullptr || node.machine == nullptr) continue;
+      // Same exclusion as audit_durability, and for the same reason: a driver
+      // that never finished recovering is not a participant whose absence
+      // means anything.
+      if (!node.driver->ready()) continue;
       if (!simulation.process().alive(NodeId{id})) continue;
       std::string value;
       LogIndex index{};

@@ -9,6 +9,9 @@
 #   tools/build.sh dpor minimiser  # several at once
 #
 # Set ANVIL_OBJ to move the cache; set ANVIL_BIN to move the binaries.
+# Set ANVIL_COVERAGE=1 for a gcov-instrumented build (tools/coverage.sh uses
+# this) -- it lands in its own object/binary cache so it never contaminates
+# the fast incremental build everything else here relies on.
 set -euo pipefail
 
 # Gotcha 10.1: Git for Windows' libstdc++-6.dll shadows the MSYS2 one and the
@@ -16,12 +19,20 @@ set -euo pipefail
 export PATH="/d/msys2/ucrt64/bin:$PATH"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OBJ="${ANVIL_OBJ:-/tmp/anvilobj}"
-BIN="${ANVIL_BIN:-/tmp/anvilbin}"
+if [ "${ANVIL_COVERAGE:-0}" = "1" ]; then
+  OBJ="${ANVIL_OBJ:-/tmp/anvilobj-cov}"
+  BIN="${ANVIL_BIN:-/tmp/anvilbin-cov}"
+else
+  OBJ="${ANVIL_OBJ:-/tmp/anvilobj}"
+  BIN="${ANVIL_BIN:-/tmp/anvilbin}"
+fi
 # An array, not a string: the repository path contains a space, and an unquoted
 # expansion splits -I"D:/Placement Projects/..." into two arguments.
 FLAGS=(-std=c++20 -I"$ROOT" -DANVIL_ENABLE_BUGGIFY=1 -O2
        -fno-threadsafe-statics -ffp-contract=off -fwrapv)
+if [ "${ANVIL_COVERAGE:-0}" = "1" ]; then
+  FLAGS+=(--coverage -fprofile-arcs -ftest-coverage)
+fi
 
 mkdir -p "$OBJ" "$BIN"
 cd "$ROOT"

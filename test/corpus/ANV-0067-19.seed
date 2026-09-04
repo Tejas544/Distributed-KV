@@ -1,0 +1,32 @@
+# ANV-0067, second mechanism -- bit rot on the true last HardState record,
+# indistinguishable from a torn write by file content alone.
+# n3 durably voted for n2 and then for n3, both in term 1; reproduces at the
+# same tick (18603) across repeated invocations. Found by re-running the
+# mixed-version sweep on the binary patched for ANV-0067's first mechanism
+# (interior corruption with trailing data) -- seed 19 was clean before the
+# patch and fails after it, a direct product of the patch changing another
+# node's recovery timing on this seed and reshuffling the rest of its
+# schedule (see BUGS.md ANV-0067 part 3).
+seed        = 19
+workload    = raft_kv, driven by test/mixed_version_faults.cc's rolling
+              upgrade/rollback schedule (RaftKvConfig::node_raft_options)
+nodes       = 4
+faults      = network/disk/clock drawn from the seed; random process
+              crash/pause disabled; the deliberate crash-for-upgrade schedule
+              stays on -- it is the thing under test
+invariant   = INV-RAFT-07 (a node never grants two votes in one term)
+reproduce   = anvil_mixed_version_faults 19  # still reproduces on the
+              ANV-0067-part-1-patched binary as of this row
+minimised   = anvil_mixed_version_faults --minimise 19 -> [disk.bit_rot]
+              alone, 10->1 features, 14 predicate runs, 1-minimal verified --
+              no partition, no clock fault needed at all
+note        = open. disk.bit_rot alone reproducing (no partition, no clock
+              fault) is consistent with bit rot landing on the file's true
+              last record: `discarded_had_more_data` (anvil/core/lsm/wal.h)
+              is false whenever nothing follows the bad record in the file,
+              which is true both for an honest torn write and for bit rot on
+              an already-synced tail record with nothing appended since --
+              those two cannot be told apart from file content alone.
+              Closing this needs a persistence-format change (e.g. a
+              redundant/dual-copy hard-state write), not a smarter read of
+              the single file that exists today. See BUGS.md ANV-0067 part 2.

@@ -177,6 +177,34 @@ Task<Status> RaftStorage::recover(RecoveredState* out) {
   lsm::WalReadResult state_result;
   status = co_await lsm::wal_read_all(runtime_, state_, &state_result);
   if (!status.is_ok()) co_return status;
+
+  // ANV-0067. Reading "until the first invalid record and trusting the record
+  // before it" is exactly right for a torn write -- anvil/sim/disk_model.cc's
+  // crash_node() only ever tears *dirty* (unsynced) sectors, and this file
+  // never has more than one record dirty at a time (RaftDriver::persist()
+  // appends at most one hard-state record, then fsyncs, before the next
+  // append), so an in-flight torn write can only ever be the last thing in
+  // the file. It is not right for bit rot, which corrupts a record that
+  // already passed its checksum once and can land anywhere, including
+  // beneath a later record that was written and fsynced afterward.
+  // `discarded_had_more_data` is exactly that distinction: it is true only
+  // when the file held bytes past this record's own declared end, which a
+  // genuine unsynced tail can never do. Silently trusting the older,
+  // pre-corruption record in that case means silently forgetting a vote that
+  // may already have been durably replied to a peer -- a real double vote
+  // under {partition, disk.bit_rot, clock.jump} (BUGS.md). When durability
+  // has promised the vote was synced before it was ever sent, this node must
+  // not pretend the promise did not happen; it fails recovery instead, which
+  // (per RaftDriver::boot()'s unbounded retry, ANV-0003's own policy) keeps
+  // this incarnation out of the voting cluster rather than returning it with
+  // a memory the cluster can no longer trust.
+  if (durability_.fsync_state && state_result.records_discarded > 0 &&
+      state_result.discarded_had_more_data) {
+    co_return Status{StatusCode::kCorruption,
+                     "raft hard state: media damage beneath an already-durable "
+                     "record -- refusing to recover a vote that may be stale"};
+  }
+
   out->state_truncated = state_result.truncated;
   out->records_discarded += state_result.records_discarded;
   for (auto it = state_result.records.rbegin(); it != state_result.records.rend(); ++it) {

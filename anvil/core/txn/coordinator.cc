@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <utility>
 
+#include "anvil/core/buggify.h"
+
 namespace anvil::txn {
 
 const char* to_string(Level level) noexcept {
@@ -339,6 +341,14 @@ Task<bool> Coordinator::resolve_blocker(Handle* handle, std::string_view blocked
   // aborts a blocker whose heartbeat has lapsed. Both are the same command with
   // one flag, which is what keeps the two policies from drifting apart.
   push.abort_expired = true;
+
+  // Widen the window between deciding to push and the push actually landing.
+  // Wound-wait's acyclicity argument rests on the age comparison being a total
+  // order at the moment the push is evaluated, not on the push being prompt --
+  // so a blocker's own state (heartbeat, commit, abort) is free to change
+  // while this is in flight, and the wait-for bookkeeping above must survive
+  // that. That race is otherwise only reachable by unlucky scheduling.
+  if (ANVIL_BUGGIFY) co_await runtime_->sleep_for(options_.retry_backoff);
 
   const Response response =
       co_await send(/*read=*/false, record_range, push, push.key, 0, 0, handle->id);

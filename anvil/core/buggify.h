@@ -31,6 +31,20 @@
 //    from the registry, because an unreached site never registers. tools/
 //    obtains it by scanning the source for the macro. If those two numbers
 //    disagree in the wrong direction, there is dead code in the core.
+//
+// A site must never sit inside code whose output has to be a pure function of
+// replicated state across independent nodes -- a placement decision, a vote, a
+// replicated command's apply path. Enablement is deterministic (hash of seed
+// and site id, see SimBuggifyPolicy), but *firing*, given enabled, is drawn
+// from the run's shared RNG stream at the moment of evaluation -- so two nodes
+// independently evaluating the same site over identical state can still get
+// different answers, purely because their coroutines reached the call in a
+// different order. Found the hard way: a site nominated inside the placement
+// driver's split/merge decision made INV-SHARD-09 ("placement decisions are a
+// function of replicated state alone") fire on ordinary seeds with no other
+// fault active. The safe places are a single node's own local, unreplicated
+// choices -- how it frames an outgoing RPC, how long it polls its own inbox --
+// never a decision more than one replica is expected to reach identically.
 
 #ifndef ANVIL_CORE_BUGGIFY_H_
 #define ANVIL_CORE_BUGGIFY_H_

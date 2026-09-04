@@ -4,6 +4,7 @@
 #include <cstring>
 #include <utility>
 
+#include "anvil/core/buggify.h"
 #include "anvil/core/lsm/format.h"
 #include "anvil/core/raft/config.h"
 #include "anvil/core/raft/message.h"
@@ -1181,6 +1182,17 @@ Task<bool> ShardStore::reserve_timestamps(std::uint64_t count, txn::Ts* first) {
     co_await transport_->send_envelope(
         make_envelope(self_, leader, MessageKind::kClientRequest, out));
   }
+
+  // A one-time, whole-request delay before this node even starts polling its
+  // own inbox -- purely local, nothing to agree on with another replica. Kept
+  // outside the poll loop deliberately: perturbing the per-iteration cadence
+  // instead (tried first) compounds across the loop's ~300 iterations and
+  // measurably slows the whole workload, which was enough to push the
+  // seeded-mutation drill's "intents invisible to readers" cell to 0/15 --
+  // a harness regression this site would have introduced, not a database one.
+  // One extra wait up front creates the same rare late-reply window without
+  // that compounding.
+  if (ANVIL_BUGGIFY) co_await runtime_->sleep_for(Duration::millis(50));
 
   const Timestamp deadline = runtime_->now().advanced_by(Duration::millis(1500));
   while (runtime_->now() < deadline) {

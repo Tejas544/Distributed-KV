@@ -51,6 +51,7 @@
 #include "anvil/checker/raft_invariants.h"
 #include "anvil/checker/shard_invariants.h"
 #include "anvil/checker/txn_invariants.h"
+#include "anvil/core/buggify.h"
 #include "anvil/sim/minimiser.h"
 #include "anvil/sim/simulation.h"
 #include "workloads/counter.h"
@@ -221,6 +222,35 @@ std::string json_escape(const std::string& s) {
   return out;
 }
 
+std::string buggify_sidecar_path(const std::string& out_path) {
+  const std::string suffix = ".jsonl";
+  if (out_path.size() >= suffix.size() &&
+      out_path.compare(out_path.size() - suffix.size(), suffix.size(), suffix) == 0) {
+    return out_path.substr(0, out_path.size() - suffix.size()) + ".buggify.jsonl";
+  }
+  return out_path + ".buggify.jsonl";
+}
+
+// One line per site this process's registry knows about (every site any seed
+// in this shard reached), and how often it fired. A single shard only sees
+// the sites its own seeds' code paths touched; tools/fleet_report.py unions
+// "ever activated" across every shard's sidecar against the full site count
+// to measure P8 exit criterion 2 (BUGGIFY activation coverage).
+void write_buggify_sidecar(const std::string& path) {
+  std::ofstream out(path);
+  if (!out) return;
+  const anvil::BuggifyRegistry& registry = anvil::BuggifyRegistry::instance();
+  for (std::size_t i = 0; i < registry.size(); ++i) {
+    const anvil::BuggifySite* site = registry.at(i);
+    if (site == nullptr) continue;
+    out << "{\"id\":" << site->id()
+        << ",\"file\":\"" << json_escape(std::string(site->file())) << "\""
+        << ",\"line\":" << site->line()
+        << ",\"evaluations\":" << site->evaluations()
+        << ",\"activations\":" << site->activations() << "}\n";
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -325,6 +355,8 @@ int main(int argc, char** argv) {
       out.flush();
     }
   }
+
+  write_buggify_sidecar(buggify_sidecar_path(out_path));
 
   const double seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();

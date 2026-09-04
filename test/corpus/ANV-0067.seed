@@ -1,0 +1,35 @@
+# ANV-0067 -- a node durably voted twice in one term under rolling upgrade
+# n2 durably voted for n2 and then for n4, both in term 4; reproduces at the
+# same tick (27714) and sim-time (17386ms) across repeated invocations.
+# This seed is the pinned first hit; it is not an isolated case -- the full
+# 200-node-hour run (1,830 seeds) failed 267 of them (14.6%) across nearly
+# every INV-RAFT-* invariant, and quadrupling the recovery time between
+# transitions did not change the rate (15% at 4x vs 14.6% at 1x).
+seed        = 24
+workload    = raft_kv, driven by test/mixed_version_faults.cc's rolling
+              upgrade/rollback schedule (RaftKvConfig::node_raft_options)
+nodes       = 5
+faults      = network/disk/clock drawn from the seed; random process
+              crash/pause disabled; the deliberate crash-for-upgrade schedule
+              (every node, twice, over ~25s, 80ms restart delay) stays on --
+              it is the thing under test
+invariant   = INV-RAFT-07 (a node never grants two votes in one term)
+reproduce   = anvil_mixed_version_faults 24  # reproduced pre-fix; now clean
+minimised   = anvil_mixed_version_faults --minimise 24 -> {partition,
+              disk.bit_rot, clock.jump}, 11->3 features, 184 predicate runs,
+              1-minimal verified
+note        = PARTIALLY FIXED, uncommitted in-session (anvil/core/lsm/wal.h,
+              anvil/core/lsm/wal.cc, anvil/core/raft/storage.cc,
+              workloads/raft_kv.cc). This seed's specific mechanism -- an
+              interior bit-rot hit on a HardState record with more, later,
+              already-fsynced data following it in the file -- is fixed and
+              verified: seed 24 no longer reproduces INV-RAFT-07 on the
+              patched binary. A second sub-mechanism (bit rot landing on the
+              true *last* record, indistinguishable from a torn write by file
+              content alone) is not fixed; see test/corpus/ANV-0067-19.seed
+              for its pinned reproduction, and BUGS.md ANV-0067 parts 2-3 for
+              the full argument, including a 300-seed before/after
+              measurement showing the fix's net effect on this workload is
+              currently negative in raw failure count even though it is a
+              verified, real partial fix -- schedule perturbation, not a new
+              defect (see BUGS.md for why).

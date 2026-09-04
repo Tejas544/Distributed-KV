@@ -1,5 +1,6 @@
 #include "anvil/core/mvcc/mvcc.h"
 
+#include "anvil/core/buggify.h"
 #include "anvil/core/lsm/format.h"
 #include "anvil/core/lsm/wal.h"
 
@@ -353,6 +354,14 @@ Task<Status> MvccStore::collect_garbage(CommitTs safepoint, std::size_t max_keys
   std::vector<std::string> keys;
   Status status = co_await keys_with_versions(&keys);
   if (!status.is_ok()) co_return status;
+
+  // A GC pass that keeps suspending after a single key looks nothing like one
+  // that walks its whole batch in a tight loop: it interleaves with far more
+  // reads, writes and other GC passes per key touched. The safepoint math
+  // (INV-MVCC's boundary-version rule, just above) does not depend on batch
+  // size, so shrinking it is safe -- it only changes how often this
+  // coroutine hands control back to the scheduler.
+  if (ANVIL_BUGGIFY) max_keys = 1;
 
   std::size_t touched = 0;
   for (const std::string& key : keys) {

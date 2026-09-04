@@ -29,6 +29,7 @@
 #define ANVIL_WORKLOADS_RAFT_KV_H_
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -63,6 +64,16 @@ struct RaftKvConfig {
 
   raft::RaftOptions raft;
   raft::RaftDurability durability;
+
+  // Null by default, which leaves every existing caller's behaviour
+  // unchanged: every node gets `raft` verbatim. Set to give a node options
+  // that differ from its peers -- a mixed-version cluster is exactly a
+  // cluster where this returns different capabilities for different nodes.
+  // Re-consulted on every boot, including a restart after a crash, so a
+  // callback closing over external mutable state can model an upgrade: a
+  // node that comes back after being "stopped for upgrade" sees whatever the
+  // callback now says for its id.
+  std::function<raft::RaftOptions(NodeId, raft::RaftOptions)> node_raft_options;
 };
 
 // One acknowledged write, with the log index the value landed at. The index is

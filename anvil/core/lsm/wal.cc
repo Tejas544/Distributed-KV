@@ -141,6 +141,12 @@ Task<Status> wal_read_all(Runtime* runtime, FileHandle file, WalReadResult* out)
     const std::uint32_t length = decode_fixed32(header.data() + 4);
 
     if (length > kMaxRecordSize || offset + kHeaderSize + length > size) {
+      // `discarded_had_more_data` deliberately stays false here: this branch
+      // fires exactly when the record's own declared length does not fit in
+      // what remains of the file, so by construction there cannot be any file
+      // content past it -- self-limiting, unlike the checksum/short-read
+      // branches below where the declared length *did* fit and something more
+      // may still follow.
       out->truncated = true;
       ++out->records_discarded;
       break;
@@ -155,6 +161,7 @@ Task<Status> wal_read_all(Runtime* runtime, FileHandle file, WalReadResult* out)
       if (read < length) {
         out->truncated = true;
         ++out->records_discarded;
+        out->discarded_had_more_data = offset + kHeaderSize + length < size;
         break;
       }
     }
@@ -164,6 +171,7 @@ Task<Status> wal_read_all(Runtime* runtime, FileHandle file, WalReadResult* out)
     if (crc != expected_crc) {
       out->truncated = true;
       ++out->records_discarded;
+      out->discarded_had_more_data = offset + kHeaderSize + length < size;
       break;
     }
 

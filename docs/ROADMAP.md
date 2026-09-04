@@ -388,15 +388,27 @@ parallel-commit divergence P6 predicted and no seed had ever reached).
 
 ## P8 — The bug hunt at scale · Weeks 30–32
 
-**Status: in progress. Two of six deliverables built, one exit criterion met and
-one partly.**
+**Status: in progress. Four of six deliverables built. Criterion 6 met;
+criteria 1–4 have real, honestly-measured numbers, none of them yet at target
+(criterion 1 is compute-bound — 1,147.9 of 20,000 node-hours, ~46 wall-hours
+away on this machine, not a code gap). Criterion 5 ran to completion at its
+target node-hours and does not currently pass — see
+[ANV-0067](../BUGS.md), the most consequential open question this pass
+produced and now confirmed S0. Its pinned seed's mechanism (interior bit rot
+rolling back an already-fsynced vote record) is fixed and verified; a second,
+structurally harder sub-mechanism (bit rot on a file's true last record,
+indistinguishable from a torn write by content alone) is not, and a 300-seed
+before/after measurement of the partial fix — 10 seeds fixed, 15 different
+seeds newly exposed by the fix's own schedule perturbation, net worse by raw
+count — is itself the strongest evidence yet that this is the engine, not
+the harness.**
 
 | Deliverable | State |
 |---|---|
 | Nightly seed fleet: distribute seeds, collect artifacts, deduplicate by invariant + minimised fault signature, file candidate rows | **built** — `test/fleet.cc`, `tools/fleet.sh`, `tools/fleet_report.py` |
 | Coverage-guided seed selection | not started — the highest-leverage item left |
 | Swarm testing across the configuration space | not started |
-| Mixed-version testing | not started — the largest single item |
+| Mixed-version testing | **built** — `test/mixed_version_faults.cc`. No wire-version field needed: `RaftDriver` already takes independent `RaftOptions` per node, so `RaftKvConfig::node_raft_options` (a new per-node override, consulted on every boot including a restart) is enough to model a cluster rolling from `pre_vote=false` ("N-1") to `pre_vote=true` ("N") and back, under the same fault injection every other suite uses |
 | Full seeded-mutation suite as one report | **built** — `test/drill_report.h`, `tools/mutation_report.py`: **23/23 must-detect caught, 8 of 23 invisible from the client API** |
 | Metrics automation (`tools/report.py`) | not started |
 
@@ -407,6 +419,68 @@ linearizable read minimised from the eleven fault features its seed drew down to
 exactly two, `partition + disk.slow_io`, with 1-minimality verified. The row is
 filed open and *unclassified*: this project has produced that symptom from the
 harness twice and from the engine never, so guessing would be the wrong move.
+
+Building the mixed-version workload found a second open row the same way:
+[ANV-0067](../BUGS.md), a node durably voting twice in one term under a rolling
+upgrade/rollback schedule (`INV-RAFT-07`), reproducing deterministically at the
+same tick across repeated runs. Disabling the workload's random process faults
+did not make it go away. Filed open and unclassified at first for the same
+reason as ANV-0066 — it surfaced on the first smoke run of a same-session
+workload, and a double-vote is exactly the class of narrow-window race
+BUGGIFY and deliberate crash schedules exist to find, but a novel driving
+mechanism is also a reasonable first suspect.
+
+Minimising the pinned seed (`anvil_mixed_version_faults --minimise 24`, a new
+mode built the same way `test/fleet.cc` minimises ANV-0066, adapted to hold
+the deliberate upgrade schedule fixed) answered it: 11 fault features reduce
+to exactly 3, 1-minimality verified — `partition + disk.bit_rot + clock.jump`.
+`disk.bit_rot` being load-bearing, rather than `process.crash`, points away
+from the workload's own crash cadence and at the storage recovery path: the
+Raft hard-state file is read back "until the first invalid record" the same
+way the LSM WAL is (correct for a torn tail, which by construction only
+damages unsynced data), so bit rot corrupting an *interior*, already-fsynced
+HardState record silently rolls a node's recovered vote back to whatever
+preceded it — and the checker's own asymmetry corroborates this: it exempts a
+corrupted node's term/commit regressions but not its vote conflicts, which is
+right if a bit-rotted record was already relied on by a peer and wrong to
+forgive.
+
+**Regression-testing the fix outside the workload that found it is what
+surfaced [ANV-0068](../BUGS.md).** `shard_faults 24`, previously 24/24 clean,
+now shows two real account-conservation violations. Not a bug in ANV-0067's
+fix — a pre-existing gap in `anvil/core/shard/placement.cc`'s dead-replica
+replacement, which computes liveness from per-*node* heartbeats and has no
+per-*range-replica* signal, so a node hosting many Raft groups can heartbeat
+normally while one specific range's replica is permanently stuck (a state
+that could not previously exist — recovery always eventually succeeded before
+this fix). If enough of one range's replicas independently hit this, the
+range's data is gone with no self-healing path. Filed rather than used as a
+reason to revert: reverting removes the only thing that can expose the gap,
+not the gap itself, and would trade a confirmed S0 double-vote for an
+invisible one to avoid making a different, real bug visible.
+
+Fixed, partially, the same pass: `RaftStorage::recover()` now refuses to
+recover rather than silently rolling back a vote when the corrupted record
+had more, later, already-durable data following it in the file — verified,
+the pinned seed no longer reproduces. Validating that also found and fixed an
+unrelated harness bug (`workloads/raft_kv.cc`'s durability audit did not
+exclude a node stuck in the new permanent recovery-retry loop, so it was
+being checked as a caught-up participant and reported as missing every write).
+But a second sub-mechanism — bit rot on a record with *nothing* after it,
+which by file content alone cannot be told apart from an honest torn write —
+is not fixed, and a 300-seed before/after comparison shows why this matters:
+39/300 seeds failed before the fix, 44/300 after, with 10 seeds now clean and
+15 *different* seeds newly failing from the fix's own timing perturbation
+(the simulator's determinism means changing one node's recovery timing
+reshuffles the whole seed's schedule). That the aggregate count got worse
+while the fix is individually correct and verified is the strongest evidence
+yet for ENGINE over HARNESS — a targeted, schedule-neutral, more-conservative
+-only recovery change does not raise a harness artifact's rate; it does raise
+the observed rate of a real, previously-undercounted vulnerability. Full
+argument, including the set-difference and the seed (19) that pins the
+remaining gap, in [ANV-0067](../BUGS.md) parts 2–3. Closing the rest needs a
+persistence-format change (a redundant/dual-copy hard-state write), out of
+scope for this pass.
 
 **Goal.** Turn compute into ledger rows.
 
@@ -419,12 +493,15 @@ harness twice and from the engine never, so guessing would be the wrong move.
 - Metrics automation: `tools/report.py` writing the README Results block.
 
 **Exit criteria**
-1. ≥ 20,000 simulated node-hours accumulated and reported honestly (this is a function of your compute; report the real number and the speedup factor).
-2. BUGGIFY site activation coverage ≥ 95% across the fleet.
-3. Branch coverage under simulation ≥ 85% for `core/`.
-4. Every bug in the ledger has a pinned corpus seed that still reproduces on the commit before its fix, and passes on the commit after.
-5. Mixed-version cluster survives 200 simulated node-hours of rolling upgrade/rollback with faults.
-6. Full mutation report published: detection rate, MTTD, and the **API-visibility column** — the evidence for the protocol-aware claim.
+
+| # | Criterion | State |
+|---|---|---|
+| 1 | ≥20,000 simulated node-hours, reported honestly | **short of target; real number reported rather than a longer wait** — a 30-minute calibration pass banked 217.7 node-hours in 1,215 runs; a follow-up 6-hour-per-shard pass (24,000 seeds × 5 workloads, 12 shards, `FLEET_SHARD_TIMEOUT=21600`) banked **1,147.9 node-hours in 6,434 runs** before its budget ran out. That is **5.7% of the 20,000 target**. The measured rate says the full target needs roughly **46 wall-hours** on this machine's 12 cores — a function of compute, exactly as this criterion's own wording anticipates, and not something a third relaunch inside one sitting changes. 12 distinct failure classes surfaced along the way (2 already-understood, 10 new candidate rows in `fleet_report.py`'s output), not yet triaged |
+| 2 | BUGGIFY site activation coverage ≥95% | **partial, real number** — 1 real call site existed before this pass (raft.cc); 4 more added to lsm/mvcc/shard/txn, each a node-local, non-decision perturbation after one site placed inside cross-replica decision logic broke INV-SHARD-09 and was reverted (anvil/core/buggify.h documents the constraint). `tools/fleet_report.py` now unions per-shard activation against a source scan for the true site count. A 30-seed smoke fleet measured 4/5 = 80%; the number the criterion is graded on comes from criterion 1's run |
+| 3 | Branch coverage under simulation ≥85% for `anvil/core/` | **measured, below target** — `tools/coverage.sh` (new): **78.1%** (6,587/8,429 branches) across the documented fault-suite seed counts. Per-file breakdown printed by the tool; weakest are `digest.h` (0%), `mvcc/lock_table.cc` (29%), `lsm/version.h` (33%), `runtime/task.h` (44%) — named rather than closed by re-shaping the run to hit 85% |
+| 4 | Every ledger bug's seed reproduces before its fix, passes after | **run, with a known limitation stated rather than hidden** — of 70 rows, 65 predate per-bug commits (squashed into five bulk phase commits) and are structurally unbisectable without rewriting published history, which is off the table. `tools/verify_ledger_seeds.py` (new) checks the 5 that have a real fix commit (3 of those 5 had the wrong value recorded in `BUGS.md`'s `fix_commit` — a phase label instead of the SHA — corrected in this pass). **All 5 reproduce on their fix commit's parent** — every pinned seed is a real reproduction, confirmed. Only 1 of 5 (ANV-0052) shows clean on the fix commit itself by the tool's actual signal (the whole suite binary's exit code); the other 4 still exit nonzero there too, and it is not because the bug persists -- `test/txn_faults.cc` alone grew by 383 lines between ANV-0054's fix commit and today, because these are development-era commits from the same P6 stretch where several bugs were live at once (e.g. ANV-0054's fix commit predates ANV-0055's by definition), so that commit's own test binary still fails on a *different*, not-yet-fixed bug from the same window. A whole-binary exit code cannot tell "this bug persists" from "a different bug in the same era does"; distinguishing them needs per-invariant output parsing this pass didn't build |
+| 5 | Mixed-version cluster survives 200 simulated node-hours of rolling upgrade/rollback with faults | **run; does not currently pass** — `test/mixed_version_faults.cc` (new) accumulated the target: **200.1 node-hours over 1,830 seeds**. **267 seeds (14.6%) failed**, against nearly every `INV-RAFT-*` invariant, far above P3's own 0/1,000+ node-hour baseline. Filed as [ANV-0067](../BUGS.md), confirmed **S0**. Its pinned seed's mechanism — interior bit rot on an already-fsynced Raft `HardState` record silently rolling a node's vote back — is **fixed and verified** (`anvil/core/lsm/wal.{h,cc}`, `anvil/core/raft/storage.cc`; an unrelated harness gap this surfaced in `workloads/raft_kv.cc`'s durability audit was fixed alongside it). A second sub-mechanism — bit rot on a file's true last record, provably indistinguishable from a torn write by content alone — is not fixed (needs a persistence-format change). A 300-seed before/after of the partial fix: 39→44 failing seeds, 10 fixed and 15 newly exposed by the fix's own schedule perturbation — net worse by raw count, and the strongest evidence yet that this is the engine rather than the harness, since a targeted, schedule-neutral, more-conservative-only fix does not raise a harness artifact's rate |
+| 6 | Full mutation report published: detection rate, MTTD, API-visibility column | **met** — 23/23 must-detect caught, 8 of 23 invisible from the client API |
 
 ---
 

@@ -107,6 +107,20 @@ struct WalReadResult {
   std::uint64_t valid_bytes = 0;  // where a clean log ends
   bool truncated = false;         // a record failed validation; the tail was dropped
   std::uint64_t records_discarded = 0;
+
+  // Only meaningful when `records_discarded > 0`. True if the file held bytes
+  // past the *declared* end of the record that failed validation -- i.e. the
+  // header's own length field, read before the failure, put this record's end
+  // strictly before the file's actual size. A torn write can never produce
+  // this: nothing is ever appended after an unsynced record (the writer waits
+  // for its fsync before the next append), so an in-flight torn write is
+  // always the last thing in the file and this is false for it. A record
+  // whose declared bytes end short of the file's true end must instead have
+  // been corrupted *after* something else was durably appended past it --
+  // media damage to already-written data, not a crash mid-append. Callers for
+  // whom that distinction is safety-relevant (a vote, not just an entry) use
+  // this instead of `records_discarded` alone.
+  bool discarded_had_more_data = false;
 };
 
 // Reads until the first invalid record. `out->truncated` distinguishes "the log

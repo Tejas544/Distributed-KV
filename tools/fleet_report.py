@@ -21,8 +21,38 @@ Only the new ones get candidate ledger rows.
 
 import glob
 import json
+import os
+import re
 import sys
 from collections import defaultdict
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# A real call site is `ANVIL_BUGGIFY` used as an expression, not a mention of
+# the macro in a comment (anvil/core/runtime/runtime.h and anvil/sim/
+# simulation.cc both talk *about* it without using it). The registry itself
+# cannot be the denominator -- a site an unlucky fleet never reached would
+# never register and BUGGIFY coverage would look perfect by never looking at
+# the code that has none. Scanning the source, per anvil/core/buggify.h's own
+# design note, is what "every site that exists" has to mean.
+_BUGGIFY_CALL = re.compile(r"^(?!\s*//).*\bANVIL_BUGGIFY\b")
+
+
+def count_buggify_call_sites(repo_root):
+    """(count, [(file, line), ...]) for every real ANVIL_BUGGIFY use under anvil/."""
+    sites = []
+    for dirpath, _, filenames in os.walk(os.path.join(repo_root, "anvil")):
+        for name in filenames:
+            if not (name.endswith(".cc") or name.endswith(".h")):
+                continue
+            path = os.path.join(dirpath, name)
+            if os.path.basename(path) == "buggify.h":
+                continue  # the macro's own definition, not a use of it
+            with open(path, encoding="utf-8") as fh:
+                for lineno, line in enumerate(fh, start=1):
+                    if _BUGGIFY_CALL.match(line):
+                        sites.append((os.path.relpath(path, repo_root), lineno))
+    return len(sites), sites
 
 # ---------------------------------------------------------------------------
 # Failures that are already understood, and why.
@@ -91,11 +121,22 @@ def classify(workload, invariant, signature):
 
 
 def main(paths):
-    files = []
+    all_files = []
     for p in paths:
-        files.extend(glob.glob(p))
-    if not files:
+        all_files.extend(glob.glob(p))
+    if not all_files:
         print("no fleet output found; give me the JSONL files", file=sys.stderr)
+        return 2
+
+    # Each shard writes its own run log (shard-N.jsonl) and its own BUGGIFY
+    # sidecar (shard-N.buggify.jsonl); the latter matches the same shell glob
+    # fleet.sh hands this script (shard-*.jsonl), so the two are told apart by
+    # suffix here rather than by asking callers to pass two separate globs.
+    files = [f for f in all_files if not f.endswith(".buggify.jsonl")]
+    buggify_files = [f for f in all_files if f.endswith(".buggify.jsonl")]
+    if not files:
+        print("no fleet run output found (only BUGGIFY sidecars); give me the JSONL files",
+              file=sys.stderr)
         return 2
 
     runs = 0
@@ -123,6 +164,23 @@ def main(paths):
                 c["detail"] = c["detail"] or r["detail"]
                 c["one_minimal"] += 1 if r["one_minimal"] else 0
 
+    # BUGGIFY coverage (P8 exit criterion 2): union "ever activated" across
+    # every shard's own registry -- each shard is its own process with its own
+    # BuggifyRegistry, so a site fired in shard 3 and never in shard 7 still
+    # counts as covered by the fleet as a whole.
+    seen_ids = {}       # id -> (file, line)
+    activated_ids = set()
+    for path in buggify_files:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                s = json.loads(line)
+                seen_ids[s["id"]] = (s["file"], s["line"])
+                if s["activations"] > 0:
+                    activated_ids.add(s["id"])
+
     node_hours = node_nanos / 3.6e12
 
     print("=" * 78)
@@ -132,6 +190,26 @@ def main(paths):
     print(f"  runs ............................ {runs:,}")
     print(f"  simulated node-hours ............ {node_hours:,.1f}")
     print(f"  shards .......................... {len(files)}")
+    print()
+
+    total_sites, all_sites = count_buggify_call_sites(_REPO_ROOT)
+    if not buggify_files:
+        print("  BUGGIFY coverage ................ no sidecars found "
+              "(rebuild anvil_fleet to get them)")
+    elif total_sites == 0:
+        print("  BUGGIFY coverage ................ n/a (no ANVIL_BUGGIFY call sites in source)")
+    else:
+        pct = 100.0 * len(activated_ids) / total_sites
+        print(f"  BUGGIFY sites in source ......... {total_sites}")
+        print(f"  BUGGIFY sites ever activated .... {len(activated_ids)} ({pct:.1f}%)")
+        never = [f"{f}:{l}" for sid, (f, l) in seen_ids.items() if sid not in activated_ids]
+        unreached = total_sites - len(seen_ids)
+        if unreached:
+            print(f"    {unreached} site(s) never reached by any seed (not even evaluated)")
+        for loc in sorted(never):
+            print(f"    evaluated but never fired: {loc}")
+        verdict = "MEETS" if pct >= 95.0 else "BELOW"
+        print(f"    {verdict} the >=95% exit criterion")
     print()
     print("  per workload:")
     for name in sorted(by_workload):
